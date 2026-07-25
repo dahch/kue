@@ -87,7 +87,7 @@ impl std::fmt::Debug for LoopbackHandle {
 
 pub struct AudioCapture {
     inner: Mutex<AudioCaptureInner>,
-    data_dir: PathBuf,
+    recordings_dir: PathBuf,
 }
 
 #[derive(Debug)]
@@ -97,13 +97,11 @@ struct AudioCaptureInner {
     mic_writer: Option<JoinHandle<()>>,
     loopback_writer: Option<JoinHandle<()>>,
     mode: String,
+    session_dir: Option<PathBuf>,
 }
 
 impl AudioCapture {
-    pub fn new(data_dir: PathBuf) -> Self {
-        if let Err(e) = fs::create_dir_all(&data_dir) {
-            eprintln!("[kue] Failed to create recordings dir {data_dir:?}: {e}");
-        }
+    pub fn new(recordings_dir: PathBuf) -> Self {
         Self {
             inner: Mutex::new(AudioCaptureInner {
                 mic: None,
@@ -111,22 +109,22 @@ impl AudioCapture {
                 mic_writer: None,
                 loopback_writer: None,
                 mode: String::new(),
+                session_dir: None,
             }),
-            data_dir,
+            recordings_dir,
         }
     }
 
-    fn recording_path(&self, label: &str) -> PathBuf {
+    fn session_temp_dir() -> PathBuf {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_else(|_| {
-                // Fallback: use a random tiebreaker to avoid collisions.
                 use std::sync::atomic::{AtomicU64, Ordering};
                 static FALLBACK: AtomicU64 = AtomicU64::new(0);
                 FALLBACK.fetch_add(1, Ordering::Relaxed)
             });
-        self.data_dir.join(format!("{label}_{ts}.wav"))
+        std::env::temp_dir().join(format!("kue-session-{ts}"))
     }
 
     pub fn start(&self, mode: &str) -> Result<AudioCaptureStatus, AudioError> {
@@ -138,10 +136,18 @@ impl AudioCapture {
 
         let mut inner = self.inner.lock().unwrap();
 
+        let session_dir = Self::session_temp_dir();
+        fs::create_dir_all(&session_dir).map_err(|e| {
+            AudioError::StreamError(format!("Failed to create session temp dir: {e}"))
+        })?;
+
         // -- Mic (Canal A) -------------------------------------------------
         let (mic_tx, mic_rx) = sync_channel::<Vec<i16>>(BUFFER_CAPACITY);
-        let mic = start_mic_capture(mic_tx)?;
-        let mic_path = self.recording_path("mic_channel_A");
+        let mic = start_mic_capture(mic_tx).map_err(|e| {
+            let _ = fs::remove_dir_all(&session_dir);
+            e
+        })?;
+        let mic_path = session_dir.join("mic_channel_A.wav");
         let mic_writer = spawn_wav_writer("mic-A", mic_rx, mic_path)?;
 
         inner.mic = Some(MicHandle(mic));
@@ -149,13 +155,17 @@ impl AudioCapture {
 
         // -- Loopback (Canal B) --------------------------------------------
         let (loopback_tx, loopback_rx) = sync_channel::<Vec<i16>>(BUFFER_CAPACITY);
-        let loopback = start_loopback_capture(loopback_tx)?;
-        let loopback_path = self.recording_path("loopback_channel_B");
+        let loopback = start_loopback_capture(loopback_tx).map_err(|e| {
+            let _ = fs::remove_dir_all(&session_dir);
+            e
+        })?;
+        let loopback_path = session_dir.join("loopback_channel_B.wav");
         let loopback_writer = spawn_wav_writer("loopback-B", loopback_rx, loopback_path)?;
 
         inner.loopback = Some(LoopbackHandle(loopback));
         inner.loopback_writer = Some(loopback_writer);
         inner.mode = mode.to_string();
+        inner.session_dir = Some(session_dir);
 
         Ok(AudioCaptureStatus {
             mic_active: true,
@@ -175,10 +185,57 @@ impl AudioCapture {
         inner.loopback_writer.take().map(|h| h.join().ok());
 
         inner.mode = String::new();
+        // session_dir stays for finalize_session to handle cleanup
 
         AudioCaptureStatus {
             mic_active: false,
             loopback_active: false,
+        }
+    }
+
+    /// Finalize the session: if `retain` is true, move WAV files to
+    /// `recordings_dir/{session_name}/`; otherwise delete the temp dir.
+    /// No-op if no session dir exists.
+    pub fn finalize_session(&self, retain: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(session_dir) = inner.session_dir.take() else {
+            return;
+        };
+
+        if retain {
+            if let Err(e) = fs::create_dir_all(&self.recordings_dir) {
+                eprintln!("[kue] Failed to create recordings dir {dir:?}: {e}",
+                    dir = self.recordings_dir);
+            } else if let Some(name) = session_dir.file_name() {
+                let target = self.recordings_dir.join(name);
+                let _ = fs::create_dir_all(&target);
+                if let Ok(entries) = fs::read_dir(&session_dir) {
+                    for entry in entries.flatten() {
+                        let dest = target.join(entry.file_name());
+                        let _ = fs::rename(entry.path(), &dest);
+                    }
+                }
+            }
+        }
+
+        let _ = fs::remove_dir_all(&session_dir);
+    }
+
+    /// Clean up any orphaned kue-session-* directories left in the system
+    /// temp directory (e.g. after a crash mid-session).
+    pub fn cleanup_orphaned_temp_dirs() {
+        let temp_dir = std::env::temp_dir();
+        if let Ok(entries) = fs::read_dir(&temp_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if name.starts_with("kue-session-") {
+                            let _ = fs::remove_dir_all(&path);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -399,13 +456,37 @@ fn start_loopback_capture(tx: SyncSender<Vec<i16>>) -> Result<SCStream, AudioErr
 // Tauri command
 // ---------------------------------------------------------------------------
 
+use crate::db::Database;
+
 #[tauri::command]
 pub fn toggle_audio_capture(
     start: bool,
     mode: String,
     audio: tauri::State<'_, AudioCapture>,
+    db: tauri::State<'_, Database>,
 ) -> Result<AudioCaptureStatus, String> {
-    audio.toggle(start, &mode).map_err(|e| e.to_string())
+    let status = audio.toggle(start, &mode).map_err(|e| e.to_string())?;
+
+    if !start {
+        // Session ended — read retain_audio setting (default: false)
+        let retain = db
+            .conn
+            .lock()
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT value FROM settings WHERE key='retain_audio'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+            })
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        audio.finalize_session(retain);
+    }
+
+    Ok(status)
 }
 
 // ---------------------------------------------------------------------------
@@ -606,88 +687,148 @@ mod tests {
         assert!(inner.mic_writer.is_none());
         assert!(inner.loopback_writer.is_none());
         assert!(inner.mode.is_empty());
+        assert!(inner.session_dir.is_none());
     }
 
     #[test]
-    fn audio_capture_new_creates_data_dir() {
-        let dir = PathBuf::from("/tmp/kue-test-audio-new");
-        // Remove if leftover from previous run
+    fn audio_capture_new_stores_recordings_dir() {
+        let dir = PathBuf::from("/tmp/kue-test-recordings-dir");
         let _ = fs::remove_dir_all(&dir);
         let cap = AudioCapture::new(dir.clone());
-        assert!(dir.exists(), "data_dir should be created by new()");
-        assert!(dir.is_dir());
-        // Clean up
-        fs::remove_dir_all(&dir).ok();
-        // We need cap to live long enough — drop it after cleanup
-        drop(cap);
-    }
-
-    #[test]
-    fn audio_capture_new_handles_existing_dir() {
-        let dir = PathBuf::from("/tmp/kue-test-audio-existing");
-        fs::create_dir_all(&dir).unwrap();
-        let cap = AudioCapture::new(dir.clone());
-        {
-            let inner = cap.inner.lock().unwrap();
-            assert!(inner.mic.is_none());
-            // inner dropped here, releasing the borrow on cap.inner
-        }
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn audio_capture_new_stores_data_dir() {
-        let dir = PathBuf::from("/tmp/kue-test-data-dir");
-        let _ = fs::remove_dir_all(&dir);
-        let cap = AudioCapture::new(dir.clone());
-        assert_eq!(cap.data_dir, dir);
+        assert_eq!(cap.recordings_dir, dir);
         fs::remove_dir_all(&dir).ok();
     }
 
     // -----------------------------------------------------------------------
-    // recording_path() format verification
+    // session_temp_dir() format verification
     // -----------------------------------------------------------------------
 
     #[test]
-    fn recording_path_format_contains_label() {
-        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test-rec-path"));
-        let path = cap.recording_path("mic_channel_A");
-        let filename = path.file_name().unwrap().to_str().unwrap();
-        assert!(filename.starts_with("mic_channel_A_"), "Expected filename to start with label, got {filename}");
-        assert!(filename.ends_with(".wav"), "Expected .wav extension, got {filename}");
-        fs::remove_dir_all("/tmp/kue-test-rec-path").ok();
+    fn session_temp_dir_uses_kue_session_prefix() {
+        let path = AudioCapture::session_temp_dir();
+        let dirname = path.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(dirname.starts_with("kue-session-"), "Expected 'kue-session-...', got {dirname}");
+        assert!(path.parent() == Some(std::env::temp_dir().as_path()));
     }
 
     #[test]
-    fn recording_path_uses_data_dir() {
-        let dir = PathBuf::from("/tmp/kue-test-rec-dir");
-        let cap = AudioCapture::new(dir.clone());
-        let path = cap.recording_path("loopback_channel_B");
-        assert_eq!(path.parent(), Some(dir.as_path()));
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn recording_path_timestamp_is_plausible() {
-        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test-rec-ts"));
-        let path = cap.recording_path("test");
-        let filename = path.file_name().unwrap().to_str().unwrap();
-        // Extract timestamp: "test_{timestamp}.wav"
-        let ts_str = filename
-            .strip_prefix("test_")
-            .and_then(|s| s.strip_suffix(".wav"))
-            .expect("filename should match test_<timestamp>.wav");
+    fn session_temp_dir_timestamp_is_plausible() {
+        let path = AudioCapture::session_temp_dir();
+        let dirname = path.file_name().unwrap().to_str().unwrap();
+        let ts_str = dirname
+            .strip_prefix("kue-session-")
+            .expect("dirname should start with kue-session-");
         let ts: u64 = ts_str.parse().expect("timestamp should be a valid u64");
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // Timestamp should be within the last 5 seconds (test runs fast)
         assert!(
             ts <= now && ts >= now.saturating_sub(5),
             "Timestamp {ts} should be close to now {now}"
         );
-        fs::remove_dir_all("/tmp/kue-test-rec-ts").ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // finalize_session() — cleanup / retention logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn finalize_session_noop_when_no_session() {
+        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test"));
+        // Should not panic when session_dir is None
+        cap.finalize_session(false);
+        cap.finalize_session(true);
+    }
+
+    #[test]
+    fn finalize_session_retain_false_deletes_dir() {
+        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test"));
+        let tmp = PathBuf::from("/tmp/kue-finalize-delete-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("test.wav"), b"fake wav data").unwrap();
+
+        {
+            let mut inner = cap.inner.lock().unwrap();
+            inner.session_dir = Some(tmp.clone());
+        }
+        cap.finalize_session(false);
+        assert!(!tmp.exists(), "session dir should be deleted when retain=false");
+    }
+
+    #[test]
+    fn finalize_session_retain_true_moves_files() {
+        let recordings_dir = PathBuf::from("/tmp/kue-finalize-move-recordings");
+        let _ = fs::remove_dir_all(&recordings_dir);
+
+        let cap = AudioCapture::new(recordings_dir.clone());
+
+        let tmp = PathBuf::from("/tmp/kue-finalize-move-session");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("mic_channel_A.wav"), b"mic data").unwrap();
+        fs::write(tmp.join("loopback_channel_B.wav"), b"loopback data").unwrap();
+
+        {
+            let mut inner = cap.inner.lock().unwrap();
+            inner.session_dir = Some(tmp.clone());
+        }
+        cap.finalize_session(true);
+
+        // The temp dir should be gone
+        assert!(!tmp.exists(), "session dir should be deleted after finalize");
+
+        // Files should have been moved to recordings_dir/{tmp_name}/
+        let dirname = tmp.file_name().unwrap();
+        let target = recordings_dir.join(dirname);
+        assert!(target.join("mic_channel_A.wav").exists(), "mic file should be in recordings");
+        assert!(target.join("loopback_channel_B.wav").exists(), "loopback file should be in recordings");
+
+        fs::remove_dir_all(&recordings_dir).ok();
+    }
+
+    #[test]
+    fn finalize_session_retain_true_creates_recordings_dir() {
+        let recordings_dir = PathBuf::from("/tmp/kue-finalize-create-recordings/nested");
+        let _ = fs::remove_dir_all(&recordings_dir);
+
+        let cap = AudioCapture::new(recordings_dir.clone());
+
+        let tmp = PathBuf::from("/tmp/kue-finalize-create-session");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("data.wav"), b"data").unwrap();
+
+        {
+            let mut inner = cap.inner.lock().unwrap();
+            inner.session_dir = Some(tmp.clone());
+        }
+        cap.finalize_session(true);
+
+        let dirname = tmp.file_name().unwrap();
+        assert!(recordings_dir.join(dirname).join("data.wav").exists());
+
+        fs::remove_dir_all("/tmp/kue-finalize-create-recordings").ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // finalize_session — error branches
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn finalize_session_retain_true_no_filename_does_not_panic() {
+        // When session_dir has no file_name (e.g., a root path), retain=true
+        // should not panic — it simply skips the file-moving branch.
+        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test-no-fn"));
+        let root = PathBuf::from("/"); // has no meaningful file_name
+
+        {
+            let mut inner = cap.inner.lock().unwrap();
+            inner.session_dir = Some(root);
+        }
+        // Should not panic
+        cap.finalize_session(true);
     }
 
     // -----------------------------------------------------------------------
@@ -815,8 +956,26 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Constants
+    // cleanup_orphaned_temp_dirs
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn cleanup_orphaned_temp_dirs_removes_stale_kue_dirs() {
+        let stale = std::env::temp_dir().join("kue-session-stale-test");
+        let _ = fs::remove_dir_all(&stale);
+        fs::create_dir_all(&stale).unwrap();
+
+        let other = std::env::temp_dir().join("other-app-temp");
+        let _ = fs::remove_dir_all(&other);
+        fs::create_dir_all(&other).unwrap();
+
+        AudioCapture::cleanup_orphaned_temp_dirs();
+
+        assert!(!stale.exists(), "stale kue-session-* dir should be removed");
+        assert!(other.exists(), "non-kue temp dirs should be left alone");
+
+        fs::remove_dir_all(&other).ok();
+    }
 
     // -----------------------------------------------------------------------
     // WAV writer thread — lifecycle and data integrity
