@@ -4,7 +4,7 @@
 
 Aplicación de escritorio (macOS, Tauri v2) con transcripción en tiempo real, RAG local sobre tu CV/proyectos, y hints ultra-cortos para mantener fluidez bajo presión. Post-call, análisis opcional con tu propio LLM (BYOK).
 
-**Estado actual:** Sprint 0 — infraestructura base. El motor de base de datos está implementado y probado. El resto del pipeline (audio → STT → RAG → hints → overlay) está en planificación (ver `spec.md`).
+**Estado actual:** Sprint 0 completa — infraestructura base (Tauri + SQLite/sqlite-vec) y captura de audio dual (micrófono vía `cpal` + loopback de sistema vía ScreenCaptureKit) implementadas y con tests. El resto del pipeline (STT → RAG → hints → overlay) está en planificación (ver `spec.md`).
 
 ---
 
@@ -57,22 +57,24 @@ npm run coverage:rust:full
 ## Arquitectura (alto nivel)
 
 ```
-┌────────────────────────────────────────────┐
-│              Tauri v2 Shell                  │
-│  ┌──────────┐   ┌──────────────────────┐    │
-│  │ Frontend │   │  Rust Backend         │    │
-│  │ (React + │◄──│  - init_db           │    │
-│  │ Tailwind)│   │  - sqlite-vec (RAG)  │    │
-│  │          │   │  - get_db_status cmd │    │
-│  └──────────┘   │  - cpal (mic, stub)  │    │
-│                 │  - SCK (loopback, stub)│   │
-│                 │  - candle (embeddings,│    │
-│                 │    stub)              │    │
-│                 └──────────────────────┘    │
-└────────────────────────────────────────────┘
+┌───────────────────────────────────────────────┐
+│              Tauri v2 Shell                     │
+│  ┌──────────┐   ┌────────────────────────┐    │
+│  │ Frontend │   │  Rust Backend           │    │
+│  │ (React + │◄──│  - init_db             │    │
+│  │ Tailwind)│   │  - sqlite-vec (RAG)    │    │
+│  │          │   │  - get_db_status cmd   │    │
+│  └──────────┘   │  - toggle_audio_capture │    │
+│                 │  - cpal (mic capture)   │    │
+│                 │  - SCK (loopback)       │    │
+│                 │  - hound (WAV writer)   │    │
+│                 │  - candle (embeddings,  │    │
+│                 │    stub)                │    │
+│                 └────────────────────────┘    │
+└───────────────────────────────────────────────┘
 ```
 
-**Leyenda:** Todo lo marcado como "stub" son dependencias declaradas en `Cargo.toml` pero sin código funcional aún.
+**Leyenda:** `cpal`, `screencapturekit-rs` y `hound` tienen código funcional. `candle` sigue siendo stub (dependencia declarada en `Cargo.toml` pero sin código de inferencia aún).
 
 ## Stack
 
@@ -81,7 +83,7 @@ npm run coverage:rust:full
 | Frontend | React 18 + TypeScript + Tailwind CSS 3 |
 | App Core | Rust (Tauri v2) |
 | Base de datos | SQLite + sqlite-vec (vectores) |
-| Audio (planeado) | cpal (mic) + screencapturekit-rs (loopback) |
+| Audio | cpal (mic) + screencapturekit-rs (loopback) + hound (WAV) |
 | STT (planeado) | Moonshine |
 | Embeddings (planeado) | candle (HuggingFace Rust) |
 | Post-call (planeado) | BYOK (Anthropic/OpenAI/Ollama/etc.) |
@@ -103,9 +105,12 @@ kue/
 ├── src-tauri/            # Backend Rust (Tauri)
 │   ├── src/
 │   │   ├── main.rs       # Entry point
-│   │   ├── lib.rs        # Tauri builder + setup
-│   │   └── db/
-│   │       └── mod.rs    # Schema, migraciones, sqlite-vec, tests
+│   │   ├── lib.rs        # Tauri builder + setup (registra DB + AudioCapture)
+│   │   ├── db/
+│   │   │   └── mod.rs    # Schema, migraciones, sqlite-vec, tests
+│   │   └── audio/
+│   │       ├── mod.rs    # Re-export del módulo capture
+│   │       └── capture.rs # Captura dual (cpal + SCK), WAV writer, toggle_audio_capture cmd
 │   ├── Cargo.toml        # Dependencias Rust
 │   ├── tauri.conf.json   # Configuración Tauri v2
 │   └── capabilities/     # Permisos Tauri (core, shell)

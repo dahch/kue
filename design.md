@@ -1,6 +1,6 @@
 # Kue — Technical Design
 
-> Estado actual: **Sprint 0** (infraestructura base). Este documento describe la arquitectura viva del proyecto, indicando qué partes están implementadas y cuáles son planeadas.
+> Estado actual: **Sprint 0** (infraestructura base + captura de audio dual). Este documento describe la arquitectura viva del proyecto, indicando qué partes están implementadas y cuáles son planeadas.
 
 ---
 
@@ -13,51 +13,57 @@ graph TD
     end
 
     subgraph "Tauri Bridge (IPC)"
-        B[tauri::command<br/>get_db_status]
+        B1[tauri::command<br/>get_db_status]
+        B2[tauri::command<br/>toggle_audio_capture]
     end
 
     subgraph "Rust Backend (lib.rs)"
         C[db::init_db]
         D[db::register_vec_extension]
-        E[setup handler]
+        E[setup handler<br/>DB + AudioCapture]
+        F[audio::capture<br/>AudioCapture]
     end
 
     subgraph "Database Layer (db/mod.rs)"
-        F[(SQLite + sqlite-vec)]
-        G[sessions]
-        H[transcript_lines]
-        I[documents]
-        J[chunks]
-        K[chunks_vec]
-        L[settings]
+        G[(SQLite + sqlite-vec)]
+        H[sessions]
+        I[transcript_lines]
+        J[documents]
+        K[chunks]
+        L[chunks_vec]
+        M[settings]
     end
 
-    subgraph "Audio Pipeline (planeado)"
-        M[cpal - micrófono<br/>Aún sin código]
-        N[screencapturekit-rs - loopback<br/>Aún sin código]
+    subgraph "Audio Capture (implementado)"
+        N[cpal - micrófono<br/>Canal A]
+        O[screencapturekit-rs - loopback<br/>Canal B]
+        P[hound - WAV writer<br/>Background threads]
     end
 
     subgraph "ML Pipeline (planeado)"
-        O[Moonshine STT<br/>Aún sin dependencia]
-        P[candle embeddings<br/>Dependencia declarada]
+        Q[Moonshine STT<br/>Aún sin dependencia]
+        R[candle embeddings<br/>Dependencia declarada]
     end
 
-    A -->|invoke| B
-    B --> C
-    C --> F
-    D --> F
+    A -->|invoke| B1
+    A -->|invoke| B2
+    B1 --> C
+    B2 --> F
+    C --> G
+    D --> G
     E --> C
-    F --> G
-    F --> H
-    F --> I
-    F --> J
-    F --> K
-    F --> L
+    E --> F
+    N --> P
+    O --> P
+    G --> H
+    G --> I
+    G --> J
+    G --> K
+    G --> L
+    G --> M
 
-    style M fill:#f0f0f0,stroke-dasharray: 5 5
-    style N fill:#f0f0f0,stroke-dasharray: 5 5
-    style O fill:#f0f0f0,stroke-dasharray: 5 5
-    style P fill:#f0f0f0,stroke-dasharray: 5 5
+    style Q fill:#f0f0f0,stroke-dasharray: 5 5
+    style R fill:#f0f0f0,stroke-dasharray: 5 5
     style A fill:#e1f5fe,stroke:#0288d1
 ```
 
@@ -73,30 +79,52 @@ graph TD
 - **`index.css`** — Directivas Tailwind (`@tailwind base/components/utilities`).
 
 ### 2.2 Tauri Shell (`lib.rs`)
-Archivo `src-tauri/src/lib.rs` (19 líneas):
+Archivo `src-tauri/src/lib.rs` (~28 líneas):
 
 ```
+mod audio;   // <-- Nuevo: módulo de captura de audio
+mod db;
+
 run() {
-    db::register_vec_extension();   // Registra sqlite-vec antes que cualquier conexión
+    db::register_vec_extension();             // Registra sqlite-vec antes que cualquier conexión
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             let database = db::init_db(app);   // Crea ~/Library/.../kue.db + migra schema
-            app.manage(database);               // Estado gestionado por Tauri
+            app.manage(database);
+
+            let recordings_dir = app.path().app_data_dir()?.join("recordings");
+            std::fs::create_dir_all(&recordings_dir).ok();
+            app.manage(audio::capture::AudioCapture::new(recordings_dir));
+            // Inyecta AudioCapture como estado accesible desde comandos Tauri
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![db::get_db_status])
+        .invoke_handler(tauri::generate_handler![
+            db::get_db_status,
+            audio::capture::toggle_audio_capture   // Nuevo comando
+        ])
         .run(tauri::generate_context!())
 }
 ```
 
-- **plugin(tauri_plugin_shell)** — Necesario para invocar procesos externos (planeado para BYOK).
-- **app.manage(database)** — Inyecta `Database` como estado accesible desde cualquier `#[tauri::command]`.
+- **`mod audio`** — Declara el submódulo de captura de audio (mic + loopback + WAV).
+- **`plugin(tauri_plugin_shell)`** — Necesario para invocar procesos externos (planeado para BYOK).
+- **`app.manage(database)`** y **`app.manage(AudioCapture)`** — Inyecta `Database` y `AudioCapture` como estado accesible desde cualquier `#[tauri::command]`.
 
 ### 2.3 Database Module (`db/mod.rs`)
 El módulo sustancial de la app (715 líneas, 20+ tests). Ver §3 para detalle del schema y §4 para tests.
 
-### 2.4 Configuración
+### 2.4 Audio Module (`audio/capture.rs`)
+Módulo sustancial (~1000 líneas, 28 tests) que implementa la captura de audio dual:
+
+- **Micrófono (Canal A):** vía `cpal`, soporta formatos de sample i16 y f32 con conversión automática a i16.
+- **Loopback (Canal B):** vía `screencapturekit-rs` (ScreenCaptureKit), captura el audio de salida del sistema (voz del entrevistador). `excludes_current_process_audio: true` para evitar eco.
+- **WAV writer:** dos hilos background (`kue-wav-mic-A`, `kue-wav-loopback-B`) que escriben los canales a archivos WAV separados (16 kHz, mono, 16-bit) usando `hound`.
+- **`AudioCapture` struct:** gestionado como estado Tauri vía `app.manage()`. Expone `start(mode)`, `stop()`, `toggle(start, mode)`.
+- **`toggle_audio_capture` command:** comando Tauri que arranca/para ambas capturas, validando modo (`practice`|`shadow`) contra el CHECK constraint de la BD.
+- **28 tests:** cubren conversión f32→i16 (casos borde: NaN, infinito, clamping), serialización de estados, creación de directorios, formato de paths, modo inválido, writer WAV (creación, buffers múltiples, path inválido, buffer vacío), y consistencia entre validación de modos y DB.
+
+### 2.5 Configuración
 - **`tauri.conf.json`** — Tauri v2, ventana de 800×600, bundle DMG (solo macOS), dev URL en puerto 1420.
 - **`vite.config.ts`** — Vite 6 con plugin React, HMR en puerto 1421, ignora cambios en `src-tauri/`.
 - **`capabilities/default.json`** — Permisos: `core:default` + `shell:allow-open`.
@@ -180,13 +208,14 @@ Todas las DDL usan `IF NOT EXISTS`. El test `open_and_migrate_is_idempotent` cor
 ## 5. Planeado vs implementado
 
 | Componente | Estado | Dependencia en Cargo.toml | Código |
-|---|---|---|---|
+|---|---|---|---|---|
 | DB schema + migraciones | **Implementado** | `rusqlite`, `sqlite-vec` | `db/mod.rs` |
 | sqlite-vec register | **Implementado** | `sqlite-vec` | `db/mod.rs` |
 | Tauri setup + comandos | **Implementado** | `tauri 2` | `lib.rs` |
 | Frontend placeholder | **Implementado** | React 18 | `App.tsx` |
-| Captura micrófono (cpal) | **Stub (dependencia declarada)** | `cpal` presente | Sin imports |
-| Captura loopback (SCK) | **Stub (dependencia declarada)** | `screencapturekit` presente | Sin imports |
+| Captura micrófono (cpal) | **Implementado** | `cpal` (activo) | `audio/capture.rs` |
+| Captura loopback (SCK) | **Implementado** | `screencapturekit` (activo) | `audio/capture.rs` |
+| Escritura WAV (hound) | **Implementado** | `hound` (activo) | `audio/capture.rs` |
 | Embeddings (candle) | **Stub (dependencia declarada)** | `candle-core`, `candle-transformers` presentes | Sin imports |
 | STT (Moonshine) | **No iniciado** | No declarada | — |
 | Clasificador de preguntas | **No iniciado** | — | — |
@@ -214,10 +243,10 @@ Todas las DDL usan `IF NOT EXISTS`. El test `open_and_migrate_is_idempotent` cor
 | `tauri-plugin-shell` | Invocación de procesos externos (BYOK) | 2 |
 | `rusqlite` | Cliente SQLite con bundled | 0.33 |
 | `sqlite-vec` | Índice vectorial dentro de SQLite | 0.1.9 |
-| `cpal` | Captura de audio por micrófono (stub) | 0.15 |
-| `screencapturekit-rs` | Captura de loopback de sistema (stub) | git |
+| `cpal` | Captura de audio por micrófono | 0.15 |
+| `screencapturekit-rs` | Captura de loopback de sistema | git |
+| `hound` | Encoding/decoding WAV | 3.5 |
 | `candle-core` | Framework ML para embeddings (stub) | 0.8 |
 | `candle-transformers` | Modelos transformer (stub) | 0.8 |
-| `hound` | Encoding/decoding WAV (stub) | 3.5 |
 | `serde` / `serde_json` | Serialización IPC | 1 |
 | `anyhow` / `thiserror` | Manejo de errores idiomático | 1 / 2 |
