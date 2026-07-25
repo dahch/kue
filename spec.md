@@ -2,7 +2,7 @@
 
 > Nombre en clave: **Kue**.
 
-> **Estado de implementación:** Sprint 0 completado (infraestructura Tauri + SQLite + sqlite-vec + captura de audio dual). El schema de BD está implementado (20+ tests) y el módulo de captura de audio (mic + loopback, ~1000 líneas, 28 tests) también. Las secciones §3–§9 describen el producto completo planeado; consulta [`design.md`](./design.md) para lo que está realmente construido. 
+> **Estado de implementación:** Sprint 0 + RAG engine completados (infraestructura Tauri + SQLite + sqlite-vec + captura de audio dual + embeddings con candle + búsqueda vectorial). El schema de BD está implementado (22 tests), el módulo de captura de audio (mic + loopback, ~1000 líneas, 51 tests) y el motor de RAG (embeddings + indexador, ~600 líneas, 44 tests) también. Las secciones §3–§9 describen el producto completo planeado; consulta [`design.md`](./design.md) para lo que está realmente construido. 
 
 ## 1. Objetivo
 
@@ -136,7 +136,7 @@ settings(key, value)  -- NO incluye API keys (ver §5, Keychain)
 |---|---|---|---|---|
 | 0 | Infraestructura base | Proyecto Tauri + React. Dependencias Rust (`cpal`, `screencapturekit-rs`, `tauri`, `rusqlite`+`sqlite-vec`, `candle`). Schema SQLite completo (sessions, transcript_lines, documents, chunks, chunks_vec, settings) con migraciones. sqlite-vec registrado. Captura de audio dual (mic cpal + loopback SCK) con escritura WAV. `get_db_status` y `toggle_audio_capture` commands. 48+ tests. | ✅ **Completado** |
 | 1 | STT (Moonshine) | Integración de Moonshine en canal B. | ⬜ No iniciado |
-| 2 | Motor de RAG | Indexación de documentos locales. sqlite-vec + candle generando y buscando embeddings. Objetivo: query <20ms. | ⬜ No iniciado |
+| 2 | Motor de RAG | Indexación de documentos locales. sqlite-vec + candle generando y buscando embeddings. Objetivo: query <20ms. | ✅ **Completado** |
 | 3 | Clasificador & hints | Reglas de §7 en Rust. Generación de hint de 5-8 palabras. Eventos Tauri al frontend. | ⬜ No iniciado |
 | 4 | Overlay & UI | Ventana transparente, always-on-top, click-through. Practice vs Shadow. Botón de Pánico. | ⬜ No iniciado |
 | 5 | Post-call & BYOK | Export/consulta de SQLite. Llamada a API externa. Guardado seguro de key en keychain. Guardado del análisis. | ⬜ No iniciado |
