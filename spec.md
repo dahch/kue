@@ -48,7 +48,7 @@ Aplicación de escritorio (macOS-only en v1) que funciona como "copiloto de memo
 | App Core | Rust (Tauri) | Acceso nativo a audio, ventanas transparentes (overlay), binario único. |
 | Captura de audio | `cpal` (mic) + `screencapturekit-rs` (loopback sistema) | ScreenCaptureKit (macOS 13+) captura audio de sistema sin drivers virtuales — evita depender de BlackHole. Requiere permiso de usuario en Ajustes → Privacidad → Screen & System Audio Recording (no hay entitlement de firma que lo evite). |
 | STT | Moonshine (Medium) | Local, streaming, <260ms de latencia, diarización nativa como respaldo. |
-| Embeddings (RAG) | candle (HuggingFace Rust) | Inferencia nativa en Rust. Candidatos: `all-MiniLM-L6-v2` o `snowflake-arctic-embed-s` (pendiente benchmark propio). |
+| Embeddings (RAG) | candle (HuggingFace Rust) | Inferencia nativa en Rust. Decidido: `snowflake-arctic-embed-s` (384-d, mismo esquema que MiniLM, mejor desempeño en benchmarks MTEB/BEIR). |
 | Vector DB / Storage | SQLite + sqlite-vec | Búsqueda vectorial dentro del mismo archivo `.db` que transcripts/sesiones. |
 | Clasificador de preguntas | Rust, heurísticas + regex | Sin LLM externo — ver §7 para el detalle de reglas. |
 | Análisis post-call | BYOK (Anthropic/OpenAI/Gemini/OpenRouter/Ollama/OpenAI-compatible) | Sin presión de latencia, usuario controla costo y privacidad. |
@@ -121,7 +121,7 @@ transcript_lines(id, session_id, speaker, text, started_at_ms, ended_at_ms)
 documents(id, filename, type, added_at)
 chunks(id, document_id, text, chunk_index, tag, metric)
 chunks_vec(chunk_id, embedding)  -- vía sqlite-vec
-settings(key, value)  -- NO incluye API keys (ver §5, Keychain)
+settings(key, value)  -- incluye retain_audio (bool, default false); NO incluye API keys (ver §5, Keychain)
 ```
 
 ## 9. Flujo de usuario
@@ -143,8 +143,8 @@ settings(key, value)  -- NO incluye API keys (ver §5, Keychain)
 
 ## 11. Open Questions / riesgos
 
-- **Legalidad de grabar sin consentimiento explícito de la otra parte** — revisar para España como mínimo antes de que esto sea un hábito regular.
-- Benchmark propio entre `all-MiniLM-L6-v2` y `snowflake-arctic-embed-s` para elegir el modelo de embeddings definitivo.
-- Tamaño de chunk / overlap para el RAG de contexto — aún sin definir.
+- **Legalidad de grabar sin consentimiento explícito de la otra parte** — revisar para España como mínimo antes de que esto sea un hábito regular. Mitigado parcialmente por ADR-011 (el audio no persiste por defecto), pero la pregunta legal de fondo sigue abierta para cuando el usuario active retención o para el transcript de texto en sí.
+- ~~Benchmark propio entre `all-MiniLM-L6-v2` y `snowflake-arctic-embed-s`~~ — Resuelto: se eligió snowflake-arctic-embed-s en base a benchmarks públicos de retrieval (MTEB/BEIR publicados por Snowflake), no una prueba propia sobre los documentos del usuario. Mismas 384 dims que MiniLM, sin impacto en el esquema.
+- ~~Tamaño de chunk / overlap para el RAG de contexto~~ — Resuelto: `CHUNK_SIZE=150` palabras, `CHUNK_OVERLAP=20` palabras, validado empíricamente contra el límite de 512 tokens de `snowflake-arctic-embed-s` (BERT WordPiece).
 - Estabilidad de ScreenCaptureKit en macOS <14 — hay reportes de segfaults intermitentes en versiones antiguas; validar el mínimo soportado antes de comprometerlo en el onboarding.
 - Umbral de 2.5s en Shadow — validar empíricamente que no se sienta ni muy ansioso ni muy tarde.

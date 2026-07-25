@@ -76,7 +76,7 @@
 
 **Consecuencias:**
 - *(Positivas)* Un solo archivo `.db` para toda la app — backup y portabilidad triviales. Cero procesos en segundo plano. Consultas híbridas (texto + vector) en una sola query SQL.
-- *(Negativas)* sqlite-vec sigue en fase alpha (breaking changes posibles entre releases menores), aceptado como riesgo menor dado que a esta escala la búsqueda por fuerza bruta es suficiente. candle requiere la descarga inicial del modelo de embeddings (~90MB para all-MiniLM).
+- *(Negativas)* sqlite-vec sigue en fase alpha (breaking changes posibles entre releases menores), aceptado como riesgo menor dado que a esta escala la búsqueda por fuerza bruta es suficiente. candle requiere la descarga inicial del modelo de embeddings (~90MB para snowflake-arctic-embed-s).
 
 **Alternativas descartadas:** zvec (motor dedicado más maduro en ANN, pero implica un segundo motor de almacenamiento separado). LEANN (pipeline de ingesta muy completo, pero ecosistema 100% Python, requeriría sidecar). LanceDB/Qdrant/Milvus (requieren servidor o complican unificar con la DB de transcripts).
 
@@ -129,3 +129,17 @@
 - *(Negativas)* Fricción inicial — el usuario debe obtener y configurar su propia key.
 
 **Alternativas descartadas:** Proveer un modelo propio gestionado por la app (costo de infraestructura, menor privacidad para el usuario).
+
+---
+
+### ADR-011: Audio crudo no persiste por defecto — solo el transcript de texto
+
+**Contexto:** La captura dual escribe WAV de ambos canales para que el STT los consuma en streaming. Persistir esos WAV indefinidamente en disco cambia el perfil de riesgo del producto: deja de ser "guardo un transcript de texto" y pasa a ser "guardo la voz real del entrevistador de forma permanente", lo cual conecta directo con la pregunta legal abierta sobre consentimiento de grabación (spec.md §11) — persistir por defecto la agrava innecesariamente antes de resolverla.
+
+**Decisión:** El WAV se escribe en un directorio temporal de la sesión (`std::env::temp_dir()/kue-session-{timestamp}/`), consumido en streaming por Moonshine. Al finalizar la sesión (`stop_session`), el WAV se borra automáticamente salvo que el usuario haya activado explícitamente `settings.retain_audio` (opt-in, default `false`). El transcript de texto (`transcript_lines`) persiste siempre — es la base real del post-call.
+
+**Consecuencias:**
+- *(Positivas)* Reduce el riesgo legal/de privacidad por defecto sin esperar a resolver la pregunta de consentimiento. El comportamiento por defecto es el más conservador.
+- *(Negativas)* Si el usuario quiere depurar calidad de STT sobre audio real, debe activar la retención explícitamente — fricción menor, aceptada a cambio de la reducción de riesgo.
+
+**Alternativas descartadas:** Persistencia por defecto de los WAV (lo que el código tenía antes de esta corrección) — riesgo innecesario antes de resolver la legalidad de grabación.

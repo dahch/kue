@@ -15,13 +15,17 @@ graph TD
     subgraph "Tauri Bridge (IPC)"
         B1[tauri::command<br/>get_db_status]
         B2[tauri::command<br/>toggle_audio_capture]
+        B3[tauri::command<br/>index_folder_cmd]
+        B4[tauri::command<br/>search_context]
     end
 
     subgraph "Rust Backend (lib.rs)"
         C[db::init_db]
         D[db::register_vec_extension]
-        E[setup handler<br/>DB + AudioCapture]
+        E[setup handler<br/>DB + AudioCapture + Model]
         F[audio::capture<br/>AudioCapture]
+        EM[rag::embeddings<br/>EmbeddingModel (Mutex)]
+        CL[cleanup_orphaned_temp_dirs]
     end
 
     subgraph "Database Layer (db/mod.rs)"
@@ -31,7 +35,7 @@ graph TD
         J[documents]
         K[chunks]
         L[chunks_vec]
-        M[settings]
+        S_KEYS[settings]
     end
 
     subgraph "Audio Capture (implementado)"
@@ -40,9 +44,13 @@ graph TD
         P[hound - WAV writer<br/>Background threads]
     end
 
+    subgraph "Shared Types"
+        TT[types::TranscriptLine<br/>types::Speaker]
+    end
+
     subgraph "RAG Engine (implementado)"
         S[rag::embeddings<br/>snowflake-arctic-embed-s + Metal]
-        T[rag::indexer<br/>ingest / search / chunk]
+        T[rag::indexer<br/>ingest / search / chunk / folder]
     end
 
     subgraph "ML Pipeline (planeado)"
@@ -51,12 +59,17 @@ graph TD
 
     A -->|invoke| B1
     A -->|invoke| B2
+    A -->|invoke| B3
+    A -->|invoke| B4
     B1 --> C
     B2 --> F
+    B3 --> T
+    B4 --> T
     C --> G
     D --> G
     E --> C
     E --> F
+    E --> EM
     N --> P
     O --> P
     G --> H
@@ -64,7 +77,8 @@ graph TD
     G --> J
     G --> K
     G --> L
-    G --> M
+    G --> S_KEYS
+    EM --> S
     S --> T
     T --> G
 
@@ -86,45 +100,55 @@ graph TD
 
 ### 2.2 Tauri Shell (`lib.rs`)
 
-Archivo `src-tauri/src/lib.rs` (~28 líneas):
+Archivo `src-tauri/src/lib.rs` (~37 líneas):
 
 ```
-mod audio;   // <-- Nuevo: módulo de captura de audio
+mod audio;
 mod db;
+mod rag;
+mod types;
 
 run() {
-    db::register_vec_extension();             // Registra sqlite-vec antes que cualquier conexión
+    db::register_vec_extension();                     // Registra sqlite-vec antes que cualquier conexión
+    audio::capture::AudioCapture::cleanup_orphaned_temp_dirs();  // Limpia WAV huérfanos de crashes previos
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
-            let database = db::init_db(app);   // Crea ~/Library/.../kue.db + migra schema
+            let database = db::init_db(app);           // Crea ~/Library/.../kue.db + migra schema
             app.manage(database);
 
             let recordings_dir = app.path().app_data_dir()?.join("recordings");
-            std::fs::create_dir_all(&recordings_dir).ok();
             app.manage(audio::capture::AudioCapture::new(recordings_dir));
-            // Inyecta AudioCapture como estado accesible desde comandos Tauri
+
+            let model = rag::embeddings::load_embedding_model()?;  // Descarga/carga BERT en Metal
+            app.manage(std::sync::Mutex::new(model));    // Mutex para acceso thread-safe
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             db::get_db_status,
-            audio::capture::toggle_audio_capture   // Nuevo comando
+            audio::capture::toggle_audio_capture,
+            rag::indexer::index_folder_cmd,             // Indexa documentos para RAG
+            rag::indexer::search_context,               // Búsqueda vectorial
         ])
         .run(tauri::generate_context!())
 }
 ```
 
-- **`mod audio`** — Declara el submódulo de captura de audio (mic + loopback + WAV).
+- **`mod audio`**, **`mod db`**, **`mod rag`**, **`mod types`** — Submódulos del backend.
+- **`cleanup_orphaned_temp_dirs()`** — Elimina directorios temporales `kue-session-*` dejados por sesiones crasheadas.
 - **`plugin(tauri_plugin_shell)`** — Necesario para invocar procesos externos (planeado para BYOK).
-- **`app.manage(database)`** y **`app.manage(AudioCapture)`** — Inyecta `Database` y `AudioCapture` como estado accesible desde cualquier `#[tauri::command]`.
+- **`app.manage(database)`**, **`app.manage(AudioCapture)`**, **`app.manage(Mutex<EmbeddingModel>)`** — Inyecta `Database`, `AudioCapture` y el modelo de embeddings como estado Tauri.
+- **`index_folder_cmd`** y **`search_context`** — Comandos Tauri para el motor RAG.
 
 ### 2.3 Database Module (`db/mod.rs`)
 
-El módulo sustancial de la app (715 líneas, 20+ tests). Ver §3 para detalle del schema y §4 para tests.
+El módulo sustancial de la app (837 líneas, 27 tests). Ver §3 para detalle del schema y §4 para tests.
 
 ### 2.4 Audio Module (`audio/capture.rs`)
 
-Módulo sustancial (~1000 líneas, 51 tests) que implementa la captura de audio dual:
+Módulo sustancial (~1166 líneas, 50 tests) que implementa la captura de audio dual:
 
 - **Micrófono (Canal A):** vía `cpal`, soporta formatos de sample i16 y f32 con conversión automática a i16.
 - **Loopback (Canal B):** vía `screencapturekit-rs` (ScreenCaptureKit), captura el audio de salida del sistema (voz del entrevistador). `excludes_current_process_audio: true` para evitar eco.
@@ -241,11 +265,15 @@ Todas las DDL usan `IF NOT EXISTS`. El test `open_and_migrate_is_idempotent` cor
 
 ## 6. Patrones de diseño
 
-- **Command pattern (Tauri):** `#[tauri::command]` como entry point de funcionalidad.
-- **State management via Tauri:** `app.manage()` inyecta dependencias accesibles por estado.
-- **Inner function pattern:** `get_db_status_inner` (testeable sin Tauri) separada de `get_db_status` (wrapper Tauri).
+- **Command pattern (Tauri):** `#[tauri::command]` como entry point de funcionalidad (`get_db_status`, `toggle_audio_capture`, `index_folder_cmd`, `search_context`).
+- **State management via Tauri:** `app.manage()` inyecta dependencias accesibles por estado (Database, AudioCapture, Mutex<EmbeddingModel>).
+- **Inner function pattern:** Funciones internas (ej. `get_db_status_inner`, `ingest_documents`, `search`) separadas de wrappers Tauri para testabilidad.
+- **Trait pattern (Embedder):** Abstracción `Embedder` trait con implementaciones `EmbeddingModel` (real) y `MockEmbeddingModel`/`TestEmbedder` (tests), permitiendo testear el indexador sin GPU.
+- **Mutex-guarded model:** `EmbeddingModel` envuelto en `std::sync::Mutex` para acceso thread-safe desde múltiples comandos Tauri; el trait `Embedder` se implementa también para `Mutex<EmbeddingModel>`.
 - **Once pattern:** `std::sync::Once` para registrar sqlite-vec una sola vez en tests.
-- **Temporary directory isolation:** Cada test usa su propio directorio temporal (`TempDir` struct).
+- **Temporary directory isolation:** Cada test usa su propio directorio temporal (`TempDir` struct, con contador atómico).
+- **Transactional ingestion:** Cada archivo se procesa dentro de una transacción SQLite (`BEGIN...COMMIT`) para atomicidad; si falla el embedding se revierte todo el archivo.
+- **Safe Send wrappers:** `MicHandle` y `LoopbackHandle` implementan `Send` manualmente para `cpal::Stream` y `SCStream`, justificado con safety comments por invariante de ownership.
 
 ---
 

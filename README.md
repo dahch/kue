@@ -27,7 +27,7 @@ npm install
 npm run tauri:dev
 ```
 
-La app abrirá una ventana con un contador de prueba. El backend Rust se conecta a SQLite y crea el schema en `~/Library/Application Support/com.kue.app/kue.db`.
+La app abrirá una ventana con controles debug para indexar carpetas (RAG) y buscar contexto. El backend Rust se conecta a SQLite y crea el schema en `~/Library/Application Support/com.kue.app/kue.db`.
 
 ## Tests
 
@@ -67,10 +67,14 @@ npm run coverage:rust:full
 │                 Tauri v2 Shell                        │
 │  ┌──────────┐   ┌───────────────────────────────┐    │
 │  │ Frontend │   │  Rust Backend                  │    │
-│  │ (React + │◄──│  - init_db                    │    │
-│  │ Tailwind)│   │  - get_db_status cmd          │    │
-│  │          │   │  - toggle_audio_capture cmd   │    │
-│  └──────────┘   │  - cpal (mic capture)         │    │
+│  │ (React + │◄──│  - db::init_db                │    │
+│  │ Tailwind)│   │  - db::get_db_status cmd      │    │
+│  │          │   │  - audio::toggle_audio_capture│    │
+│  │          │   │  - rag::index_folder_cmd     │    │
+│  │          │   │  - rag::search_context cmd   │    │
+│  └──────────┘   │  - types (TranscriptLine,     │    │
+│                 │    Speaker)                    │    │
+│                 │  - cpal (mic capture)          │    │
 │                 │  - SCK (loopback)              │    │
 │                 │  - hound (WAV writer)          │    │
 │                 │  ┌─────────────────────────┐   │    │
@@ -121,7 +125,8 @@ kue/
 ├── src-tauri/            # Backend Rust (Tauri)
 │   ├── src/
 │   │   ├── main.rs       # Entry point
-│   │   ├── lib.rs        # Tauri builder + setup (registra DB + AudioCapture + RAG)
+│   │   ├── lib.rs        # Tauri builder + setup (registra DB, AudioCapture, RAG, limpia orphan temp dirs)
+│   │   ├── types.rs      # TranscriptLine, Speaker (contrato STT → clasificador)
 │   │   ├── db/
 │   │   │   └── mod.rs    # Schema, migraciones, sqlite-vec, tests
 │   │   ├── audio/
