@@ -100,6 +100,12 @@ pub fn open_and_migrate(db_path: &Path) -> Result<Database, Box<dyn std::error::
     conn.execute_batch(SCHEMA_DDL)?;
     conn.execute_batch(&vec0_ddl())?;
 
+    // Seed default settings
+    conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('retain_audio', 'false')",
+        [],
+    )?;
+
     Ok(Database {
         conn: Mutex::new(conn),
         path: db_path.to_path_buf(),
@@ -625,6 +631,123 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Schema integrity — document type CHECK constraint
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn documents_type_check_constraint_rejects_empty_type() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("test_doc_type.db");
+
+        let db = open_and_migrate_with_vec(&db_path).unwrap();
+        let conn = db.conn.lock().unwrap();
+
+        let result = conn.execute(
+            "INSERT INTO documents (filename, type) VALUES (?1, ?2)",
+            rusqlite::params!["resume.pdf", ""],
+        );
+        assert!(
+            result.is_err(),
+            "CHECK constraint should reject empty document type"
+        );
+    }
+
+    #[test]
+    fn documents_type_check_constraint_accepts_valid_type() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("test_doc_type.db");
+
+        let db = open_and_migrate_with_vec(&db_path).unwrap();
+        let conn = db.conn.lock().unwrap();
+
+        let result = conn.execute(
+            "INSERT INTO documents (filename, type) VALUES (?1, ?2)",
+            rusqlite::params!["readme.md", "text/markdown"],
+        );
+        assert!(
+            result.is_ok(),
+            "CHECK constraint should accept non-empty document type"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // retain_audio migration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn retain_audio_default_is_false_after_migration() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("test_retain.db");
+
+        let db = open_and_migrate_with_vec(&db_path).unwrap();
+        let conn = db.conn.lock().unwrap();
+
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='retain_audio'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "false", "retain_audio should default to 'false'");
+    }
+
+    #[test]
+    fn retain_audio_migration_is_idempotent() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("test_retain_idem.db");
+
+        let db1 = open_and_migrate_with_vec(&db_path).unwrap();
+        {
+            let conn = db1.conn.lock().unwrap();
+            let v1: String = conn
+                .query_row(
+                    "SELECT value FROM settings WHERE key='retain_audio'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(v1, "false");
+        }
+        drop(db1);
+
+        let db2 = open_and_migrate_with_vec(&db_path).unwrap();
+        let conn = db2.conn.lock().unwrap();
+        let v2: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='retain_audio'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v2, "false", "second migration should not change value");
+    }
+
+    #[test]
+    fn retain_audio_can_be_overridden() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("test_retain_override.db");
+
+        let db = open_and_migrate_with_vec(&db_path).unwrap();
+        let conn = db.conn.lock().unwrap();
+
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('retain_audio', 'true')",
+            [],
+        )
+        .unwrap();
+
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='retain_audio'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "true", "retain_audio should be overridable to 'true'");
+    }
+
+    // -----------------------------------------------------------------------
     // Edge cases
     // -----------------------------------------------------------------------
 
@@ -650,7 +773,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 2, "should support multiple settings");
+        assert_eq!(count, 3, "should support multiple settings (including retain_audio default)");
     }
 
     #[test]
