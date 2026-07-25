@@ -9,6 +9,16 @@ pub const EMBEDDING_DIM: usize = 384;
 
 pub trait Embedder {
     fn generate_embedding(&self, text: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>>;
+
+    /// Returns the number of tokens the tokenizer would produce for `text`.
+    ///
+    /// Used by the indexer to warn when a chunk approaches the model's
+    /// 512-token limit (instead of letting the tokenizer silently truncate).
+    /// The default implementation counts whitespace-separated words as a
+    /// rough fallback; real implementations SHOULD delegate to the tokenizer.
+    fn token_count(&self, text: &str) -> usize {
+        text.split_whitespace().count()
+    }
 }
 
 pub struct EmbeddingModel {
@@ -79,6 +89,36 @@ impl Embedder for EmbeddingModel {
 
         Ok(data)
     }
+
+    fn token_count(&self, text: &str) -> usize {
+        self.tokenizer
+            .encode(text, true)
+            .map(|enc| enc.get_ids().len())
+            .unwrap_or_else(|_| {
+                eprintln!("[kue] Failed to tokenize for token_count, falling back to word count");
+                text.split_whitespace().count()
+            })
+    }
+}
+
+// SAFETY: EmbeddingModel is Send + Sync (BertModel + Tokenizer + Device),
+// so Mutex<EmbeddingModel> can safely implement Embedder, acquiring the
+// lock per call rather than holding it across a full ingestion pipeline.
+impl Embedder for std::sync::Mutex<EmbeddingModel> {
+    fn generate_embedding(&self, text: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        self.lock()
+            .map_err(|e| Box::<dyn std::error::Error>::from(format!("model mutex poisoned: {e}")))?
+            .generate_embedding(text)
+    }
+
+    fn token_count(&self, text: &str) -> usize {
+        self.lock()
+            .map(|g| g.token_count(text))
+            .unwrap_or_else(|e| {
+                eprintln!("[kue] model mutex poisoned in token_count: {e}");
+                0
+            })
+    }
 }
 
 pub fn load_embedding_model() -> Result<EmbeddingModel, Box<dyn std::error::Error>> {
@@ -146,5 +186,52 @@ mod tests {
         let e = TestEmbedder;
         let emb = e.generate_embedding("Hello, World! café résumé ñoño 日本国 αβγ 📚🧪").unwrap();
         assert_eq!(emb.len(), EMBEDDING_DIM);
+    }
+
+    // -----------------------------------------------------------------------
+    // Default token_count implementation (whitespace-based)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn token_count_default_impl_empty_string() {
+        let e = TestEmbedder;
+        assert_eq!(e.token_count(""), 0, "empty string should have 0 tokens");
+    }
+
+    #[test]
+    fn token_count_default_impl_single_word() {
+        let e = TestEmbedder;
+        assert_eq!(e.token_count("hello"), 1);
+    }
+
+    #[test]
+    fn token_count_default_impl_multiple_words() {
+        let e = TestEmbedder;
+        assert_eq!(e.token_count("the quick brown fox"), 4);
+    }
+
+    #[test]
+    fn token_count_default_impl_leading_trailing_whitespace() {
+        let e = TestEmbedder;
+        assert_eq!(e.token_count("  hello world  "), 2, "whitespace should be stripped by split_whitespace");
+    }
+
+    #[test]
+    fn token_count_default_impl_multiline() {
+        let e = TestEmbedder;
+        assert_eq!(e.token_count("line1\nline2\tline3"), 3, "newlines and tabs are whitespace separators");
+    }
+
+    #[test]
+    fn token_count_default_impl_only_whitespace() {
+        let e = TestEmbedder;
+        assert_eq!(e.token_count("   \n  \t  "), 0, "only whitespace should yield 0 tokens");
+    }
+
+    #[test]
+    fn token_count_default_impl_unicode() {
+        let e = TestEmbedder;
+        // Unicode words separated by whitespace
+        assert_eq!(e.token_count("café résumé niño"), 3);
     }
 }
