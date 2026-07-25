@@ -2,6 +2,7 @@ use tauri::Manager;
 
 mod audio;
 mod db;
+mod rag;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

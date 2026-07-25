@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::Manager;
 
+use crate::rag::embeddings::EMBEDDING_DIM;
+
 pub struct Database {
     pub conn: Mutex<Connection>,
     pub path: PathBuf,
@@ -34,9 +36,6 @@ pub fn register_vec_extension() {
         assert_eq!(rc, rusqlite::ffi::SQLITE_OK, "sqlite3_auto_extension failed");
     }
 }
-
-/// Embedding dimension for the vector search index (all-MiniLM-L6-v2 output).
-const EMBEDDING_DIM: u32 = 384;
 
 /// The DDL statements used to bootstrap the database schema.
 /// The vec0 virtual table is appended separately via `vec0_ddl()` so the
