@@ -32,8 +32,20 @@ rev = "9a6b9f3"
 version = "0.8"
 features = ["metal"]
 
+[dependencies.candle-nn]
+version = "0.8"
+
 [dependencies.candle-transformers]
 version = "0.8"
+
+[dependencies.hf-hub]
+version = "0.4"
+
+[dependencies.tokenizers]
+version = "0.21"
+
+[dependencies.bytemuck]
+version = "1"
 
 [dependencies.sqlite-vec]
 version = "0.1.9"
