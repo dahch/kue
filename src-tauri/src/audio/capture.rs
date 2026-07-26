@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,6 +15,8 @@ use screencapturekit::sc_shareable_content::SCShareableContent;
 use screencapturekit::sc_stream::SCStream;
 use screencapturekit::sc_stream_configuration::SCStreamConfiguration;
 use serde::Serialize;
+
+use super::mic_vad::MicVadState;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -88,6 +90,7 @@ impl std::fmt::Debug for LoopbackHandle {
 pub struct AudioCapture {
     inner: Mutex<AudioCaptureInner>,
     recordings_dir: PathBuf,
+    pub(crate) mic_vad: Arc<Mutex<MicVadState>>,
 }
 
 #[derive(Debug)]
@@ -96,6 +99,7 @@ struct AudioCaptureInner {
     loopback: Option<LoopbackHandle>,
     mic_writer: Option<JoinHandle<()>>,
     loopback_writer: Option<JoinHandle<()>>,
+    mic_vad_handle: Option<JoinHandle<()>>,
     stt_thread: Option<JoinHandle<()>>,
     mode: String,
     session_dir: Option<PathBuf>,
@@ -109,12 +113,20 @@ impl AudioCapture {
                 loopback: None,
                 mic_writer: None,
                 loopback_writer: None,
+                mic_vad_handle: None,
                 stt_thread: None,
                 mode: String::new(),
                 session_dir: None,
             }),
             recordings_dir,
+            mic_vad: Arc::new(Mutex::new(MicVadState::new())),
         }
+    }
+
+    /// Returns a clone of the shared `MicVadState` handle so the hint worker
+    /// can check for user voice activity before emitting Shadow-mode hints.
+    pub fn mic_vad_state(&self) -> Arc<Mutex<MicVadState>> {
+        self.mic_vad.clone()
     }
 
     fn session_temp_dir() -> PathBuf {
@@ -146,17 +158,27 @@ impl AudioCapture {
             AudioError::StreamError(format!("Failed to create session temp dir: {e}"))
         })?;
 
+        // Reset mic VAD state so speech from a previous session doesn't carry over.
+        if let Ok(mut vad) = self.mic_vad.lock() {
+            vad.reset();
+        }
+
         // -- Mic (Canal A) -------------------------------------------------
-        let (mic_tx, mic_rx) = sync_channel::<Vec<i16>>(BUFFER_CAPACITY);
-        let mic = start_mic_capture(mic_tx).map_err(|e| {
+        let (mic_wav_tx, mic_wav_rx) = sync_channel::<Vec<i16>>(BUFFER_CAPACITY);
+        let (mic_vad_tx, mic_vad_rx) = sync_channel::<Vec<i16>>(BUFFER_CAPACITY);
+        let mic = start_mic_capture_tee(mic_wav_tx, mic_vad_tx).map_err(|e| {
             let _ = fs::remove_dir_all(&session_dir);
             e
         })?;
         let mic_path = session_dir.join("mic_channel_A.wav");
-        let mic_writer = spawn_wav_writer("mic-A", mic_rx, mic_path)?;
+        let mic_writer = spawn_wav_writer("mic-A", mic_wav_rx, mic_path)?;
+
+        let mic_vad_state = self.mic_vad.clone();
+        let mic_vad_handle = spawn_mic_vad_monitor(mic_vad_rx, mic_vad_state);
 
         inner.mic = Some(MicHandle(mic));
         inner.mic_writer = Some(mic_writer);
+        inner.mic_vad_handle = Some(mic_vad_handle);
 
         // -- Loopback (Canal B) --------------------------------------------
         let (loopback_tx, loopback_rx) = sync_channel::<Vec<i16>>(BUFFER_CAPACITY);
@@ -192,6 +214,9 @@ impl AudioCapture {
         // Join writer threads so the WAV files are fully flushed.
         inner.mic_writer.take().map(|h| h.join().ok());
         inner.loopback_writer.take().map(|h| h.join().ok());
+
+        // Join VAD monitor thread
+        inner.mic_vad_handle.take().map(|h| h.join().ok());
 
         // Join STT thread (it will disconnect when the audio receiver drops)
         inner.stt_thread.take().map(|h| h.join().ok());
@@ -325,10 +350,13 @@ fn spawn_wav_writer(
 }
 
 // ---------------------------------------------------------------------------
-// Mic capture (Canal A) – cpal
+// Mic capture (Canal A) – cpal, with tee for VAD
 // ---------------------------------------------------------------------------
 
-fn start_mic_capture(tx: SyncSender<Vec<i16>>) -> Result<cpal::Stream, AudioError> {
+fn start_mic_capture_tee(
+    wav_tx: SyncSender<Vec<i16>>,
+    vad_tx: SyncSender<Vec<i16>>,
+) -> Result<cpal::Stream, AudioError> {
     let host = cpal::default_host();
     let device = host.default_input_device().ok_or_else(|| {
         AudioError::DeviceNotFound(
@@ -349,7 +377,9 @@ fn start_mic_capture(tx: SyncSender<Vec<i16>>) -> Result<cpal::Stream, AudioErro
                 .build_input_stream::<i16, _, _>(
                     &stream_config,
                     move |data, _| {
-                        let _ = tx.try_send(data.to_vec());
+                        let samples = data.to_vec();
+                        let _ = wav_tx.try_send(samples.clone());
+                        let _ = vad_tx.try_send(samples);
                     },
                     move |err| eprintln!("[kue] Mic capture error: {err}"),
                     None,
@@ -370,7 +400,8 @@ fn start_mic_capture(tx: SyncSender<Vec<i16>>) -> Result<cpal::Stream, AudioErro
                             .iter()
                             .map(|&s| f32_to_i16(s))
                             .collect();
-                        let _ = tx.try_send(converted);
+                        let _ = wav_tx.try_send(converted.clone());
+                        let _ = vad_tx.try_send(converted);
                     },
                     move |err| eprintln!("[kue] Mic capture error: {err}"),
                     None,
@@ -475,6 +506,28 @@ fn start_loopback_capture_tee(
 
     println!("[kue] Loopback capture (Canal B) with STT tee started — 16 kHz, mono via ScreenCaptureKit");
     Ok(stream)
+}
+
+// ---------------------------------------------------------------------------
+// Mic VAD monitor thread
+// ---------------------------------------------------------------------------
+
+/// Spawns a background thread that reads i16 mic audio samples and feeds
+/// them into the shared `MicVadState`.  The thread exits when the channel
+/// is closed (mic capture stops).
+fn spawn_mic_vad_monitor(
+    rx: Receiver<Vec<i16>>,
+    state: Arc<Mutex<MicVadState>>,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name("kue-mic-vad".into())
+        .spawn(move || {
+            for samples in &rx {
+                let mut s = state.lock().expect("mic_vad lock poisoned");
+                s.feed_audio(&samples);
+            }
+        })
+        .expect("failed to spawn mic VAD monitor thread")
 }
 
 // ---------------------------------------------------------------------------
@@ -758,9 +811,18 @@ mod tests {
         assert!(inner.loopback.is_none());
         assert!(inner.mic_writer.is_none());
         assert!(inner.loopback_writer.is_none());
+        assert!(inner.mic_vad_handle.is_none());
         assert!(inner.stt_thread.is_none());
         assert!(inner.mode.is_empty());
         assert!(inner.session_dir.is_none());
+    }
+
+    #[test]
+    fn audio_capture_new_has_mic_vad_state() {
+        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test"));
+        let state = cap.mic_vad_state();
+        let s = state.lock().unwrap();
+        assert!(!s.is_currently_speaking());
     }
 
     #[test]
