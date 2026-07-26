@@ -1318,4 +1318,150 @@ mod tests {
         assert!(texts.contains(&"second"), "should contain 'second'");
         assert!(texts.contains(&"third"), "should contain 'third'");
     }
+
+    // ── generate_and_emit_hint: guard clauses ──
+
+    #[test]
+    fn generate_and_emit_hint_none_type_returns_early() {
+        // Should not crash or emit anything
+        generate_and_emit_hint(
+            "any text",
+            QuestionType::None,
+            "practice",
+            "sess-1",
+            None,
+            &HintScheduler::new(),
+            &test_db("none_early"),
+            &MockEmbedder,
+        );
+        // No panic is the assertion
+    }
+
+    #[test]
+    fn generate_and_emit_hint_whitespace_text_returns_early() {
+        // build_hint_text returns empty for whitespace-only text with None qtype
+        generate_and_emit_hint(
+            "   ",
+            QuestionType::Technical,
+            "practice",
+            "sess-1",
+            None,
+            &HintScheduler::new(),
+            &test_db("ws_early"),
+            &MockEmbedder,
+        );
+    }
+
+    #[test]
+    fn generate_and_emit_hint_question_type_none_empty_text() {
+        // Both guard conditions hit: first the qtype == None check,
+        // then the text.trim().is_empty() in build_hint_text
+        generate_and_emit_hint(
+            "",
+            QuestionType::None,
+            "shadow",
+            "sess-1",
+            None,
+            &HintScheduler::new(),
+            &test_db("empty_none"),
+            &MockEmbedder,
+        );
+    }
+
+    // ── generate_and_emit_hint: practice mode without AppHandle ──
+
+    #[test]
+    fn generate_and_emit_hint_practice_mode_no_app_handle_schedules_nothing() {
+        // In practice mode, without an AppHandle the hint is silently dropped
+        // (the function checks `if let Some(handle) = app_handle` and skips emission).
+        let scheduler = HintScheduler::new();
+        generate_and_emit_hint(
+            "What is Rust?",
+            QuestionType::Technical,
+            "practice",
+            "sess-1",
+            None,
+            &scheduler,
+            &test_db("practice_no_handle"),
+            &MockEmbedder,
+        );
+        // Nothing should be scheduled (practice mode uses the scheduler only
+        // when mode == "shadow")
+        let expired = scheduler.tick(Instant::now() + Duration::from_secs(60));
+        assert!(expired.is_empty());
+    }
+
+    // ── generate_and_emit_hint: fallback when search returns no results ──
+
+    #[test]
+    fn generate_and_emit_hint_fallback_to_generic_when_search_empty() {
+        // When the DB is empty, search returns empty → generic_hint is used.
+        // build_hint_text returns the generic hint.
+        let text = "What technology is best?";
+        let scheduler = HintScheduler::new();
+        generate_and_emit_hint(
+            text,
+            QuestionType::Technical,
+            "shadow",
+            "sess-generic",
+            None,
+            &scheduler,
+            &test_db("generic_fallback"),
+            &MockEmbedder,
+        );
+
+        let future = Instant::now() + Duration::from_secs(5);
+        let expired = scheduler.tick(future);
+        assert_eq!(expired.len(), 1, "should have scheduled a hint");
+        assert!(expired[0].text.contains("stack"), "should fall back to generic Technical hint");
+    }
+
+    // ── HintScheduler: hint metadata preserved through tick ──
+
+    #[test]
+    fn scheduler_tick_preserves_hint_metadata() {
+        let s = HintScheduler::new();
+        let now = Instant::now();
+        s.schedule(PendingHint {
+            session_id: "sess-777".into(),
+            qtype: QuestionType::Trap,
+            text: "💡 Sé honesto".into(),
+            fire_at: now + Duration::from_millis(10),
+            scheduled_at: now,
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        let expired = s.tick(Instant::now());
+
+        assert_eq!(expired.len(), 1);
+        let hint = &expired[0];
+        assert_eq!(hint.session_id, "sess-777");
+        assert_eq!(hint.qtype, QuestionType::Trap);
+        assert_eq!(hint.text, "💡 Sé honesto");
+        assert!(hint.fire_at <= Instant::now());
+        assert!(hint.scheduled_at <= hint.fire_at);
+    }
+
+    // ── PendingHint constructor guard ──
+
+    #[test]
+    fn pending_hint_fields_are_accessible() {
+        let now = Instant::now();
+        let hint = PendingHint {
+            session_id: "sess-p".into(),
+            qtype: QuestionType::Architecture,
+            text: "arch hint".into(),
+            fire_at: now + Duration::from_secs(10),
+            scheduled_at: now,
+        };
+        assert_eq!(hint.session_id, "sess-p");
+        assert_eq!(hint.qtype, QuestionType::Architecture);
+        assert_eq!(hint.text, "arch hint");
+        assert!(hint.fire_at > now);
+        assert_eq!(hint.scheduled_at, now);
+    }
+
+    // ── hint_silenced_by_panic helper ──
+    // Cannot test directly (requires AppHandle), but the component
+    // PanicState.is_panicking() is already tested above.
 }
