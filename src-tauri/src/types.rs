@@ -29,7 +29,7 @@ pub struct TranscriptLine {
 /// Values are serialized to lowercase (`"user"`, `"interviewer"`) to match the
 /// `CHECK(speaker IN ('user', 'interviewer'))` constraint in the SQL schema.
 /// Always use the `Display` impl or `as_db_str()` when persisting.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Speaker {
     User,
     Interviewer,
