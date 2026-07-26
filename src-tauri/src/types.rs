@@ -24,8 +24,34 @@ pub struct TranscriptLine {
 /// Speaker label derived from the audio channel:
 /// - `User` = Canal A (micrófono del candidato).
 /// - `Interviewer` = Canal B (loopback de sistema, entrevistador).
+///
+/// # DB contract
+/// Values are serialized to lowercase (`"user"`, `"interviewer"`) to match the
+/// `CHECK(speaker IN ('user', 'interviewer'))` constraint in the SQL schema.
+/// Always use the `Display` impl or `as_db_str()` when persisting.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Speaker {
     User,
     Interviewer,
+}
+
+impl Speaker {
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            Speaker::User => "user",
+            Speaker::Interviewer => "interviewer",
+        }
+    }
+}
+
+impl std::fmt::Display for Speaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_db_str())
+    }
+}
+
+impl From<Speaker> for String {
+    fn from(s: Speaker) -> Self {
+        s.as_db_str().to_string()
+    }
 }

@@ -9,6 +9,7 @@ use tauri::Emitter;
 use super::cli::MoonshineCLIEngine;
 use super::ffi::MoonshineFFIEngine;
 use super::{SimpleVAD, STTConfig, STTEngine};
+use crate::classifier::{classify, QuestionType};
 use crate::types::{Speaker, TranscriptLine};
 
 pub struct STTPipeline {
@@ -189,6 +190,14 @@ impl STTPipeline {
             }
 
             if let Some(ref handle) = app_handle {
+                // Classify first (borrow), then move transcribed into event
+                let qtype = classify(&transcribed);
+                let qtext = if qtype != QuestionType::None {
+                    Some(transcribed.clone())
+                } else {
+                    None
+                };
+
                 let line = TranscriptLine {
                     speaker: Speaker::Interviewer,
                     text: transcribed,
@@ -197,6 +206,16 @@ impl STTPipeline {
                 };
                 if let Err(e) = handle.emit("new-transcript", line) {
                     eprintln!("[kue] Failed to emit new-transcript event: {e}");
+                }
+
+                if let Some(text) = qtext {
+                    if let Err(e) = handle.emit("question-detected", serde_json::json!({
+                        "text": text,
+                        "type": qtype.as_str(),
+                        "session_id": session_id,
+                    })) {
+                        eprintln!("[kue] Failed to emit question-detected event: {e}");
+                    }
                 }
             }
         }
@@ -217,7 +236,7 @@ impl STTPipeline {
         if let Err(e) = conn.execute(
             "INSERT INTO transcript_lines (session_id, speaker, text, started_at_ms, ended_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![session_id, "interviewer", text, started_at_ms, ended_at_ms],
+            rusqlite::params![session_id, Speaker::Interviewer.as_db_str(), text, started_at_ms, ended_at_ms],
         ) {
             eprintln!("[kue] STT: failed to persist transcript line: {e}");
         }

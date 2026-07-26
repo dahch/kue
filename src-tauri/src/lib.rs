@@ -1,6 +1,7 @@
 use tauri::Manager;
 
 mod audio;
+mod classifier;
 mod db;
 mod rag;
 mod stt;
@@ -32,6 +33,7 @@ pub fn run() {
             audio::capture::toggle_audio_capture,
             rag::indexer::index_folder_cmd,
             rag::indexer::search_context,
+            classifier::classify_text,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
