@@ -4,7 +4,7 @@
 
 Desktop application (macOS, Tauri v2) with real-time transcription, local RAG over your CV/projects, and ultra-short hints to maintain fluency under pressure. Post-call, optional analysis with your own LLM (BYOK).
 
-**Current status:** Sprints 0–6 completed. All v1 features implemented and tested: base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline + batch transcription for Channel A), question classifier (heuristics + regex with bilingual EN/ES keyword lists including trap keywords for regret/failure) wired into the STT pipeline, orchestrator (HintScheduler + hint worker + PanicState) producing hints from classifier+RAG, overlay window (transparent, always-on-top, click-through, 400×100) with hint display component (3s auto-dismiss via React `Overlay` component), mic VAD for Shadow-mode hint cancellation, panic/mute button (10s hint silence via `PanicState`), mode selection UI (Practice/Shadow in `App.tsx`), Channel A batch transcription at session end (ADR-015), post-call BYOK analysis with keychain-stored API keys and LLM provider selection (Anthropic/OpenAI/Ollama/etc.), and Moonshine auto-provisioning (`stt/provisioning.rs` downloads dylibs + model on first launch, reports progress via `moonshine-download-progress` events, retry via `retry_moonshine_download` Tauri command). All implemented and tested (~400 tests in Rust). Remaining work: hint positioning clean-ups — see `spec.md`.
+**Current status:** Sprints 0–6 completed. All v1 features implemented and tested: base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline + batch transcription for Channel A), question classifier (heuristics + regex with bilingual EN/ES keyword lists including trap keywords for regret/failure) wired into the STT pipeline, orchestrator (HintScheduler + hint worker + PanicState) producing hints from classifier+RAG, overlay window (transparent, always-on-top, click-through, 400×100) with hint display component (3s auto-dismiss via React `Overlay` component), mic VAD for Shadow-mode hint cancellation, panic/mute button (10s hint silence via `PanicState`), mode selection UI (Practice/Shadow in `App.tsx`), Channel A batch transcription at session end (ADR-015), post-call BYOK analysis with keychain-stored API keys and LLM provider selection (Anthropic/OpenAI/Ollama/etc.), and Moonshine auto-provisioning (`stt/provisioning.rs` downloads dylibs + model on first launch, reports progress via `moonshine-download-progress` events, retry via `retry_moonshine_download` Tauri command). All implemented and tested (~534 tests in Rust). Remaining work: hint positioning clean-ups — see `spec.md`.
 
 ---
 
@@ -35,7 +35,7 @@ The app will open a session control UI (mode selector, start/stop, panic button,
 # Rust tests (database — all logic implemented)
 npm run test:rust:db
 
-# Rust tests (all modules, ~400 tests)
+# Rust tests (all modules, ~534 tests)
 npm run test:rust
 
 # Rust coverage (requires cargo-tarpaulin)
@@ -53,8 +53,10 @@ npm run coverage:rust:full
 | `npm run tauri` | Tauri CLI directly |
 | `npm run tauri:dev` | Tauri + Vite in development mode |
 | `npm run tauri:build` | Production build (generates .dmg) |
+| `npm run test` | Frontend unit tests (Vitest) |
+| `npm run test:watch` | Frontend tests in watch mode |
 | `npm run test:rust:db` | Tests for the database module only |
-| `npm run test:rust` | Tests for all Rust modules (~400 tests) |
+| `npm run test:rust` | Tests for all Rust modules (~534 tests) |
 | `npm run coverage:rust` | Runs Rust tests (alias for `test:rust`) |
 | `npm run coverage:rust:check` | Checks availability of coverage tools |
 | `npm run coverage:rust:db` | Coverage for the database module (tarpaulin) |
