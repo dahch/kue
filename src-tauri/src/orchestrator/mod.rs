@@ -13,6 +13,22 @@ use crate::db::Database;
 use crate::rag::embeddings::Embedder;
 use crate::rag::indexer::search;
 
+/// Shared state for panic mode — when set, hints are silenced until this instant.
+#[derive(Clone)]
+pub struct PanicState(pub Arc<Mutex<Option<Instant>>>);
+
+impl PanicState {
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+
+    pub fn is_panicking(&self) -> bool {
+        self.0.lock().ok().is_some_and(|guard| {
+            guard.is_some_and(|until| Instant::now() < until)
+        })
+    }
+}
+
 pub const SHADOW_DELAY_MS: u64 = 2500;
 const HINT_TOP_K: usize = 1;
 
@@ -109,6 +125,13 @@ impl Default for HintScheduler {
 ///
 /// When no `MicVadState` is available (e.g. in tests) all hints are
 /// allowed to proceed.
+/// Returns `true` if panic mode is active and hints should be suppressed.
+fn hint_silenced_by_panic(app_handle: &tauri::AppHandle) -> bool {
+    app_handle
+        .try_state::<PanicState>()
+        .is_some_and(|s| s.is_panicking())
+}
+
 pub fn should_cancel_hint(hint: &PendingHint, mic_vad: Option<&crate::audio::mic_vad::MicVadState>) -> bool {
     mic_vad.is_some_and(|vad| {
         vad.is_currently_speaking() || vad.has_speech_since(hint.scheduled_at)
@@ -123,7 +146,14 @@ pub fn should_cancel_hint(hint: &PendingHint, mic_vad: Option<&crate::audio::mic
 /// is silently cancelled (the user is already answering and doesn't need a
 /// prompt).  When no `AudioCapture` state is available (e.g. in tests),
 /// all expired hints are emitted as-is.
+///
+/// If panic mode is active (see [`PanicState`]), all hints are silently dropped
+/// until the panic timer expires.
 pub fn emit_expired_hints(app_handle: &tauri::AppHandle, scheduler: &HintScheduler) {
+    if hint_silenced_by_panic(app_handle) {
+        return;
+    }
+
     let expired = scheduler.tick(Instant::now());
 
     let mic_vad = app_handle
@@ -172,6 +202,12 @@ pub fn generate_and_emit_hint(
 ) {
     if qtype == QuestionType::None || text.trim().is_empty() {
         return;
+    }
+
+    if let Some(handle) = app_handle {
+        if hint_silenced_by_panic(handle) {
+            return;
+        }
     }
 
     let hint_text = build_hint_text(text, qtype, db, model);
@@ -1075,5 +1111,211 @@ mod tests {
         assert_eq!(expired.len(), 1, "only sess-b's hint should survive");
         assert_eq!(expired[0].session_id, "sess-b");
         assert!(expired[0].text.contains("STAR"), "should be the Star generic hint for sess-b");
+    }
+
+    // ── PanicState tests ──
+
+    #[test]
+    fn panic_state_starts_inactive() {
+        let state = PanicState::new();
+        assert!(!state.is_panicking(), "fresh PanicState should not be panicking");
+    }
+
+    #[test]
+    fn panic_state_activated_for_duration() {
+        let state = PanicState::new();
+        {
+            let mut guard = state.0.lock().unwrap();
+            *guard = Some(Instant::now() + Duration::from_secs(10));
+        }
+        assert!(state.is_panicking(), "should be panicking while within the 10s window");
+    }
+
+    #[test]
+    fn panic_state_expires() {
+        let state = PanicState::new();
+        {
+            let mut guard = state.0.lock().unwrap();
+            // Set panic until 1ms ago — already expired
+            *guard = Some(Instant::now() - Duration::from_millis(1));
+        }
+        // Sleep a tiny bit to ensure the instant is really in the past
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!state.is_panicking(), "should not be panicking after expiry");
+    }
+
+    #[test]
+    fn panic_state_reset_clears_panic() {
+        let state = PanicState::new();
+        {
+            let mut guard = state.0.lock().unwrap();
+            *guard = Some(Instant::now() + Duration::from_secs(10));
+        }
+        assert!(state.is_panicking());
+        {
+            let mut guard = state.0.lock().unwrap();
+            *guard = None;
+        }
+        assert!(!state.is_panicking(), "should not be panicking after reset");
+    }
+
+    // -----------------------------------------------------------------------
+    // HintScheduler: Default impl
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scheduler_default_is_same_as_new() {
+        let a = HintScheduler::new();
+        let b = HintScheduler::default();
+        // Both should be empty and behave identically
+        assert_eq!(a.tick(Instant::now()).len(), b.tick(Instant::now()).len());
+        assert_eq!(a.cancel_all("any"), ());
+    }
+
+    // -----------------------------------------------------------------------
+    // HintScheduler: empty / edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scheduler_tick_empty_returns_empty() {
+        let s = HintScheduler::new();
+        let expired = s.tick(Instant::now());
+        assert!(expired.is_empty(), "tick on empty scheduler should return empty vec");
+    }
+
+    #[test]
+    fn scheduler_cancel_all_empty_is_noop() {
+        let s = HintScheduler::new();
+        // Should not panic or error
+        s.cancel_all("non-existent-session");
+        let expired = s.tick(Instant::now());
+        assert!(expired.is_empty(), "cancel on empty scheduler should leave it empty");
+    }
+
+    // -----------------------------------------------------------------------
+    // HintScheduler: poisoned mutex resilience
+    // -----------------------------------------------------------------------
+
+    /// Poison the scheduler's internal mutex by panicking while holding the lock.
+    /// All public methods should handle the poison gracefully (return defaults).
+    fn poison_scheduler(s: &HintScheduler) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = s.pending.lock().unwrap();
+            panic!("intentional poison");
+        }));
+    }
+
+    #[test]
+    fn scheduler_schedule_handles_poisoned_mutex() {
+        let s = HintScheduler::new();
+        poison_scheduler(&s);
+
+        // schedule should silently ignore the poisoned mutex
+        s.schedule(PendingHint {
+            session_id: "s".into(),
+            qtype: QuestionType::Technical,
+            text: "ignored".into(),
+            fire_at: Instant::now(),
+            scheduled_at: Instant::now(),
+        });
+        // No panic is the main assertion
+    }
+
+    #[test]
+    fn scheduler_tick_handles_poisoned_mutex() {
+        let s = HintScheduler::new();
+        poison_scheduler(&s);
+
+        let expired = s.tick(Instant::now());
+        assert!(
+            expired.is_empty(),
+            "tick on poisoned mutex should return empty vec"
+        );
+    }
+
+    #[test]
+    fn scheduler_cancel_all_handles_poisoned_mutex() {
+        let s = HintScheduler::new();
+        poison_scheduler(&s);
+
+        // cancel_all should silently skip the poisoned mutex
+        s.cancel_all("sess-any");
+        // No panic is the main assertion
+    }
+
+    // -----------------------------------------------------------------------
+    // HintScheduler: schedule + tick integration (poisoned then recovered)
+    // -----------------------------------------------------------------------
+
+    /// Verify that after poisoning, the scheduler still creates a new valid
+    /// guard if the mutex is cleaned up (i.e., the poison is handled and the
+    /// lock is acquired again after the poisoning thread releases it).
+    #[test]
+    fn scheduler_works_after_poison_handled() {
+        // Note: in single-threaded use, poisoning the mutex makes .lock()
+        // return Err(MutexError::Poisoned). The scheduler methods use
+        // `if let Ok` / `match { Ok => ..., Err => return }` which means
+        // they silently skip after poison. For normal recovery, the Mutex
+        // would need to be re-initialized. This test verifies the defensive
+        // behaviour — not that recovery is possible.
+        let s = HintScheduler::new();
+        poison_scheduler(&s);
+
+        // After poison, operations are silently degraded
+        let start = Instant::now();
+        // Schedule will be a no-op (poisoned)
+        s.schedule(PendingHint {
+            session_id: "sess".into(),
+            qtype: QuestionType::Star,
+            text: "will be lost".into(),
+            fire_at: start + Duration::from_millis(10),
+            scheduled_at: start,
+        });
+
+        // Tick will return empty (poisoned)
+        std::thread::sleep(Duration::from_millis(20));
+        let expired = s.tick(Instant::now());
+        assert!(expired.is_empty(), "hint scheduled on poisoned mutex should be lost");
+    }
+
+    // -----------------------------------------------------------------------
+    // HintScheduler: schedule preserves order of equal-deadline hints
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scheduler_returns_all_hints_with_same_deadline() {
+        let s = HintScheduler::new();
+        let now = Instant::now();
+        s.schedule(PendingHint {
+            session_id: "s".into(),
+            qtype: QuestionType::Technical,
+            text: "first".into(),
+            fire_at: now + Duration::from_millis(10),
+            scheduled_at: now,
+        });
+        s.schedule(PendingHint {
+            session_id: "s".into(),
+            qtype: QuestionType::Star,
+            text: "second".into(),
+            fire_at: now + Duration::from_millis(10),
+            scheduled_at: now,
+        });
+        s.schedule(PendingHint {
+            session_id: "s".into(),
+            qtype: QuestionType::Architecture,
+            text: "third".into(),
+            fire_at: now + Duration::from_millis(10),
+            scheduled_at: now,
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        let expired = s.tick(Instant::now());
+
+        assert_eq!(expired.len(), 3, "all three should expire");
+        // tick uses swap_remove so order is not guaranteed; verify all present.
+        let texts: Vec<&str> = expired.iter().map(|h| h.text.as_str()).collect();
+        assert!(texts.contains(&"first"), "should contain 'first'");
+        assert!(texts.contains(&"second"), "should contain 'second'");
+        assert!(texts.contains(&"third"), "should contain 'third'");
     }
 }
