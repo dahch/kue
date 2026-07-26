@@ -2580,6 +2580,7 @@ dependencies = [
  "cpal",
  "hf-hub",
  "hound",
+ "libloading 0.8.9",
  "rusqlite",
  "screencapturekit",
  "serde",
@@ -2590,6 +2591,7 @@ dependencies = [
  "tauri-plugin-shell",
  "thiserror 2.0.19",
  "tokenizers",
+ "uuid",
 ]
 
 [[package]]
