@@ -31,6 +31,9 @@ function Overlay() {
       if (timerRef.current) clearTimeout(timerRef.current);
       setHint(event.payload);
       setVisible(true);
+      getCurrentWebviewWindow().show().catch((err) =>
+        console.warn("Overlay: failed to show window on new-hint", err),
+      );
       timerRef.current = setTimeout(() => setVisible(false), 3000);
     });
 
@@ -44,14 +47,16 @@ function Overlay() {
       }, ms);
     });
 
-    const unlistenStart = listen<SessionStartedPayload>("session-started", (event) => {
-      if (event.payload.mode === "shadow") {
-        getCurrentWebviewWindow().show().catch(() => {});
-      }
+    const unlistenStart = listen<SessionStartedPayload>("session-started", () => {
+      getCurrentWebviewWindow().show().catch((err) =>
+        console.warn("Overlay: failed to show window on session-started", err),
+      );
     });
 
     const unlistenStop = listen("session-stopped", () => {
-      getCurrentWebviewWindow().hide().catch(() => {});
+      getCurrentWebviewWindow().hide().catch((err) =>
+        console.warn("Overlay: failed to hide window on session-stopped", err),
+      );
       setVisible(false);
       setHint(null);
     });
@@ -64,8 +69,10 @@ function Overlay() {
       if (timerRef.current) clearTimeout(timerRef.current);
       if (panicTimerRef.current) clearTimeout(panicTimerRef.current);
     };
+    // Tauri event listeners are global singletons; register once on mount
   }, []);
 
+  // Top-center: transparent floating 400×100 window, unobtrusive above main content
   return (
     <div
       className="fixed inset-0 flex items-start justify-center pt-8 transition-opacity duration-500"

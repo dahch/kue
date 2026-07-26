@@ -20,7 +20,7 @@ interface PanicPayload {
   until_secs: number;
 }
 
-interface SessionRow {
+export interface SessionRow {
   id: string;
   started_at: string;
   ended_at: string | null;
@@ -30,7 +30,7 @@ interface SessionRow {
   line_count: number;
 }
 
-interface AnalyzeResult {
+export interface AnalyzeResult {
   summary: string;
   weak_questions: string[];
   forgotten_projects: string[];
@@ -109,7 +109,7 @@ function ApiKeyInput({
   );
 }
 
-function PostCallPanel({ session }: { session: SessionRow }) {
+export function PostCallPanel({ session }: { session: SessionRow }) {
   const [transcriptReady, setTranscriptReady] = useState(false);
   const [checking, setChecking] = useState(true);
   const [provider, setProvider] = useState("openai");
