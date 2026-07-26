@@ -8,6 +8,7 @@ mod audio;
 mod classifier;
 mod db;
 mod keys;
+mod logging;
 mod orchestrator;
 mod overlay;
 mod rag;
@@ -30,6 +31,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
+            // Initialize file logging before any other setup
+            if let Ok(app_data) = app.path().app_data_dir() {
+                let _ = logging::Logger::init(&app_data);
+            }
+
             // Configure overlay window for click-through behavior
             if let Some(overlay) = app.get_webview_window("overlay") {
                 let _ = overlay.set_ignore_cursor_events(true);
