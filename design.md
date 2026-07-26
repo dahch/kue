@@ -1,6 +1,6 @@
 # Kue — Technical Design
 
-> Current status: **Sprint 0–3 completed, Sprint 4 (overlay) partially implemented** (base infrastructure + dual audio capture + STT + RAG engine + classifier + orchestrator + overlay window + hint display + mic VAD gating). This document describes the living architecture of the project, indicating which parts are implemented and which are planned.
+> Current status: **Sprint 0–4 completed** (base infrastructure + dual audio capture + STT + RAG engine + classifier + orchestrator + overlay window + hint display + mic VAD gating + Panic button + mode selection UI). Sprint 5 (post-call) not started. This document describes the living architecture of the project, indicating which parts are implemented and which are planned.
 
 ---
 
@@ -9,13 +9,15 @@
 ```mermaid
 graph TD
     subgraph "Frontend (React + TypeScript)"
-        A[MainApp<br/>debug RAG UI]
-        OV[Overlay<br/>hint display component<br/>3s auto-dismiss]
+        A[MainApp<br/>session control UI<br/>mode selector + panic button]
+        OV[Overlay<br/>hint display component<br/>3s auto-dismiss<br/>auto-show/hide on session events]
     end
 
     subgraph "Tauri Bridge (IPC)"
         B1[tauri::command<br/>get_db_status]
-        B2[tauri::command<br/>toggle_audio_capture]
+        B2[tauri::command<br/>start_session]
+        B2B[tauri::command<br/>stop_session]
+        B2C[tauri::command<br/>panic_mode]
         B3[tauri::command<br/>index_folder_cmd]
         B4[tauri::command<br/>search_context]
         B5[tauri::command<br/>overlay::show_overlay]
@@ -24,10 +26,11 @@ graph TD
     subgraph "Rust Backend (lib.rs)"
         C[db::init_db]
         D[db::register_vec_extension]
-        E[setup handler<br/>DB + AudioCapture + Model + overlay config]
+        E[setup handler<br/>DB + AudioCapture + Model + overlay config + PanicState]
         F[audio::capture<br/>AudioCapture]
         EM[rag::embeddings<br/>EmbeddingModel (Mutex)]
         CL[cleanup_orphaned_temp_dirs]
+        PS[orchestrator::PanicState<br/>10s hint silence]
     end
 
     subgraph "Database Layer (db/mod.rs)"
@@ -77,20 +80,28 @@ graph TD
         O3[orchestrator::worker::<br/>start_hint_worker<br/>kue-hint-worker thread]
         O4[orchestrator::generate_and_emit_hint<br/>classify→RAG→hint→emit]
         OC[orchestrator::should_cancel_hint<br/>mic VAD gating for Shadow mode]
+        PS2[orchestrator::PanicState<br/>silences hints for 10s]
     end
 
     subgraph "Tauri Events"
         EV1[new-transcript]
         EV2[question-detected]
         EV3[new-hint]
+        EV4[panic-mode]
+        EV5[session-started]
+        EV6[session-stopped]
     end
 
     A -->|invoke| B1
     A -->|invoke| B2
+    A -->|invoke| B2B
+    A -->|invoke| B2C
     A -->|invoke| B3
     A -->|invoke| B4
     B1 --> C
     B2 --> F
+    B2B --> F
+    B2C --> PS
     B3 --> T
     B4 --> T
     C --> G
@@ -115,8 +126,16 @@ graph TD
     OC -->|reads| MV
     OC -->|cancels if speaking| O1
     OV -->|listens| EV3
+    OV -->|listens| EV4
+    OV -->|listens| EV5
+    OV -->|listens| EV6
     Q4 --> EV1
     Q4 --> EV2
+    E --> PS
+    PS2 <-->|hint_silenced_by_panic| O3
+    PS -->|panic-mode event| EV4
+    F -->|session-started| EV5
+    F -->|session-stopped| EV6
     G --> H
     G --> I
     G --> J
@@ -131,7 +150,7 @@ graph TD
     style OV fill:#fff3e0,stroke:#f57c00
 ```
 
-**Legend:** Solid line = implemented. The STT pipeline integrates classification (VAD → STT → classify → events → DB). When a question is detected, the pipeline pushes a `HintJob` to the orchestrator worker thread via an mpsc channel. The worker queries RAG, builds a hint, and either emits it immediately (Practice) or schedules it via `HintScheduler` (Shadow, 2.5s delay). Expired hints are drained every 500ms in the worker's poll loop. In Shadow mode, before emitting each expired hint, the worker checks `MicVadState` (Channel A VAD) — if the user started speaking since the hint was scheduled, the hint is silently cancelled. At session end, Channel A (mic) audio is sent to a batch transcription thread (`kue-batch-transcribe`) via `spawn_batch_transcription()` which runs offline VAD+STT and persists user responses with `speaker='user'`. The `Overlay` React component listens for `new-hint` Tauri events and displays the hint with a 3s auto-dismiss timer.
+**Legend:** Solid line = implemented. The STT pipeline integrates classification (VAD → STT → classify → events → DB). When a question is detected, the pipeline pushes a `HintJob` to the orchestrator worker thread via an mpsc channel. The worker queries RAG, builds a hint, and either emits it immediately (Practice) or schedules it via `HintScheduler` (Shadow, 2.5s delay). Expired hints are drained every 500ms in the worker's poll loop. In Shadow mode, before emitting each expired hint, the worker checks `MicVadState` (Channel A VAD) — if the user started speaking since the hint was scheduled, the hint is silently cancelled. `PanicState` (registered in Tauri state) can silence all hints for 10s; the worker checks `hint_silenced_by_panic()` before processing any hint job or emitting expired hints. At session end, Channel A (mic) audio is sent to a batch transcription thread (`kue-batch-transcribe`) via `spawn_batch_transcription()` which runs offline VAD+STT and persists user responses with `speaker='user'`. The `Overlay` React component listens for `new-hint` Tauri events, auto-shows in Shadow mode on `session-started`, auto-hides on `session-stopped`, and shows a panic indicator on `panic-mode`. The `MainApp` component is a full session control UI with mode selector, start/stop buttons, and a panic button.
 
 ---
 
@@ -140,23 +159,33 @@ graph TD
 ### 2.1 Frontend (`src/`)
 
 - **`main.tsx`** — Entry point React 18, mounts `<App />` on `#root`.
-- **`App.tsx`** — App router that detects the window label via `getCurrentWebviewWindow()`. If the label is `"overlay"`, renders the `<Overlay />` component; otherwise renders `<MainApp />` (debug RAG UI).
-- **`MainApp`** (inside `App.tsx`) — Debug UI with controls to index folders (RAG) and search vector context. Buttons and text input connected via `invoke()` to the Tauri commands `index_folder_cmd` and `search_context`.
-- **`Overlay.tsx`** — Hint display component rendered inside the overlay window. Listens for `new-hint` Tauri events via `listen()`. Shows the hint text in a semi-transparent backdrop-blur container, auto-dismisses after 3 seconds via `setTimeout`.
+- **`App.tsx`** — App router that detects the window label via `getCurrentWebviewWindow()`. If the label is `"overlay"`, renders the `<Overlay />` component; otherwise renders `<MainApp />` (session control UI).
+- **`MainApp`** (inside `App.tsx`) — Full session control UI with:
+  - Mode selector (Practice/Shadow toggle)
+  - Start/Stop session buttons connected via `invoke("start_session")` / `invoke("stop_session")`
+  - Panic button connected via `invoke("panic_mode")`, displays a 10s mute indicator
+  - Transcript and hint log display
+  - Listens for `new-transcript`, `new-hint`, and `panic-mode` events
+- **`Overlay.tsx`** — Hint display component rendered inside the overlay window. Listens for:
+  - `new-hint` — shows hint with 3s auto-dismiss via `setTimeout`
+  - `session-started` — auto-shows overlay window in Shadow mode
+  - `session-stopped` — auto-hides overlay window and clears state
+  - `panic-mode` — shows a panic indicator (🔇) for the duration
+  - Hint text displayed in a semi-transparent backdrop-blur container
 - **`index.css`** — Tailwind directives (`@tailwind base/components/utilities`).
 
 ### 2.2 Tauri Shell (`lib.rs`)
 
-File `src-tauri/src/lib.rs` (~68 lines):
+File `src-tauri/src/lib.rs` (~73 lines):
 
 ```rust
 mod audio;
 mod classifier;
 mod db;
-mod orchestrator;    // Hint engine — wired into lifecycle
+mod orchestrator;    // Hint engine + PanicState — wired into lifecycle
 mod overlay;         // Overlay window show/hide command
 mod rag;
-mod stt;             // STT module (Moonshine) — integrated via toggle_audio_capture
+mod stt;             // STT module (Moonshine) — integrated via session lifecycle
 mod types;
 
 run() {
@@ -198,11 +227,16 @@ run() {
                 scheduler,
             );
 
+            // Register panic state
+            app.manage(orchestrator::PanicState::new());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             db::get_db_status,
-            audio::capture::toggle_audio_capture,
+            audio::capture::start_session,
+            audio::capture::stop_session,
+            audio::capture::panic_mode,
             rag::indexer::index_folder_cmd,
             rag::indexer::search_context,
             classifier::classify_text,
@@ -218,8 +252,10 @@ run() {
 - **Overlay click-through:** In `setup()`, the overlay window is configured with `set_ignore_cursor_events(true)` so mouse events pass through to the video call underneath.
 - **`app.manage(database)`**, **`app.manage(AudioCapture)`**, **`app.manage(Arc<Mutex<EmbeddingModel>>)`** — Injects `Database`, `AudioCapture` and the embeddings model (wrapped in `Arc` for sharing with the hint worker) as Tauri state.
 - **Orchestrator setup:** `HintScheduler` (manages delayed hints in Shadow mode), `HintJobSender` (mpsc channel for dispatching hint jobs), and `start_hint_worker` (spawns `kue-hint-worker` thread that processes jobs and drains expired hints every 500ms).
+- **`PanicState`** — Registered via `app.manage(PanicState::new())`. Stores an optional `Instant` deadline; when set, `hint_silenced_by_panic()` in the orchestrator returns `true` for all hint operations until the deadline expires (10s), effectively muting all hints.
+- **`start_session`**, **`stop_session`**, **`panic_mode`** — Tauri commands replacing the old `toggle_audio_capture`. `start_session` creates a DB session, spawns the dual capture and STP pipeline. `stop_session` stops capture, triggers batch transcription for Channel A, and emits `session-stopped`. `panic_mode` activates `PanicState` for 10s and emits `panic-mode` event.
 - **`index_folder_cmd`**, **`search_context`**, **`classify_text`**, and **`show_overlay`** — Tauri commands for RAG, classifier, and overlay window control.
-- **STT integration:** The STT pipeline is fully integrated into `toggle_audio_capture`. When `start=true`, the command creates a DB session, spawns an `STTPipeline` thread that consumes audio from the loopback channel, performs VAD → STT → classify → events → persistence → hint job dispatch. The `new-transcript` and `question-detected` events are emitted to the frontend; question-detected lines also push a `HintJob` to the orchestrator worker.
+- **STT integration:** The STT pipeline is fully integrated into `start_session`. The command creates a DB session, spawns an `STTPipeline` thread that consumes audio from the loopback channel, performs VAD → STT → classify → events → persistence → hint job dispatch. The `new-transcript` and `question-detected` events are emitted to the frontend; question-detected lines also push a `HintJob` to the orchestrator worker.
 
 ### 2.3 Database Module (`db/mod.rs`)
 
@@ -235,7 +271,7 @@ Substantial module (~1230 lines, 50 tests) that implements dual audio capture:
 - **Loopback (Channel B):** via `screencapturekit-rs` (ScreenCaptureKit), captures the system output audio (interviewer's voice). `excludes_current_process_audio: true` to avoid echo.
 - **WAV writer:** two background threads (`kue-wav-mic-A`, `kue-wav-loopback-B`) that write the channels to separate WAV files (16 kHz, mono, 16-bit) using `hound`.
 - **`AudioCapture` struct:** managed as Tauri state via `app.manage()`. Exposes `start(mode)`, `stop()`, `toggle(start, mode)`. Exposes `mic_vad_state()` returning `Arc<Mutex<MicVadState>>` for the orchestrator's shadow-mode hint cancellation.
-- **`toggle_audio_capture` command:** Tauri command that starts/stops both captures, validating mode (`practice`|`shadow`) against the DB CHECK constraint.
+- **`start_session` / `stop_session` / `panic_mode` commands:** Three separate Tauri commands replacing the old `toggle_audio_capture`. `start_session(mode)` starts both captures and creates a DB session. `stop_session()` stops both captures and triggers batch transcription. `panic_mode()` activates `PanicState` (10s hint silence) and emits `panic-mode` event.
 - **51 tests:** cover f32→i16 conversion (edge cases: NaN, infinity, clamping, very small values), state serialization (4 combinations), directory creation, path format, invalid mode (multiple variants), toggle (4 paths), WAV writer (creation, multiple buffers, invalid path, empty buffer, cyclic lifecycle), and consistency between mode validation and DB.
 
 #### `audio/mic_vad.rs`
@@ -250,16 +286,16 @@ Moderate module (~365 lines, 22 tests) that wraps `SimpleVAD` for Channel A (mic
 
 ### 2.5 STT + Classifier Module (`stt/`, `classifier/`)
 
-**STT Module (`stt/`, ~1400 non-test lines, ~110 tests)** — implements real-time transcription of Channel B and batch transcription of Channel A, integrated into the app lifecycle via `toggle_audio_capture`:
+**STT Module (`stt/`, ~1400 non-test lines, ~110 tests)** — implements real-time transcription of Channel B and batch transcription of Channel A, integrated into the app lifecycle via `start_session`/`stop_session`:
 
-- **`stt/mod.rs`** — `STTEngine` trait with `load()` and `transcribe_audio_chunk()`, `STTConfig`, blanket impl for `Box<T>`.
+- **`stt/mod.rs`** — `STTEngine` trait with `load()` and `transcribe_audio_chunk()`, `STTConfig`, blanket impl for `Box<T>`. Also exposes `persist_transcript_line()` and `create_engine()` at module level (extracted from `pipeline.rs` and `ffi.rs`).
 - **`stt/ffi.rs`** — `MoonshineFFIEngine`: loads `libmoonshine.dylib` at runtime via `libloading`, declares FFI bindings with `#[repr(C)]` for `CTranscript`, `CTranscriptLine`, etc. Calls the Moonshine streaming API: `create_stream` → `start_stream` → `add_audio_to_stream` → `transcribe_stream`. Frees resources in `Drop`.
 - **`stt/cli.rs`** — `MoonshineCLIEngine` (fallback): writes WAV segments to temp with UUID, invokes `moonshine-voice transcribe --wav-path <file>` as a subprocess, parses the last line of output.
 - **`stt/vad.rs`** — `SimpleVAD`: voice activity detection by RMS energy with configurable threshold, minimum speech duration, and silence timeout.
 - **`stt/pipeline.rs`** — `STTPipeline`: orchestrator that receives audio from loopback via `mpsc::Receiver`, runs VAD + segment buffer + STT engine + calls `classifier::classify()` on each transcribed line + emits `new-transcript` and `question-detected` events + persists in `transcript_lines`.
-- **`stt/batch.rs`** — `transcribe_channel_batch()`: offline batch transcription of a full-channel WAV file. Used post-session to transcribe Channel A (mic, user voice) via Moonshine + SimpleVAD chunking. Reads the entire WAV into memory, segments by VAD, transcribes each segment, persists with `speaker='user'` in `transcript_lines`. Runs in a dedicated `kue-batch-transcribe` thread spawned from `toggle_audio_capture`'s stop path. Emits `post-call-transcript-ready` event on completion. Handles empty/corrupt WAVs, whitespace-only results, uneven sample lengths, and non-standard sample rates. Includes 27 tests covering edge cases (empty, corrupt, all-silence, short speech, multiple segments, partial chunks, different sample rates, DB timestamp/session-id verification).
+- **`stt/batch.rs`** — `transcribe_channel_batch()`: offline batch transcription of a full-channel WAV file. Used post-session to transcribe Channel A (mic, user voice) via Moonshine + SimpleVAD chunking. Reads the entire WAV into memory, segments by VAD, transcribes each segment, persists with `speaker='user'` in `transcript_lines`. Runs in a dedicated `kue-batch-transcribe` thread spawned from `stop_session`'s stop path. Emits `post-call-transcript-ready` event on completion. Handles empty/corrupt WAVs, whitespace-only results, uneven sample lengths, and non-standard sample rates. Includes 27 tests covering edge cases (empty, corrupt, all-silence, short speech, multiple segments, partial chunks, different sample rates, DB timestamp/session-id verification).
 
-**Lifecycle integration:** When `toggle_audio_capture` is called with `start=true`, the command creates a DB session (in `sessions` table), spawns an `STTPipeline` thread via `spawn_processing_thread()`, and connects it to the loopback audio stream. The pipeline runs until `stop()` is called, at which point the session is finalized, any pending shadow hints are cancelled via `HintCommand::CancelSession`, and temp WAV files are cleaned up (or retained if `retain_audio` is enabled). On stop, Channel A (mic WAV) is sent to a batch transcription thread (`kue-batch-transcribe`) via `spawn_batch_transcription()`, which transcribes the entire Channel A recording offline using `stt::batch::transcribe_channel_batch()` and persists user responses with `speaker='user'`. The `post-call-transcript-ready` event is emitted on completion.
+**Lifecycle integration:** When `start_session` is called, the command creates a DB session (in `sessions` table), spawns an `STTPipeline` thread via `spawn_processing_thread()`, and connects it to the loopback audio stream. The pipeline runs until `stop()` is called, at which point the session is finalized, any pending shadow hints are cancelled via `HintCommand::CancelSession`, and temp WAV files are cleaned up (or retained if `retain_audio` is enabled). On stop, Channel A (mic WAV) is sent to a batch transcription thread (`kue-batch-transcribe`) via `spawn_batch_transcription()`, which transcribes the entire Channel A recording offline using `stt::batch::transcribe_channel_batch()` and persists user responses with `speaker='user'`. The `post-call-transcript-ready` event is emitted on completion.
 
 **Auto-detection:** At runtime, tries FFI first (`libmoonshine.dylib` in `MOONSHINE_LIB_DIR` or standard paths), falls back to CLI if the library is not found. No Whisper — Moonshine is the only option.
 
@@ -274,7 +310,7 @@ Moderate module (~365 lines, 22 tests) that wraps `SimpleVAD` for Channel A (mic
 
 ### 2.6 Configuration
 
-- **`tauri.conf.json`** — Tauri v2, two windows: `main` (800×600, debug RAG UI) and `overlay` (400×100, transparent, always-on-top, click-through, skip-taskbar, hidden by default). DMG bundle (macOS only), dev URL on port 1420.
+- **`tauri.conf.json`** — Tauri v2, two windows: `main` (800×600, session control UI) and `overlay` (400×100, transparent, always-on-top, click-through, skip-taskbar, hidden by default). DMG bundle (macOS only), dev URL on port 1420.
 - **`vite.config.ts`** — Vite 6 with React plugin, HMR on port 1421, ignores changes in `src-tauri/`.
 - **`capabilities/default.json`** — Main window permissions: `core:default` + `shell:allow-open`.
 - **`capabilities/overlay.json`** — Overlay window permissions: `core:default` (minimal — no shell access).
@@ -290,8 +326,10 @@ Moderate module (~365 lines, 22 tests) that wraps `SimpleVAD` for Channel A (mic
 - **`orchestrator::generate_and_emit_hint()`** — the core hint generation function. Guards against `None`/empty text, runs `build_hint_text()` (RAG search top_k=1, tag+metric formatting, generic fallback), and either emits `new-hint` event immediately (Practice) or schedules via `HintScheduler` (Shadow).
 - **`orchestrator::build_hint_text()`** — queries RAG via `search()`, if results have both `tag` and `metric` → formats as `"💡 {tag}: {metric}"` (max 8 words), otherwise truncates the chunk text to 8 words, falls back to generic hint per question type.
 - **`orchestrator::generic_hint()`** — per-type fallback strings (e.g., `"💡 Usa STAR: Situación, Tarea, Acción, Resultado"` for Star).
+- **`orchestrator::PanicState`** — shared state struct wrapping `Arc<Mutex<Option<Instant>>>`. When set to a future `Instant`, `is_panicking()` returns `true` until the deadline passes. Used by `hint_silenced_by_panic()` to gate all hint operations during the 10s mute window. Registered as Tauri state in `lib.rs::setup()`.
+- **`orchestrator::hint_silenced_by_panic()`** — checks `PanicState` from Tauri state; returns `true` if panic mode is active. Called at the top of both `generate_and_emit_hint()` and `emit_expired_hints()` to silently drop hints during mute.
 - **`orchestrator::should_cancel_hint()`** — pure function that receives a `PendingHint` and optional `MicVadState`. Returns `true` if the user is currently speaking or has spoken since the hint was scheduled. Used to gate Shadow-mode hints.
-- **`orchestrator::worker::start_hint_worker()`** — spawns the `kue-hint-worker` thread. Polls `HintCommand` channel with 500ms timeout. On `Process(job)`, calls `generate_and_emit_hint`. On timeout, calls `emit_expired_hints()` to drain the scheduler. On `CancelSession(sid)`, calls `scheduler.cancel_all()`.
+- **`orchestrator::worker::start_hint_worker()`** — spawns the `kue-hint-worker` thread. Polls `HintCommand` channel with 500ms timeout. On `Process(job)`, calls `generate_and_emit_hint` (which first checks panic state). On timeout, calls `emit_expired_hints()` (which also checks panic state). On `CancelSession(sid)`, calls `scheduler.cancel_all()`.
 - **`orchestrator::emit_expired_hints()`** — drains all expired hints from the scheduler. For each hint, checks `should_cancel_hint()` against `AudioCapture.mic_vad_state()`. If the user started speaking on Channel A since the hint was scheduled, the hint is silently dropped. Otherwise, emits it as `new-hint` Tauri event.
 
 **Integration:** The STT pipeline's `flush_segment()` pushes `HintCommand::Process` into the mpsc channel when a question is detected. The pipeline's shutdown path sends `HintCommand::CancelSession` to cancel any pending shadow hints. The hint worker reads `MicVadState` from `AudioCapture` (injected via `app.try_state`) to implement mic-gated cancellation for Shadow mode.
@@ -303,7 +341,11 @@ Small module (~88 lines, 8 tests) that controls the overlay window:
 - **`overlay::show_overlay()`** — Tauri command `fn show_overlay(show: bool, app_handle: AppHandle) -> Result<(), String>`. If `show=true`, shows the overlay window and sets focus; if `show=false`, hides it. Returns an error if the `"overlay"` webview window doesn't exist (misconfigured `tauri.conf.json`).
 - **`overlay::ERR_OVERLAY_WINDOW_NOT_FOUND`** — Public error constant for test assertions.
 - **Window lifecycle:** The overlay window is defined in `tauri.conf.json` with `"visible": false` — it is created at app start but hidden. Click-through is enabled in `lib.rs::setup()` via `set_ignore_cursor_events(true)`.
-- **Frontend counterpart:** `src/Overlay.tsx` React component listens for `new-hint` Tauri events, displays the hint text in a semi-transparent backdrop-blur container, and auto-dismisses after 3 seconds via `setTimeout`.
+- **Frontend counterpart:** `src/Overlay.tsx` React component listens for:
+  - `new-hint` — displays the hint text in a semi-transparent backdrop-blur container, auto-dismisses after 3 seconds via `setTimeout`.
+  - `session-started` — auto-shows the overlay window in Shadow mode (so the user sees the overlay appear when the session starts).
+  - `session-stopped` — auto-hides the overlay window and clears hint state.
+  - `panic-mode` — shows a panic indicator (🔇) inside the hint container for the 10s mute duration.
 
 ---
 
@@ -392,24 +434,26 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 | DB schema + migrations  | **Implemented**  | `rusqlite`, `sqlite-vec`                                                              | `db/mod.rs`                         |
 | sqlite-vec register     | **Implemented**  | `sqlite-vec`                                                                          | `db/mod.rs`                         |
 | Tauri setup + commands  | **Implemented**  | `tauri 2`                                                                             | `lib.rs`                            |
-| Frontend (debug RAG UI) | **Implemented**  | React 18                                                                              | `App.tsx`                           |
+| Frontend (session control UI) | **Implemented**  | React 18                                                                              | `App.tsx`                           |
 | Mic capture (cpal)      | **Implemented**  | `cpal` (active)                                                                       | `audio/capture.rs`                  |
 | Loopback capture (SCK)  | **Implemented**  | `screencapturekit` (active)                                                           | `audio/capture.rs`                  |
 | WAV writing (hound)     | **Implemented**  | `hound` (active)                                                                      | `audio/capture.rs`                  |
 | RAG embeddings + indexer | **Implemented**  | `candle-core`, `candle-nn`, `candle-transformers`, `hf-hub`, `tokenizers`, `bytemuck` | `rag/embeddings.rs`, `rag/indexer.rs` |
-| STT (Moonshine)         | **Implemented** (integrated in lifecycle via `toggle_audio_capture`) | `libloading` (dynamically loaded `libmoonshine.dylib`), `uuid`                       | `stt/mod.rs`, `stt/ffi.rs`, `stt/cli.rs`, `stt/vad.rs`, `stt/pipeline.rs` |
+| STT (Moonshine)         | **Implemented** (integrated in lifecycle via `start_session`/`stop_session`) | `libloading` (dynamically loaded `libmoonshine.dylib`), `uuid`                       | `stt/mod.rs`, `stt/ffi.rs`, `stt/cli.rs`, `stt/vad.rs`, `stt/pipeline.rs` |
 | Channel A batch transcription | **Implemented** (ADR-015 — runs offline post-session in `kue-batch-transcribe` thread) | `hound`                                                                               | `stt/batch.rs`, `audio/capture.rs` (spawn_batch_transcription) |
 | Question classifier     | **Implemented** (integrated in STT pipeline, standalone Tauri cmd) | —                                                                                     | `classifier/mod.rs`                  |
 | Hint generator          | **Implemented** (orchestrator module: HintScheduler + hint worker + mpsc dispatch) | —                                                                                     | `orchestrator/mod.rs`, `orchestrator/worker.rs` |
-| Overlay window + hint display | **Implemented** (window config, click-through, Overlay.tsx with 3s auto-dismiss, show/hide command) | `tauri.conf.json` window config     | `overlay.rs`, `Overlay.tsx`         |
+| Overlay window + hint display | **Implemented** (window config, click-through, Overlay.tsx with 3s auto-dismiss, show/hide command, auto-show/hide on session events, panic indicator) | `tauri.conf.json` window config     | `overlay.rs`, `Overlay.tsx`         |
 | Mic VAD (Shadow gating)       | **Implemented** | —                                                                                     | `audio/mic_vad.rs`                   |
+| Panic button + PanicState    | **Implemented** (~10s mute via `panic_mode` command + `panic-mode` event) | `PanicState` in Tauri state                                | `orchestrator/mod.rs`, `audio/capture.rs`, `App.tsx`, `Overlay.tsx` |
+| Mode selection UI             | **Implemented** (Practice/Shadow toggle in `App.tsx`) | —                                                                                     | `App.tsx`                           |
 | Post-call BYOK          | **Not started**  | `tauri-plugin-shell` present                                                          | —                                    |
 
 ---
 
 ## 6. Design patterns
 
-- **Command pattern (Tauri):** `#[tauri::command]` as entry point for functionality (`get_db_status`, `toggle_audio_capture`, `index_folder_cmd`, `search_context`).
+- **Command pattern (Tauri):** `#[tauri::command]` as entry point for functionality (`get_db_status`, `start_session`, `stop_session`, `panic_mode`, `index_folder_cmd`, `search_context`). Session lifecycle is split into three separate commands (start/stop/panic) instead of a single `toggle_audio_capture`, giving the frontend explicit control over each phase.
 - **State management via Tauri:** `app.manage()` injects dependencies accessible by state (Database, AudioCapture, Mutex<EmbeddingModel>).
 - **Inner function pattern:** Inner functions (e.g. `get_db_status_inner`, `ingest_documents`, `search`) separated from Tauri wrappers for testability.
 - **Trait pattern (Embedder):** `Embedder` trait abstraction with `EmbeddingModel` (real) and `MockEmbeddingModel`/`TestEmbedder` (tests) implementations, allowing the indexer to be tested without GPU.
@@ -422,6 +466,7 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 - **FFI auto-detection pattern:** `MoonshineFFIEngine::is_available()` checks for `libmoonshine.dylib` at runtime; if not available, falls back to `MoonshineCLIEngine` without user intervention.
 - **Pipeline-integrated classification:** The classifier is not a separate service — it's called inline from `STTPipeline::flush_segment()` after each transcription, emitting a `question-detected` event if the text is a recognized question type.
 - **Pure function with Tauri wrapper (classifier):** `classify()` is a pure `fn(&str) -> QuestionType` (testable without Tauri), while `classify_text()` is a thin `#[tauri::command]` wrapper exposing it over IPC.
+- **Module-level helpers with shared types:** `persist_transcript_line()` and `create_engine()` are extracted to `stt/mod.rs` (module level, not inside any sub-struct) so they can be shared across `pipeline.rs` (streaming STT) and `batch.rs` (offline batch STT) without code duplication. `TranscriptLine` and `Speaker` live in `types.rs` as the shared contract between the STT, classifier, and orchestrator modules.
 - **Worker thread + channel (orchestrator):** The hint engine runs in a dedicated `kue-hint-worker` thread that receives `HintCommand` messages over an `mpsc` channel from the STT pipeline. Decouples the latency-sensitive audio path from the hint generation path (which hits RAG).
 - **Scheduler pattern (HintScheduler):** Shadow mode hints are stored in a `Vec<PendingHint>` with an `Instant` deadline. The worker polls via `tick(now)` every 500ms. This avoids timers/threads per hint — a single poll loop processes all expired hints at once.
 - **Cancel on session end:** The pipeline sends `HintCommand::CancelSession` when its thread exits, and the scheduler immediately removes all pending hints for that session. This prevents stale hints from appearing after the interview has ended.
@@ -429,7 +474,8 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 - **Multi-window architecture (Tauri):** Two separate webview windows (`main` and `overlay`) share the same Rust backend. The `App.tsx` component detects which window it's running in via `getCurrentWebviewWindow().label` and renders the appropriate UI (debug UI vs. overlay). The overlay window has its own capability file with minimal permissions.
 - **Mic VAD monitor pattern (MicVadState):** A lightweight VAD wrapper runs alongside the mic capture pipeline. It doesn't control anything directly — it simply tracks speech transition timestamps. The orchestrator reads this state passively when deciding whether to emit a shadow hint. This separates the concerns of "detect speech" (mic_vad) from "decide whether to cancel" (orchestrator) without coupling the audio path to the hint path.
 - **Microphone-gated hint delivery:** In Shadow mode, hints are not emitted unconditionally after the 2.5s delay — they are gated on the user's current speech state. `emit_expired_hints()` retrieves `MicVadState` from `AudioCapture` and calls `should_cancel_hint()` before each emission. This prevents the app from showing a hint when the user is already answering, making Shadow mode feel non-intrusive.
-- **Post-session batch transcription (ADR-015):** Channel A (mic, user voice) is not transcribed in real time — it's transcribed offline at session end via `stt::batch::transcribe_channel_batch()`. The entire WAV is read into memory, segmented by VAD, and transcribed segment-by-segment. This runs in a dedicated `kue-batch-transcribe` thread spawned from the `stop` path of `toggle_audio_capture`, so the Tauri command returns immediately without blocking. The batch thread takes ownership of the session temp directory and applies audio retention policy (ADR-011) after transcription completes. Results are persisted with `speaker='user'`, and a `post-call-transcript-ready` event notifies the frontend.
+- **Post-session batch transcription (ADR-015):** Channel A (mic, user voice) is not transcribed in real time — it's transcribed offline at session end via `stt::batch::transcribe_channel_batch()`. The entire WAV is read into memory, segmented by VAD, and transcribed segment-by-segment. This runs in a dedicated `kue-batch-transcribe` thread spawned from the `stop` path of `stop_session`, so the Tauri command returns immediately without blocking. The batch thread takes ownership of the session temp directory and applies audio retention policy (ADR-011) after transcription completes. Results are persisted with `speaker='user'`, and a `post-call-transcript-ready` event notifies the frontend.
+- **Panic/Mute state pattern (PanicState):** A shared `Arc<Mutex<Option<Instant>>>` is registered as Tauri state. When the user presses the panic button, `panic_mode` command sets the Instant to `now + 10s`. The `hint_silenced_by_panic()` function checks this state at the top of both `generate_and_emit_hint()` and `emit_expired_hints()`, silently dropping all hints until the timer expires. This is a lightweight, timer-free mute mechanism — no threads, no async, just an Instant comparison before each hint operation.
 
 ---
 

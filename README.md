@@ -4,7 +4,7 @@
 
 Desktop application (macOS, Tauri v2) with real-time transcription, local RAG over your CV/projects, and ultra-short hints to maintain fluency under pressure. Post-call, optional analysis with your own LLM (BYOK).
 
-**Current status:** Sprints 0–3 completed, Sprint 4 (overlay) nearly complete, Sprint 5 (post-call) next. All core modules are implemented and tested: base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline + batch transcription for Channel A), question classifier (heuristics + regex) wired into the STT pipeline, orchestrator (HintScheduler + hint worker) producing hints from classifier+RAG, overlay window (transparent, always-on-top, click-through, 400×100) with hint display component (3s auto-dismiss via React `Overlay` component), mic VAD for Shadow-mode hint cancellation, and Channel A batch transcription at session end (ADR-015). All implemented and tested (>400 tests in Rust). Remaining work for v1: Panic button, mode selection UI, hint positioning (Sprint 4), and post-call BYOK analysis (Sprint 5) — see `spec.md`.
+**Current status:** Sprints 0–4 completed, Sprint 5 (post-call) next. All core modules are implemented and tested: base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline + batch transcription for Channel A), question classifier (heuristics + regex with bilingual EN/ES keyword lists including trap keywords for regret/failure) wired into the STT pipeline, orchestrator (HintScheduler + hint worker + PanicState) producing hints from classifier+RAG, overlay window (transparent, always-on-top, click-through, 400×100) with hint display component (3s auto-dismiss via React `Overlay` component), mic VAD for Shadow-mode hint cancellation, panic/mute button (10s hint silence via `PanicState`), mode selection UI (Practice/Shadow in `App.tsx`), and Channel A batch transcription at session end (ADR-015). All implemented and tested (>400 tests in Rust). Remaining work for v1: hint positioning clean-ups (Sprint 4) and post-call BYOK analysis (Sprint 5) — see `spec.md`.
 
 ---
 
@@ -70,21 +70,25 @@ npm run coverage:rust:full
 │  │ Frontend   │ │  Rust Backend                    │    │
 │  │            │ │  - db::init_db                   │    │
 │  │ ┌────────┐ │ │  - db::get_db_status cmd        │    │
-│  │ │ MainApp│ │◄│  - audio::toggle_audio_capture  │    │
-│  │ │(Debug  │ │ │  - audio::mic_vad (MicVadState) │    │
-│  │ │ RAG UI)│ │ │  - rag::index_folder_cmd        │    │
-│  │ └────────┘ │ │  - rag::search_context cmd      │    │
-│  │            │ │  - overlay::show_overlay cmd    │    │
-│  │ ┌────────┐ │ │  - stt::pipeline (VAD→STT→     │    │
-│  │ │ Overlay│ │ │    classify→events→DB)          │    │
-│  │ │(hint   │ │ │  - classifier::classify_text    │    │
-│  │ │ window)│ │ │    (question classification)    │    │
-│  │ └────────┘ │ │  - types (TranscriptLine,       │    │
-│  │            │ │    Speaker)                      │    │
-│  │ React +    │ │  - cpal (mic capture)           │    │
-│  │ Tailwind   │ │  - SCK (loopback)               │    │
-│  │            │ │  - hound (WAV writer)           │    │
-│  └────────────┘ │  ┌───────────────────────────┐ │    │
+│  │ │MainApp │ │◄│  - audio::capture::start_session│    │
+│  │ │(Session│ │ │  - audio::capture::stop_session │    │
+│  │ │Control │ │ │  - audio::capture::panic_mode   │    │
+│  │ │UI)     │ │ │  - audio::mic_vad (MicVadState) │    │
+│  │ └────────┘ │ │  - rag::index_folder_cmd        │    │
+│  │            │ │  - rag::search_context cmd      │    │
+│  │ ┌────────┐ │ │  - overlay::show_overlay cmd   │    │
+│  │ │ Overlay│ │ │  - stt::pipeline (VAD→STT→     │    │
+│  │ │(hint   │ │ │    classify→events→DB)          │    │
+│  │ │ window)│ │ │  - classifier::classify_text    │    │
+│  │ └────────┘ │ │    (question classification)    │    │
+│  │            │ │  - orchestrator (HintScheduler+ │    │
+│  │ React +    │ │    PanicState)                  │    │
+│  │ Tailwind   │ │  - types (TranscriptLine,       │    │
+│  │            │ │    Speaker + Copy)              │    │
+│  └────────────┘ │  - cpal (mic capture)           │    │
+│                 │  - SCK (loopback)               │    │
+│                 │  - hound (WAV writer)           │    │
+│                 │  ┌───────────────────────────┐ │    │
 │                 │  │  Overlay Window            │ │    │
 │                 │  │  (transparent, always-on-  │ │    │
 │                 │  │  top, click-through, 400x100) │ │
@@ -109,12 +113,16 @@ npm run coverage:rust:full
 │                 │  │  - stt::batch             │ │    │
 │                 │  │    (post-session Ch. A    │ │    │
 │                 │  │     VAD+STT, speaker=user)│ │    │
+│                 │  │  - stt::mod (module-level │ │    │
+│                 │  │    persist_transcript_    │ │    │
+│                 │  │    line & create_engine)  │ │    │
 │                 │  └───────────────────────────┘ │    │
 │                 │  ┌───────────────────────────┐ │    │
 │                 │  │  Orchestrator              │ │    │
 │                 │  │  - HintScheduler           │ │    │
 │                 │  │  - HintJob/HintCommand     │ │    │
 │                 │  │  - hint worker thread      │ │    │
+│                 │  │  - PanicState (10s silence)│ │    │
 │                 │  │  - should_cancel_hint      │ │    │
 │                 │  │    (mic VAD gating)        │ │    │
 │                 │  │  - generate_and_emit_hint  │ │    │
@@ -131,21 +139,22 @@ npm run coverage:rust:full
 └────────────────────────────────────────────────────────┘
 ```
 
-**Legend:** All listed code is functional and tested. `candle` implements BERT embeddings (`snowflake-arctic-embed-s`) in the `rag::embeddings` module, and `sqlite-vec` performs KNN vector search. The STT pipeline integrates Moonshine (FFI + CLI fallback), VAD, classification, DB persistence, and pushes hint jobs to the orchestrator. The classifier module uses heuristic rules (regex + keyword density) to categorize questions. The orchestrator module stitches classifier + RAG → hints (immediate in Practice, delayed in Shadow) via a dedicated worker thread; in Shadow mode, hints are gated by `audio::mic_vad::MicVadState` — if the user starts speaking on Channel A before the 2.5s delay expires, the hint is silently cancelled. At session end, Channel A (mic) audio is batch-transcribed via Moonshine + SimpleVAD in a dedicated thread (`kue-batch-transcribe`) and persisted with `speaker='user'` (ADR-015). The overlay window (transparent, always-on-top, click-through, 400×100) displays hints via an `Overlay` React component that listens for `new-hint` Tauri events and auto-dismisses after 3s.
+**Legend:** All listed code is functional and tested. `candle` implements BERT embeddings (`snowflake-arctic-embed-s`) in the `rag::embeddings` module, and `sqlite-vec` performs KNN vector search. Session control is handled by three separate Tauri commands (`start_session`, `stop_session`, `panic_mode`) instead of a single `toggle_audio_capture`. The STT pipeline integrates Moonshine (FFI + CLI fallback), VAD, classification, DB persistence, and pushes hint jobs to the orchestrator. The classifier module uses heuristic rules (regex + keyword density, bilingual EN/ES) with trap keywords for regret and failure topics. The orchestrator module stitches classifier + RAG → hints (immediate in Practice, delayed in Shadow) via a dedicated worker thread; in Shadow mode, hints are gated by `audio::mic_vad::MicVadState` — if the user starts speaking on Channel A before the 2.5s delay expires, the hint is silently cancelled. A `PanicState` registered in Tauri state silences all hints for 10s when activated via the panic button/mute command. At session end, Channel A (mic) audio is batch-transcribed via Moonshine + SimpleVAD in a dedicated thread (`kue-batch-transcribe`) and persisted with `speaker='user'` (ADR-015). The overlay window (transparent, always-on-top, click-through, 400×100) displays hints via an `Overlay` React component that listens for `new-hint` Tauri events, auto-shows in Shadow mode via `session-started`, auto-hides on `session-stopped`, and displays a panic indicator on `panic-mode`. Hints auto-dismiss after 3s.
 
 ## Stack
 
 | Layer | Technology |
 |---|---|
 | Frontend | React 18 + TypeScript + Tailwind CSS 3 |
-| App Core | Rust (Tauri v2) |
+| App Core | Rust (Tauri v2), session commands: `start_session`/`stop_session`/`panic_mode` |
 | Database | SQLite + sqlite-vec (vectors) |
 | Audio | cpal (mic) + screencapturekit-rs (loopback) + hound (WAV) |
-| STT + Classifier | Moonshine (FFI + CLI fallback) + heuristics/regex classifier + batch transcription (Ch. A) |
-| Hint Engine | orchestrator module (HintScheduler + hint worker thread) |
+| STT + Classifier | Moonshine (FFI + CLI fallback) + heuristics/regex classifier (bilingual EN/ES, trap keywords for regret/failure) + batch transcription (Ch. A) |
+| Hint Engine | orchestrator module (HintScheduler + hint worker thread + PanicState) |
 | Embeddings | candle (HuggingFace Rust) + `snowflake-arctic-embed-s` |
-| Overlay Window | Tauri v2 multi-window (transparent, click-through, always-on-top) |
+| Overlay Window | Tauri v2 multi-window (transparent, click-through, always-on-top, auto-show/hide on session events) |
 | Mic VAD (Shadow gating) | `audio::mic_vad::MicVadState` wraps `SimpleVAD` for Channel A |
+| Panic/Mute | `PanicState` in Tauri state silences hints for 10s via `panic_mode` command + `panic-mode` event |
 | Post-call (planned) | BYOK (Anthropic/OpenAI/Ollama/etc.) |
 
 ## Related documentation
@@ -159,30 +168,30 @@ npm run coverage:rust:full
 ```
 kue/
 ├── src/                     # Frontend React + TypeScript
-│   ├── App.tsx              # App router: renders MainApp or Overlay by window label
-│   ├── Overlay.tsx          # Hint overlay component (listens for new-hint events, 3s auto-dismiss)
+│   ├── App.tsx              # App router: renders MainApp (session control UI) or Overlay by window label
+│   ├── Overlay.tsx          # Hint overlay component (listens for new-hint, session-started/stopped, panic-mode events, 3s auto-dismiss)
 │   ├── main.tsx             # Entry point
 │   └── index.css            # Tailwind directives
 ├── src-tauri/               # Rust backend (Tauri)
 │   ├── src/
 │   │   ├── main.rs          # Entry point
 │   │   ├── lib.rs           # Tauri builder + setup (registers DB, AudioCapture, RAG,
-│   │   │                    #   overlay click-through, cleans orphan temp dirs)
-│   │   ├── types.rs         # TranscriptLine, Speaker (STT → classifier contract)
+│   │   │                    #   overlay click-through, PanicState, cleans orphan temp dirs)
+│   │   ├── types.rs         # TranscriptLine, Speaker (STT → classifier contract, Copy derive)
 │   │   ├── db/
 │   │   │   └── mod.rs       # Schema, migrations, sqlite-vec, tests
 │   │   ├── audio/
 │   │   │   ├── mod.rs       # Re-exports capture and mic_vad modules
-│   │   │   ├── capture.rs   # Dual capture (cpal + SCK), WAV writer, toggle_audio_capture cmd
+│   │   │   ├── capture.rs   # Dual capture (cpal + SCK), WAV writer, start_session/stop_session/panic_mode cmds
 │   │   │   └── mic_vad.rs   # MicVadState — VAD for Channel A (Shadow-mode hint cancellation)
 │   │   ├── overlay.rs       # show_overlay Tauri command (show/hide overlay window)
 │   │   ├── classifier/
-│   │   │   └── mod.rs       # Question classification (heuristics + regex, 48 tests)
+│   │   │   └── mod.rs       # Question classification (heuristics + regex, bilingual EN/ES, trap keywords for regret/failure, 48+ tests)
 │   │   ├── orchestrator/
-│   │   │   ├── mod.rs       # HintJob, HintScheduler, should_cancel_hint, generate_and_emit_hint
+│   │   │   ├── mod.rs       # HintJob, HintScheduler, PanicState, should_cancel_hint, generate_and_emit_hint
 │   │   │   └── worker.rs    # hint worker thread (poll loop + expired hint emission)
 │   │   ├── stt/
-│   │   │   ├── mod.rs       # STTEngine trait, STTConfig, re-exports
+│   │   │   ├── mod.rs       # STTEngine trait, STTConfig, persist_transcript_line, create_engine (module-level)
 │   │   │   ├── ffi.rs       # MoonshineFFIEngine (libmoonshine.dylib via libloading)
 │   │   │   ├── cli.rs       # MoonshineCLIEngine (fallback to moonshine-voice CLI)
 │   │   │   ├── vad.rs       # SimpleVAD (energy-based)
