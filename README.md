@@ -4,7 +4,7 @@
 
 Desktop application (macOS, Tauri v2) with real-time transcription, local RAG over your CV/projects, and ultra-short hints to maintain fluency under pressure. Post-call, optional analysis with your own LLM (BYOK).
 
-**Current status:** Sprints 0–3 completed — base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline) integrated into the app lifecycle, and question classifier (heuristics + regex) wired into the STT pipeline. All implemented and tested (+300 tests in Rust). The remaining work (overlay → final UI) is in planning for Sprint 4 (see `spec.md`).
+**Current status:** Sprints 0–3 completed, Sprint 4 (overlay) partially implemented — base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline) integrated into the app lifecycle, question classifier (heuristics + regex) wired into the STT pipeline, orchestrator (HintScheduler + hint worker) producing hints from classifier+RAG, overlay window (transparent, always-on-top, click-through) with hint display component, and mic VAD for Shadow-mode hint cancellation. All implemented and tested (+400 tests in Rust). The remaining work (Panic button, mode selection UI, post-call analysis) is in Sprint 4–5 (see `spec.md`).
 
 ---
 
@@ -54,7 +54,7 @@ npm run coverage:rust:full
 | `npm run tauri:dev` | Tauri + Vite in development mode |
 | `npm run tauri:build` | Production build (generates .dmg) |
 | `npm run test:rust:db` | Tests for the database module only |
-| `npm run test:rust` | Tests for all Rust modules (>260 tests) |
+| `npm run test:rust` | Tests for all Rust modules (>400 tests) |
 | `npm run coverage:rust` | Runs Rust tests (alias for `test:rust`) |
 | `npm run coverage:rust:check` | Checks availability of coverage tools |
 | `npm run coverage:rust:db` | Coverage for the database module (tarpaulin) |
@@ -64,62 +64,71 @@ npm run coverage:rust:full
 ## Architecture (high level)
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                 Tauri v2 Shell                        │
-│  ┌──────────┐   ┌───────────────────────────────┐    │
-│  │ Frontend │   │  Rust Backend                  │    │
-│  │ (React + │◄──│  - db::init_db                │    │
-│  │ Tailwind)│   │  - db::get_db_status cmd      │    │
-│  │          │   │  - audio::toggle_audio_capture│    │
-│  │          │   │  - rag::index_folder_cmd     │    │
-│  │          │   │  - rag::search_context cmd   │    │
- │  │          │   │  - stt::pipeline (VAD→STT→  │    │
-│  │          │   │    classify→events→DB)       │    │
-│  │          │   │  - classifier::classify_text │    │
-│  │          │   │    (question classification) │    │
-│  └──────────┘   │  - types (TranscriptLine,     │    │
-│                 │    Speaker)                    │    │
-│                 │  - cpal (mic capture)          │    │
-│                 │  - SCK (loopback)              │    │
-│                 │  - hound (WAV writer)          │    │
-│                 │  ┌─────────────────────────┐   │    │
-│                 │  │  RAG Engine              │   │    │
-│                 │  │  - rag::embeddings       │   │    │
-│                 │  │    (candle BERT, 384-d)  │   │    │
-│                 │  │  - rag::indexer          │   │    │
-│                 │  │    (ingest / search /    │   │    │
-│                 │  │     chunk / folder)      │   │    │
-│                 │  └─────────────────────────┘   │    │
-│                 │  ┌─────────────────────────┐   │    │
-│                 │  │  STT Module              │   │    │
-│                 │  │  - stt::ffi             │   │    │
-│                 │  │    (Moonshine FFI)      │   │    │
-│                 │  │  - stt::cli (fallback)  │   │    │
-│                 │  │  - stt::vad (energy)    │   │    │
-│                 │  │  - stt::pipeline        │   │    │
-│                 │  │    (VAD→STT→classify→   │   │    │
-│                 │  │     events→DB)           │   │    │
-│                 │  └─────────────────────────┘   │    │
-│                 │  ┌─────────────────────────┐   │    │
-│                 │  │  Orchestrator            │   │    │
-│                 │  │  - HintScheduler         │   │    │
-│                 │  │  - HintJob/HintCommand   │   │    │
-│                 │  │  - hint worker thread    │   │    │
-│                 │  │  - generate_and_emit_hint│   │    │
-│                 │  │  (classify→RAG→hint→     │   │    │
-│                 │  │   emit, Practice immedi-  │   │    │
-│                 │  │   ate / Shadow delayed)   │   │    │
-│                 │  └─────────────────────────┘   │    │
-│                 └───────────────────────────────┘    │
-│  ┌──────────────────────────────────────────────┐    │
-│  │  SQLite + sqlite-vec                          │    │
-│  │  (sessions · transcript_lines · documents ·   │    │
-│  │   chunks · chunks_vec · settings)              │    │
-│  └──────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────┐
+│                  Tauri v2 Shell                         │
+│  ┌────────────┐ ┌─────────────────────────────────┐    │
+│  │ Frontend   │ │  Rust Backend                    │    │
+│  │            │ │  - db::init_db                   │    │
+│  │ ┌────────┐ │ │  - db::get_db_status cmd        │    │
+│  │ │ MainApp│ │◄│  - audio::toggle_audio_capture  │    │
+│  │ │(Debug  │ │ │  - audio::mic_vad (MicVadState) │    │
+│  │ │ RAG UI)│ │ │  - rag::index_folder_cmd        │    │
+│  │ └────────┘ │ │  - rag::search_context cmd      │    │
+│  │            │ │  - overlay::show_overlay cmd    │    │
+│  │ ┌────────┐ │ │  - stt::pipeline (VAD→STT→     │    │
+│  │ │ Overlay│ │ │    classify→events→DB)          │    │
+│  │ │(hint   │ │ │  - classifier::classify_text    │    │
+│  │ │ window)│ │ │    (question classification)    │    │
+│  │ └────────┘ │ │  - types (TranscriptLine,       │    │
+│  │            │ │    Speaker)                      │    │
+│  │ React +    │ │  - cpal (mic capture)           │    │
+│  │ Tailwind   │ │  - SCK (loopback)               │    │
+│  │            │ │  - hound (WAV writer)           │    │
+│  └────────────┘ │  ┌───────────────────────────┐ │    │
+│                 │  │  Overlay Window            │ │    │
+│                 │  │  (transparent, always-on-  │ │    │
+│                 │  │  top, click-through, 400x100) │ │
+│                 │  └───────────────────────────┘ │    │
+│                 │  ┌───────────────────────────┐ │    │
+│                 │  │  RAG Engine                │ │    │
+│                 │  │  - rag::embeddings         │ │    │
+│                 │  │    (candle BERT, 384-d)    │ │    │
+│                 │  │  - rag::indexer            │ │    │
+│                 │  │    (ingest / search /      │ │    │
+│                 │  │     chunk / folder)        │ │    │
+│                 │  └───────────────────────────┘ │    │
+│                 │  ┌───────────────────────────┐ │    │
+│                 │  │  STT Module                │ │    │
+│                 │  │  - stt::ffi               │ │    │
+│                 │  │    (Moonshine FFI)        │ │    │
+│                 │  │  - stt::cli (fallback)    │ │    │
+│                 │  │  - stt::vad (energy)      │ │    │
+│                 │  │  - stt::pipeline          │ │    │
+│                 │  │    (VAD→STT→classify→     │ │    │
+│                 │  │     events→DB)            │ │    │
+│                 │  └───────────────────────────┘ │    │
+│                 │  ┌───────────────────────────┐ │    │
+│                 │  │  Orchestrator              │ │    │
+│                 │  │  - HintScheduler           │ │    │
+│                 │  │  - HintJob/HintCommand     │ │    │
+│                 │  │  - hint worker thread      │ │    │
+│                 │  │  - should_cancel_hint      │ │    │
+│                 │  │    (mic VAD gating)        │ │    │
+│                 │  │  - generate_and_emit_hint  │ │    │
+│                 │  │    (classify→RAG→hint→     │ │    │
+│                 │  │     emit, Practice immedi- │ │    │
+│                 │  │     ate / Shadow delayed)  │ │    │
+│                 │  └───────────────────────────┘ │    │
+│                 └─────────────────────────────────┘    │
+│  ┌────────────────────────────────────────────────┐    │
+│  │  SQLite + sqlite-vec                            │    │
+│  │  (sessions · transcript_lines · documents ·     │    │
+│  │   chunks · chunks_vec · settings)               │    │
+│  └────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────────────┘
 ```
 
-**Legend:** All listed code is functional and tested. `candle` implements BERT embeddings (`snowflake-arctic-embed-s`) in the `rag::embeddings` module, and `sqlite-vec` performs KNN vector search. The STT pipeline integrates Moonshine (FFI + CLI fallback), VAD, classification, DB persistence, and pushes hint jobs to the orchestrator. The classifier module uses heuristic rules (regex + keyword density) to categorize questions. The orchestrator module stitches classifier + RAG → hints (immediate in Practice, delayed in Shadow) via a dedicated worker thread.
+**Legend:** All listed code is functional and tested. `candle` implements BERT embeddings (`snowflake-arctic-embed-s`) in the `rag::embeddings` module, and `sqlite-vec` performs KNN vector search. The STT pipeline integrates Moonshine (FFI + CLI fallback), VAD, classification, DB persistence, and pushes hint jobs to the orchestrator. The classifier module uses heuristic rules (regex + keyword density) to categorize questions. The orchestrator module stitches classifier + RAG → hints (immediate in Practice, delayed in Shadow) via a dedicated worker thread; in Shadow mode, hints are gated by `audio::mic_vad::MicVadState` — if the user starts speaking on Channel A before the 2.5s delay expires, the hint is silently cancelled. The overlay window (transparent, always-on-top, click-through, 400×100) displays hints via an `Overlay` React component that listens for `new-hint` Tauri events and auto-dismisses after 3s.
 
 ## Stack
 
@@ -132,6 +141,8 @@ npm run coverage:rust:full
 | STT + Classifier | Moonshine (FFI + CLI fallback) + heuristics/regex classifier |
 | Hint Engine | orchestrator module (HintScheduler + hint worker thread) |
 | Embeddings | candle (HuggingFace Rust) + `snowflake-arctic-embed-s` |
+| Overlay Window | Tauri v2 multi-window (transparent, click-through, always-on-top) |
+| Mic VAD (Shadow gating) | `audio::mic_vad::MicVadState` wraps `SimpleVAD` for Channel A |
 | Post-call (planned) | BYOK (Anthropic/OpenAI/Ollama/etc.) |
 
 ## Related documentation
@@ -144,38 +155,44 @@ npm run coverage:rust:full
 
 ```
 kue/
-├── src/                  # Frontend React + TypeScript
-│   ├── App.tsx           # Debug UI: RAG indexing and vector search
-│   ├── main.tsx          # Entry point
-│   └── index.css         # Tailwind directives
-├── src-tauri/            # Rust backend (Tauri)
+├── src/                     # Frontend React + TypeScript
+│   ├── App.tsx              # App router: renders MainApp or Overlay by window label
+│   ├── Overlay.tsx          # Hint overlay component (listens for new-hint events, 3s auto-dismiss)
+│   ├── main.tsx             # Entry point
+│   └── index.css            # Tailwind directives
+├── src-tauri/               # Rust backend (Tauri)
 │   ├── src/
-│   │   ├── main.rs       # Entry point
-│   │   ├── lib.rs        # Tauri builder + setup (registers DB, AudioCapture, RAG, cleans orphan temp dirs)
-│   │   ├── types.rs      # TranscriptLine, Speaker (STT → classifier contract)
+│   │   ├── main.rs          # Entry point
+│   │   ├── lib.rs           # Tauri builder + setup (registers DB, AudioCapture, RAG,
+│   │   │                    #   overlay click-through, cleans orphan temp dirs)
+│   │   ├── types.rs         # TranscriptLine, Speaker (STT → classifier contract)
 │   │   ├── db/
-│   │   │   └── mod.rs    # Schema, migrations, sqlite-vec, tests
+│   │   │   └── mod.rs       # Schema, migrations, sqlite-vec, tests
 │   │   ├── audio/
-│   │   │   ├── mod.rs    # Re-export of the capture module
-│   │   │   └── capture.rs # Dual capture (cpal + SCK), WAV writer, toggle_audio_capture cmd
+│   │   │   ├── mod.rs       # Re-exports capture and mic_vad modules
+│   │   │   ├── capture.rs   # Dual capture (cpal + SCK), WAV writer, toggle_audio_capture cmd
+│   │   │   └── mic_vad.rs   # MicVadState — VAD for Channel A (Shadow-mode hint cancellation)
+│   │   ├── overlay.rs       # show_overlay Tauri command (show/hide overlay window)
 │   │   ├── classifier/
-│   │   │   └── mod.rs    # Question classification (heuristics + regex, 48 tests)
+│   │   │   └── mod.rs       # Question classification (heuristics + regex, 48 tests)
 │   │   ├── orchestrator/
-│   │   │   ├── mod.rs    # HintJob, HintScheduler, generate_and_emit_hint (39 tests)
-│   │   │   └── worker.rs # hint worker thread (poll loop + expired hint emission)
+│   │   │   ├── mod.rs       # HintJob, HintScheduler, should_cancel_hint, generate_and_emit_hint
+│   │   │   └── worker.rs    # hint worker thread (poll loop + expired hint emission)
 │   │   ├── stt/
-│   │   │   ├── mod.rs    # STTEngine trait, STTConfig, re-exports
-│   │   │   ├── ffi.rs    # MoonshineFFIEngine (libmoonshine.dylib via libloading)
-│   │   │   ├── cli.rs    # MoonshineCLIEngine (fallback to moonshine-voice CLI)
-│   │   │   ├── vad.rs    # SimpleVAD (energy-based)
-│   │   │   └── pipeline.rs # STTPipeline (thread loopback→VAD→STT→events→DB)
+│   │   │   ├── mod.rs       # STTEngine trait, STTConfig, re-exports
+│   │   │   ├── ffi.rs       # MoonshineFFIEngine (libmoonshine.dylib via libloading)
+│   │   │   ├── cli.rs       # MoonshineCLIEngine (fallback to moonshine-voice CLI)
+│   │   │   ├── vad.rs       # SimpleVAD (energy-based)
+│   │   │   └── pipeline.rs  # STTPipeline (thread loopback→VAD→STT→events→DB)
 │   │   └── rag/
-│   │       ├── mod.rs    # Re-export of embeddings and indexer
+│   │       ├── mod.rs       # Re-export of embeddings and indexer
 │   │       ├── embeddings.rs # BERT model (snowflake-arctic-embed-s), embedding generation
-│   │       └── indexer.rs    # Ingestion, chunking, indexing, and vector search
-│   ├── Cargo.toml        # Rust dependencies
-│   ├── tauri.conf.json   # Tauri v2 configuration
-│   └── capabilities/     # Tauri permissions (core, shell)
+│   │       └── indexer.rs   # Ingestion, chunking, indexing, and vector search
+│   ├── Cargo.toml           # Rust dependencies
+│   ├── tauri.conf.json      # Tauri v2 configuration (main + overlay windows)
+│   └── capabilities/
+│       ├── default.json     # Permissions for main window (core:default + shell:allow-open)
+│       └── overlay.json     # Minimal permissions for overlay window (core:default)
 ├── package.json
 ├── vite.config.ts
 ├── tailwind.config.js
