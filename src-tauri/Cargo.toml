@@ -14,7 +14,9 @@ crate-type = ["lib", "cdylib", "staticlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# test feature allows tauri::test::mock_app() — zero-cost in release builds
+# (the module is cfg'd out unless feature is explicitly enabled)
+tauri = { version = "2", features = ["test"] }
 tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
