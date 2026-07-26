@@ -3,6 +3,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import Overlay from "./Overlay";
+import ProvisioningProgress from "./ProvisioningProgress";
 
 interface TranscriptEvent {
   session_id: string;
@@ -527,6 +528,8 @@ function MainApp() {
 
 function App() {
   const [isOverlay, setIsOverlay] = useState(false);
+  const [showMain, setShowMain] = useState(false);
+  const handleProvisioned = useCallback(() => setShowMain(true), []);
 
   useEffect(() => {
     const win = getCurrentWebviewWindow();
@@ -537,6 +540,10 @@ function App() {
 
   if (isOverlay) {
     return <Overlay />;
+  }
+
+  if (!showMain) {
+    return <ProvisioningProgress onProvisioned={handleProvisioned} />;
   }
 
   return <MainApp />;
