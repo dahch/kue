@@ -4,7 +4,7 @@
 
 Desktop application (macOS, Tauri v2) with real-time transcription, local RAG over your CV/projects, and ultra-short hints to maintain fluency under pressure. Post-call, optional analysis with your own LLM (BYOK).
 
-**Current status:** Sprints 0–6 completed. All v1 features implemented and tested: base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline + batch transcription for Channel A), question classifier (heuristics + regex with bilingual EN/ES keyword lists including trap keywords for regret/failure) wired into the STT pipeline, orchestrator (HintScheduler + hint worker + PanicState) producing hints from classifier+RAG, overlay window (transparent, always-on-top, click-through, 400×100) with hint display component (3s auto-dismiss via React `Overlay` component), mic VAD for Shadow-mode hint cancellation, panic/mute button (10s hint silence via `PanicState`), mode selection UI (Practice/Shadow in `App.tsx`), Channel A batch transcription at session end (ADR-015), post-call BYOK analysis with keychain-stored API keys and LLM provider selection (Anthropic/OpenAI/Ollama/etc.), Moonshine auto-provisioning (`stt/provisioning.rs` downloads dylibs + model on first launch, reports progress via `moonshine-download-progress` events, retry via `retry_moonshine_download` and status check via `is_moonshine_provisioned` Tauri commands), and a `ProvisioningProgress` frontend component with progress bar, file counter, error display, and retry button. All implemented and tested (~520 tests in Rust). Remaining work: hint positioning clean-ups — see `spec.md`.
+**Current status:** Sprints 0–6 completed. All v1 features implemented and tested: base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline + batch transcription for Channel A), question classifier (heuristics + regex with bilingual EN/ES keyword lists including trap keywords for regret/failure) wired into the STT pipeline, orchestrator (HintScheduler + hint worker + PanicState) producing hints from classifier+RAG, overlay window (transparent, always-on-top, click-through, 400×100) with hint display component (3s auto-dismiss via React `Overlay` component), mic VAD for Shadow-mode hint cancellation, panic/mute button (10s hint silence via `PanicState`), mode selection UI (Practice/Shadow in `App.tsx`), Channel A batch transcription at session end (ADR-015), post-call BYOK analysis with keychain-stored API keys and LLM provider selection (Anthropic/OpenAI/Ollama/etc.), Moonshine auto-provisioning (`stt/provisioning.rs` downloads dylibs + model on first launch, reports progress via `moonshine-download-progress` events, retry via `retry_moonshine_download` and status check via `is_moonshine_provisioned` Tauri commands), `ProvisioningProgress` frontend component with progress bar, file counter, error display, and retry button, onboarding wizard (`src/Onboarding.tsx`, `src-tauri/src/onboarding.rs`) with screen recording permission check, embedding model loading, and folder indexing, session metadata persistence (`company`, `role`, `ended_at`), file logging (`src-tauri/src/logging.rs`), and Tauri auto-updater support (`tauri-plugin-updater`). All implemented and tested (~530 tests in Rust, ~10 frontend tests in Vitest). Remaining work: hint positioning clean-ups — see `spec.md`.
 
 ---
 
@@ -27,7 +27,7 @@ npm install
 npm run tauri:dev
 ```
 
-If Moonshine is not yet provisioned on first launch, a `ProvisioningProgress` UI (progress bar, file counter, stage label, retry button) blocks entry until downloads complete. Once provisioned, the app opens a session control UI (mode selector, start/stop, panic button, transcript log, session history, post-call analysis panel). The Rust backend connects to SQLite and creates the schema at `~/Library/Application Support/com.kue.app/kue.db`.
+If Moonshine is not yet provisioned on first launch, a `ProvisioningProgress` UI (progress bar, file counter, stage label, retry button) blocks entry until downloads complete. Once provisioned, the app shows an **Onboarding wizard** (`src/Onboarding.tsx`) that guides the user through screen recording permission, embedding model loading, and folder indexing. After onboarding, the main session control UI unlocks (mode selector, start/stop, company/role inputs, panic button, transcript log, session history, post-call analysis panel). The Rust backend connects to SQLite and creates the schema at `~/Library/Application Support/com.kue.app/kue.db`.
 
 ## Tests
 
@@ -39,7 +39,7 @@ npm run test:watch    # watch mode
 # Rust tests (database — all logic implemented)
 npm run test:rust:db
 
-# Rust tests (all modules, ~520 tests)
+# Rust tests (all modules, ~530 tests)
 npm run test:rust
 
 # Rust coverage (requires cargo-tarpaulin)
@@ -60,7 +60,7 @@ npm run coverage:rust:full
 | `npm run test` | Frontend unit tests (Vitest) |
 | `npm run test:watch` | Frontend tests in watch mode |
 | `npm run test:rust:db` | Tests for the database module only |
-| `npm run test:rust` | Tests for all Rust modules (~534 tests) |
+| `npm run test:rust` | Tests for all Rust modules (~530 tests) |
 | `npm run coverage:rust` | Runs Rust tests (alias for `test:rust`) |
 | `npm run coverage:rust:check` | Checks availability of coverage tools |
 | `npm run coverage:rust:db` | Coverage for the database module (tarpaulin) |
@@ -189,17 +189,20 @@ npm run coverage:rust:full
 ```
 kue/
 ├── src/                     # Frontend React + TypeScript
-│   ├── App.tsx              # App router: renders ProvisioningProgress on first launch,
+│   ├── App.tsx              # App router: renders ProvisioningProgress → Onboarding →
 │   │                        #   MainApp (session control UI + post-call panel),
 │   │                        #   or Overlay by window label
 │   ├── Overlay.tsx          # Hint overlay component (listens for new-hint, session-started/stopped,
 │   │                        #   panic-mode events, 3s auto-dismiss)
 │   ├── ProvisioningProgress.tsx  # Moonshine download progress UI (progress bar, file counter,
-│   │                        #   error display, retry button), gates access to MainApp
+│   │                        #   error display, retry button), gates access to Onboarding
+│   ├── Onboarding.tsx       # First-run wizard: screen recording permission, embedding
+│   │                        #   model load, folder indexing — gates access to MainApp
 │   ├── main.tsx             # Entry point
 │   ├── index.css            # Tailwind directives
 │   └── __tests__/           # Frontend unit tests
 │       ├── setup.ts         # Vitest setup: Tauri API mocks (invoke, listen, webviewWindow)
+│       ├── Onboarding.test.tsx  # Onboarding wizard integration tests
 │       ├── PostCallPanel.test.tsx  # Post-call analysis panel gating tests
 │       └── ProvisioningProgress.test.tsx  # Provisioning UI state machine tests
 ├── src-tauri/               # Rust backend (Tauri)
@@ -208,7 +211,8 @@ kue/
 │   │   ├── lib.rs           # Tauri builder + setup (registers DB, AudioCapture, RAG,
 │   │   │                    #   overlay click-through, PanicState, BatchTracker,
 │   │   │                    #   cleans orphan temp dirs, DYLD_LIBRARY_PATH setup,
-│   │   │                    #   spawns Moonshine provisioning background thread)
+│   │   │                    #   Logger init, tauri-plugin-updater, spawns Moonshine
+│   │   │                    #   provisioning background thread)
 │   │   ├── types.rs         # TranscriptLine, Speaker (STT → classifier contract, Copy derive)
 │   │   ├── db/
 │   │   │   └── mod.rs       # Schema, migrations, sqlite-vec, get_sessions/get_session_transcript, tests
@@ -241,8 +245,12 @@ kue/
 │   │   ├── analyze.rs       # Post-call BYOK analysis: prompt building, LLM API calls,
 │   │   │                    #   response parsing, analyze_session command
 │   │   │                    #   (supports Anthropic/OpenAI/Gemini/OpenRouter/Ollama)
-│   │   └── keys.rs          # Keychain API key storage via `keyring` crate
-│   │                        #   (save_key/has_key Tauri commands)
+│   │   ├── keys.rs          # Keychain API key storage via `keyring` crate
+│   │   │                    #   (save_key/has_key Tauri commands)
+│   │   ├── onboarding.rs    # First-run wizard: is_first_run, mark_onboarding_done,
+│   │   │                    #   check_screen_recording_permission,
+│   │   │                    #   is_embedding_model_loaded Tauri commands
+│   │   ├── logging.rs       # File logger: rotates logs, keeps last 5 files
 │   ├── Cargo.toml           # Rust dependencies (includes keyring for BYOK)
 │   ├── tauri.conf.json      # Tauri v2 configuration (main + overlay windows)
 │   └── capabilities/

@@ -189,9 +189,10 @@ graph TD
 ### 2.1 Frontend (`src/`)
 
 - **`main.tsx`** — Entry point React 18, mounts `<App />` on `#root`.
-- **`App.tsx`** — App router that detects the window label via `getCurrentWebviewWindow()`. If the label is `"overlay"`, renders the `<Overlay />` component; if Moonshine is not yet provisioned, renders `<ProvisioningProgress />` (download progress UI); otherwise renders `<MainApp />` (session control UI).
+- **`App.tsx`** — App router that detects the window label via `getCurrentWebviewWindow()`. If the label is `"overlay"`, renders the `<Overlay />` component; if Moonshine is not yet provisioned, renders `<ProvisioningProgress />` (download progress UI); if first run (`is_first_run` returns `true`), renders `<Onboarding />` (wizard for screen permission, model loading, folder indexing); otherwise renders `<MainApp />` (session control UI).
 - **`MainApp`** (inside `App.tsx`) — Full session control UI with:
   - Mode selector (Practice/Shadow toggle)
+  - Company/Role input fields (`company` and `role` optional strings, persisted in `sessions` table via `start_session` command)
   - Start/Stop session buttons connected via `invoke("start_session")` / `invoke("stop_session")`
   - Panic button connected via `invoke("panic_mode")`, displays a 10s mute indicator
   - Transcript and hint log display
@@ -207,20 +208,28 @@ graph TD
   - Hint text displayed in a semi-transparent backdrop-blur container
 - **`index.css`** — Tailwind directives (`@tailwind base/components/utilities`).
 - **`__tests__/setup.ts`** — Vitest setup file that mocks `@tauri-apps/api/core` (invoke), `@tauri-apps/api/event` (listen), and `@tauri-apps/api/webviewWindow` (getCurrentWebviewWindow). All frontend tests import this setup.
+- **`__tests__/Onboarding.test.tsx`** — Tests for Onboarding wizard: step transitions, screen permission polling, folder validation, skip flow, error sanitization.
 - **`__tests__/PostCallPanel.test.tsx`** — Tests for PostCallPanel gating: transcript readiness toggles button state, event filtering by session ID.
 - **`__tests__/ProvisioningProgress.test.tsx`** — Tests for ProvisioningProgress state machine: mount behavior, progress events, error/retry, done event, cleanup after unmount, percent edge cases.
 - **`vitest.config.ts`** — Vitest configuration with React plugin, jsdom environment, globals enabled, and setup file reference.
 
 ### 2.2 Tauri Shell (`lib.rs`)
 
-File `src-tauri/src/lib.rs` (114 lines):
+File `src-tauri/src/lib.rs` (126 lines):
 
 ```rust
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
+use tauri::Manager;
+
 mod analyze;         // Post-call BYOK analysis (Sprint 5)
 mod audio;
 mod classifier;
 mod db;
 mod keys;            // Keychain API key storage
+mod logging;         // File logger (rotates logs, keeps last 5 files)
+mod onboarding;      // First-run wizard (screen permission, model load, folder index)
 mod orchestrator;    // Hint engine + PanicState — wired into lifecycle
 mod overlay;         // Overlay window show/hide command
 mod rag;
@@ -231,15 +240,28 @@ mod types;
 /// transcription. The batch thread writes to this set when done; the
 /// `is_transcript_ready` command and `analyze_session` read from it.
 #[derive(Clone)]
-struct BatchTracker(Arc<Mutex<HashSet<String>>>);
+pub struct BatchTracker(pub Arc<Mutex<HashSet<String>>>);
 
-run() {
-    db::register_vec_extension();                     // Registers sqlite-vec before any connection
-    audio::capture::AudioCapture::cleanup_orphaned_temp_dirs();  // Cleans orphan WAVs from previous crashes
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    db::register_vec_extension();
+
+    // Clean up any WAV temp dirs left from a previous crashed session
+    audio::capture::AudioCapture::cleanup_orphaned_temp_dirs();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())    // Auto-updater
         .setup(|app| {
+            // Initialize file logging before any other setup
+            if let Ok(app_data) = app.path().app_data_dir() {
+                let _ = logging::Logger::init(&app_data);
+            }
+
+            // Spawn background Moonshine provisioning (dylibs + model download
+            // on first launch, no-op otherwise). Progress via events.
+            stt::provisioning::ensure_moonshine_installed(app.handle().clone());
+
             // Configure overlay window for click-through behavior
             if let Some(overlay) = app.get_webview_window("overlay") {
                 let _ = overlay.set_ignore_cursor_events(true);
@@ -281,7 +303,8 @@ run() {
 
             // Prepend the managed moonshine lib dir to DYLD_LIBRARY_PATH so
             // that @rpath/libonnxruntime.*.dylib is found alongside
-            // libmoonshine.dylib when loaded by the FFI engine.
+            // libmoonshine.dylib when loaded by the FFI engine. Safe here:
+            // no other threads have been spawned yet.
             if let Ok(app_data) = app.path().app_data_dir() {
                 let managed_lib = app_data.join("moonshine").join("lib");
                 let current = std::env::var("DYLD_LIBRARY_PATH").unwrap_or_default();
@@ -292,10 +315,6 @@ run() {
                 };
                 std::env::set_var("DYLD_LIBRARY_PATH", &new);
             }
-
-            // Spawn background Moonshine provisioning (dylibs + model download
-            // on first launch, no-op otherwise). Progress via events.
-            stt::provisioning::ensure_moonshine_installed(app.handle().clone());
 
             Ok(())
         })
@@ -316,37 +335,47 @@ run() {
             analyze::analyze_session,
             stt::provisioning::is_moonshine_provisioned,
             stt::provisioning::retry_moonshine_download,
+            onboarding::is_first_run,
+            onboarding::mark_onboarding_done,
+            onboarding::check_screen_recording_permission,
+            onboarding::is_embedding_model_loaded,
         ])
         .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }
 ```
 
-- **`mod analyze`**, **`mod audio`**, **`mod classifier`**, **`mod db`**, **`mod keys`**, **`mod orchestrator`**, **`mod overlay`**, **`mod rag`**, **`mod stt`**, **`mod types`** — Backend submodules. `stt` includes `provisioning` (Sprint 6) for first-launch Moonshine auto-download.
+- **`mod analyze`**, **`mod audio`**, **`mod classifier`**, **`mod db`**, **`mod keys`**, **`mod logging`**, **`mod onboarding`**, **`mod orchestrator`**, **`mod overlay`**, **`mod rag`**, **`mod stt`**, **`mod types`** — Backend submodules. `stt` includes `provisioning` (Sprint 6) for first-launch Moonshine auto-download. `logging` implements file-based logging with rotation (keeps last 5 log files). `onboarding` implements the first-run wizard: screen recording permission check, embedding model loading, and folder indexing.
 - **`cleanup_orphaned_temp_dirs()`** — Removes temporary `kue-session-*` directories left by crashed sessions.
 - **`plugin(tauri_plugin_shell)`** — Standard Tauri v2 plugin for shell operations (not used for BYOK — that uses `reqwest`).
+- **`plugin(tauri_plugin_updater)`** — Tauri v2 auto-updater plugin (configured in `tauri.conf.json` under `plugins.updater`, endpoints configured at build time).
+- **`logging::Logger::init()`** — In `setup()`, file logging is initialized before any other setup, writing to `{app_data_dir}/logs/kue_{timestamp}.log` with rotation (keeps last 5 log files).
+- **Moonshine provisioning (early startup):** `ensure_moonshine_installed()` is called early in `setup()`, *before* overlay configuration, so the background download thread starts as soon as possible.
 - **Overlay click-through:** In `setup()`, the overlay window is configured with `set_ignore_cursor_events(true)` so mouse events pass through to the video call underneath.
 - **`app.manage(database)`**, **`app.manage(AudioCapture)`**, **`app.manage(Arc<Mutex<EmbeddingModel>>)`** — Injects `Database`, `AudioCapture` and the embeddings model (wrapped in `Arc` for sharing with the hint worker) as Tauri state.
 - **`BatchTracker`** — `Arc<Mutex<HashSet<String>>>` registered as Tauri state, tracks which sessions have completed Channel A batch transcription. Checked by `is_transcript_ready` command and `analyze_session`.
 - **Moonshine provisioning setup:** Prepends the managed moonshine lib dir to `DYLD_LIBRARY_PATH` (so `@rpath/libonnxruntime.*.dylib` is found at load time), then spawns a background `kue-moonshine-provision` thread via `ensure_moonshine_installed()` that downloads dylibs from PyPI and model files (~482 MB total) on first launch. Progress is reported via `moonshine-download-progress` events (with stage, file index/count, and downloaded/total bytes, throttled to 250ms); success emits `moonshine-provisioned`, failure emits `moonshine-provision-error`. The `is_moonshine_provisioned` command lets the frontend check whether provisioning is already complete; `retry_moonshine_download` allows retry on failure.
 - **Orchestrator setup:** `HintScheduler` (manages delayed hints in Shadow mode), `HintJobSender` (mpsc channel for dispatching hint jobs), and `start_hint_worker` (spawns `kue-hint-worker` thread that processes jobs and drains expired hints every 500ms).
 - **`PanicState`** — Registered via `app.manage(PanicState::new())`. Stores an optional `Instant` deadline; when set, `hint_silenced_by_panic()` in the orchestrator returns `true` for all hint operations until the deadline expires (10s), effectively muting all hints.
-- **`start_session`**, **`stop_session`**, **`panic_mode`** — Tauri commands replacing the old `toggle_audio_capture`. `start_session` creates a DB session, spawns the dual capture and STP pipeline. `stop_session` stops capture, triggers batch transcription for Channel A, and emits `session-stopped`. `panic_mode` activates `PanicState` for 10s and emits `panic-mode` event.
+- **`start_session`**, **`stop_session`**, **`panic_mode`** — Tauri commands replacing the old `toggle_audio_capture`. `start_session(mode, company?, role?)` creates a DB session (persisting optional `company` and `role` metadata), spawns the dual capture and STP pipeline. `stop_session` stops capture, sets `ended_at = datetime('now')` in the sessions table, triggers batch transcription for Channel A, and emits `session-stopped`. `panic_mode` activates `PanicState` for 10s and emits `panic-mode` event.
 - **`index_folder_cmd`**, **`search_context`**, **`classify_text`**, and **`show_overlay`** — Tauri commands for RAG, classifier, and overlay window control.
 - **`get_sessions`**, **`get_session_transcript`** — Tauri commands in `db/mod.rs` for retrieving session history and full transcripts from the frontend (used by the post-call panel).
 - **`is_transcript_ready`** — Tauri command in `audio/capture.rs` that checks `BatchTracker` to see if Channel A batch transcription has completed for a given session.
 - **`save_key`**, **`has_key`** — Tauri commands in `keys.rs` for storing/checking API keys in the OS keychain via the `keyring` crate.
+- **`is_moonshine_provisioned`**, **`retry_moonshine_download`** — Tauri commands in `stt/provisioning.rs` for checking Moonshine provisioning status and retrying failed downloads.
+- **`is_first_run`**, **`mark_onboarding_done`**, **`check_screen_recording_permission`**, **`is_embedding_model_loaded`** — Tauri commands in `onboarding.rs` that drive the first-run wizard (screen recording permission check via `SCShareableContent::try_current()`, embedding model readiness polling, and onboarding completion flag in `settings.first_run`).
 - **`analyze_session`** — Tauri command in `analyze.rs` that sends the full session transcript + RAG context to a user-configured LLM (Anthropic/OpenAI/Gemini/OpenRouter/Ollama) and returns a structured analysis (summary, weak questions, forgotten projects, STAR improvements).
 - **STT integration:** The STT pipeline is fully integrated into `start_session`. The command creates a DB session, spawns an `STTPipeline` thread that consumes audio from the loopback channel, performs VAD → STT → classify → events → persistence → hint job dispatch. The `new-transcript` and `question-detected` events are emitted to the frontend; question-detected lines also push a `HintJob` to the orchestrator worker.
 
 ### 2.3 Database Module (`db/mod.rs`)
 
-The substantial module of the app (~1185 lines, 34 tests). See §3 for schema details and §4 for tests.
+The substantial module of the app (~1192 lines, 34 tests). See §3 for schema details and §4 for tests.
 
 ### 2.4 Audio Module (`audio/`)
 
 #### `audio/capture.rs`
 
-Substantial module (~1638 lines, 54 tests) that implements dual audio capture:
+Substantial module (~1638 lines, 72 tests) that implements dual audio capture:
 
 - **Microphone (Channel A):** via `cpal`, supports i16 and f32 sample formats with automatic conversion to i16.
 - **Loopback (Channel B):** via `screencapturekit-rs` (ScreenCaptureKit), captures the system output audio (interviewer's voice). `excludes_current_process_audio: true` to avoid echo.
@@ -367,7 +396,7 @@ Moderate module (~365 lines, 18 tests) that wraps `SimpleVAD` for Channel A (mic
 
 ### 2.5 STT + Classifier Module (`stt/`, `classifier/`)
 
-**STT Module (`stt/`, ~1400 non-test lines, ~138 tests)** — implements real-time transcription of Channel B and batch transcription of Channel A, integrated into the app lifecycle via `start_session`/`stop_session`:
+**STT Module (`stt/`, ~1400 non-test lines, ~138 tests including cli/vad/pipeline/ffi/batch/provisioning)** — implements real-time transcription of Channel B and batch transcription of Channel A, integrated into the app lifecycle via `start_session`/`stop_session`:
 
 - **`stt/mod.rs`** — `STTEngine` trait with `load()` and `transcribe_audio_chunk()`, `STTConfig`, blanket impl for `Box<T>`. Also exposes `persist_transcript_line()` and `create_engine()` at module level (extracted from `pipeline.rs` and `ffi.rs`).
 - **`stt/ffi.rs`** — `MoonshineFFIEngine`: loads `libmoonshine.dylib` at runtime via `libloading`, declares FFI bindings with `#[repr(C)]` for `CTranscript`, `CTranscriptLine`, etc. Calls the Moonshine streaming API: `create_stream` → `start_stream` → `add_audio_to_stream` → `transcribe_stream`. Frees resources in `Drop`.
@@ -378,9 +407,11 @@ Moderate module (~365 lines, 18 tests) that wraps `SimpleVAD` for Channel A (mic
 
 **Lifecycle integration:** When `start_session` is called, the command creates a DB session (in `sessions` table), spawns an `STTPipeline` thread via `spawn_processing_thread()`, and connects it to the loopback audio stream. The pipeline runs until `stop()` is called, at which point the session is finalized, any pending shadow hints are cancelled via `HintCommand::CancelSession`, and temp WAV files are cleaned up (or retained if `retain_audio` is enabled). On stop, Channel A (mic WAV) is sent to a batch transcription thread (`kue-batch-transcribe`) via `spawn_batch_transcription()`, which transcribes the entire Channel A recording offline using `stt::batch::transcribe_channel_batch()` and persists user responses with `speaker='user'`. The `post-call-transcript-ready` event is emitted on completion.
 
+**Moonshine auto-provisioning (`stt/provisioning.rs`, 905 lines, 17 tests):** On first launch, `ensure_moonshine_installed()` spawns a `kue-moonshine-provision` thread that downloads `libmoonshine.dylib` + `libonnxruntime.1.23.2.dylib` (~53 MB) from PyPI and 8 model files (~429 MB) from `download.moonshine.ai`. Progress is reported via `moonshine-download-progress` events (throttled to 250ms). The `is_moonshine_provisioned` command lets the frontend check status; `retry_moonshine_download` retries on failure.
+
 **Auto-detection:** At runtime, tries FFI first (`libmoonshine.dylib` in `MOONSHINE_LIB_DIR` or standard paths), falls back to CLI if the library is not found. No Whisper — Moonshine is the only option.
 
-**~138 tests:** cover `parse_transcript` (null ptr, 0 lines, completed/incomplete, empty text, preferred line), `rms` (8 cases), VAD (24 cases: silence, speech, timeout, reset, minimum duration, empty, threshold, boundary, accumulation, reset during speech, etc.), temp WAV writing (3 cases: data, empty, unique names), FFI (11 cases: transcript parsing, multi-line, C wraparound), CLI (15 cases: subprocess, parse, edge cases), `STTPipeline` (engine selection, load delegation, start/end session, process chunk, flush segment, DB persistence, poisoned mutex, special characters, multiple lines, hint job dispatch), batch transcription (27 cases: empty/corrupt/all-silence WAVs, user/interviewer speaker, multi-segment, silent engine, whitespace-only text, mixed segments, partial chunks, different sample rates, DB timestamp/session-id verification, chunk_size, sample_offset_to_ms, Send trait, trailing segment edge cases), and provisioning (17 cases: SHA-256 verification, size validation, ZIP extraction, dylib detection).
+**138 tests:** cover `parse_transcript` (null ptr, 0 lines, completed/incomplete, empty text, preferred line), `rms` (8 cases), VAD (24 cases: silence, speech, timeout, reset, minimum duration, empty, threshold, boundary, accumulation, reset during speech, etc.), temp WAV writing (3 cases: data, empty, unique names), FFI (11 cases: transcript parsing, multi-line, C wraparound), CLI (15 cases: subprocess, parse, edge cases), `STTPipeline` (engine selection, load delegation, start/end session, process chunk, flush segment, DB persistence, poisoned mutex, special characters, multiple lines, hint job dispatch), batch transcription (27 cases: empty/corrupt/all-silence WAVs, user/interviewer speaker, multi-segment, silent engine, whitespace-only text, mixed segments, partial chunks, different sample rates, DB timestamp/session-id verification, chunk_size, sample_offset_to_ms, Send trait, trailing segment edge cases), provisioning (17 cases: SHA-256 verification, size validation, ZIP extraction, dylib detection), and `stt/mod.rs` module-level tests (21 cases: engine creation, persist_transcript_line, engine auto-detection).
 
 **Classifier Module (`classifier/mod.rs`, 76 tests)** — heuristics-based question classifier, no LLM:
 
@@ -418,14 +449,14 @@ Moderate module (~365 lines, 18 tests) that wraps `SimpleVAD` for Channel A (mic
 
 ### 2.6 Configuration
 
-- **`tauri.conf.json`** — Tauri v2, two windows: `main` (800×600, session control UI) and `overlay` (400×100, transparent, always-on-top, click-through, skip-taskbar, hidden by default). DMG bundle (macOS only), dev URL on port 1420.
+- **`tauri.conf.json`** — Tauri v2, two windows: `main` (800×600, session control UI) and `overlay` (400×100, transparent, always-on-top, click-through, skip-taskbar, hidden by default). DMG bundle (macOS only), dev URL on port 1420. Includes `tauri-plugin-updater` configuration for auto-update support.
 - **`vite.config.ts`** — Vite 6 with React plugin, HMR on port 1421, ignores changes in `src-tauri/`.
 - **`capabilities/default.json`** — Main window permissions: `core:default` + `shell:allow-open`.
 - **`capabilities/overlay.json`** — Overlay window permissions: `core:default` (minimal — no shell access).
 
 ### 2.7 Orchestrator Module (`orchestrator/`)
 
-**Orchestrator module (`orchestrator/mod.rs` + `orchestrator/worker.rs`, >1400 lines including tests, 73 tests)** — binds classifier + RAG + hint emission into a cohesive hint engine:
+**Orchestrator module (`orchestrator/mod.rs` + `orchestrator/worker.rs`, >1400 lines including tests, 72 tests)** — binds classifier + RAG + hint emission into a cohesive hint engine:
 
 - **`orchestrator::HintJob`** — data struct carrying `session_id`, `text` (the transcribed question), `qtype` (classified question type), and `mode` (`"practice"` or `"shadow"`).
 - **`orchestrator::HintCommand`** — enum for the hint worker's message protocol: `Process(HintJob)` and `CancelSession(String)`.
@@ -625,3 +656,6 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 | `hex`                  | Hex encoding for SHA-256 hashes                   | 0.4     |
 | `zip`                  | ZIP extraction for Moonshine wheel dylibs         | 2       |
 | `reqwest`              | HTTP client for post-call BYOK analysis           | 0.12    |
+| `log`                  | Logging facade for file logger                    | 0.4     |
+| `chrono`               | Timestamp formatting for log files                | 0.4     |
+| `tauri-plugin-updater` | Tauri v2 auto-updater plugin                      | 2       |
