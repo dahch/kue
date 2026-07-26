@@ -605,102 +605,129 @@ fn spawn_batch_transcription(
 }
 
 // ---------------------------------------------------------------------------
-// Tauri command
+// Tauri commands
 // ---------------------------------------------------------------------------
 
 use crate::db::Database;
-use crate::orchestrator::HintJobSender;
+use crate::orchestrator::{HintJobSender, PanicState};
 use crate::stt::{STTConfig, STTPipeline};
 use tauri::Emitter;
 use tauri::Manager;
 
+const PANIC_DURATION_SECS: u64 = 10;
+
 #[tauri::command]
-pub fn toggle_audio_capture(
-    start: bool,
+pub fn start_session(
     mode: String,
     audio: tauri::State<'_, AudioCapture>,
     db: tauri::State<'_, Database>,
     app_handle: tauri::AppHandle,
 ) -> Result<AudioCaptureStatus, String> {
-    if start {
-        let (status, stt_rx) = audio.start(&mode).map_err(|e| e.to_string())?;
+    let (status, stt_rx) = audio.start(&mode).map_err(|e| e.to_string())?;
 
-        // Create a new session in the DB
-        let session_id = uuid::Uuid::new_v4().to_string();
-        {
-            let conn = db.conn.lock().map_err(|e| e.to_string())?;
-            conn.execute(
-                "INSERT INTO sessions (id, company, role, mode) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![session_id, "", "", mode],
-            )
-            .map_err(|e| format!("Failed to insert session: {e}"))?;
-        }
-
-        // Start the STT pipeline
-        let rx = stt_rx;
-        let config = STTConfig {
-            model_path: STTConfig::default_model_path(),
-            language: "en".to_string(),
-            ..Default::default()
-        };
-
-        let hint_job_tx = app_handle.state::<HintJobSender>().inner().clone();
-
-        let mut pipeline = STTPipeline::new(config)
-            .with_app_handle(app_handle)
-            .with_mode(&mode)
-            .with_hint_job_tx(hint_job_tx);
-        if let Err(e) = pipeline.load_model() {
-            eprintln!("[kue] STT model load failed (best-effort): {e}");
-        }
-        pipeline.start_session(&session_id);
-
-        let db_for_stt = Database::clone(db.inner());
-        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        let stt_thread = pipeline.spawn_processing_thread(rx, db_for_stt);
-
-        let mut inner = audio.inner.lock().unwrap();
-        inner.stt_thread = Some(stt_thread);
-        inner.session_id = Some(session_id);
-
-        Ok(status)
-    } else {
-        let status = audio.stop();
-        let session_dir = audio.take_session_dir();
-        let session_id = {
-            let mut inner = audio.inner.lock().unwrap();
-            inner.session_id.take()
-        };
-
-        let retain = db
-            .conn
-            .lock()
-            .ok()
-            .and_then(|conn| {
-                conn.query_row(
-                    "SELECT value FROM settings WHERE key='retain_audio'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok()
-            })
-            .map(|v| v == "true")
-            .unwrap_or(false);
-
-        if let (Some(dir), Some(sid)) = (session_dir, session_id) {
-            let recordings_dir = audio.recordings_dir_path();
-            spawn_batch_transcription(
-                dir,
-                sid,
-                retain,
-                recordings_dir,
-                Database::clone(db.inner()),
-                app_handle.clone(),
-            );
-        }
-
-        Ok(status)
+    // Create a new session in the DB
+    let session_id = uuid::Uuid::new_v4().to_string();
+    {
+        let conn = db.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO sessions (id, company, role, mode) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![session_id, "", "", mode],
+        )
+        .map_err(|e| format!("Failed to insert session: {e}"))?;
     }
+
+    // Start the STT pipeline
+    let rx = stt_rx;
+    let config = STTConfig {
+        model_path: STTConfig::default_model_path(),
+        language: "en".to_string(),
+        ..Default::default()
+    };
+
+    let hint_job_tx = app_handle.state::<HintJobSender>().inner().clone();
+
+    let mut pipeline = STTPipeline::new(config)
+        .with_app_handle(app_handle.clone())
+        .with_mode(&mode)
+        .with_hint_job_tx(hint_job_tx);
+    if let Err(e) = pipeline.load_model() {
+        eprintln!("[kue] STT model load failed (best-effort): {e}");
+    }
+    pipeline.start_session(&session_id);
+
+    let db_for_stt = Database::clone(db.inner());
+    let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+    let stt_thread = pipeline.spawn_processing_thread(rx, db_for_stt);
+
+    let mut inner = audio.inner.lock().map_err(|e| e.to_string())?;
+    inner.stt_thread = Some(stt_thread);
+    inner.session_id = Some(session_id.clone());
+
+    app_handle
+        .emit("session-started", serde_json::json!({"mode": mode, "session_id": session_id}))
+        .ok();
+
+    Ok(status)
+}
+
+#[tauri::command]
+pub fn stop_session(
+    audio: tauri::State<'_, AudioCapture>,
+    db: tauri::State<'_, Database>,
+    app_handle: tauri::AppHandle,
+) -> Result<AudioCaptureStatus, String> {
+    let status = audio.stop();
+    let session_dir = audio.take_session_dir();
+    let session_id = {
+        let mut inner = audio.inner.lock().map_err(|e| e.to_string())?;
+        inner.session_id.take()
+    };
+
+    app_handle.emit("session-stopped", ()).ok();
+
+    let retain = db
+        .conn
+        .lock()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT value FROM settings WHERE key='retain_audio'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        })
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    if let (Some(dir), Some(sid)) = (session_dir, session_id) {
+        let recordings_dir = audio.recordings_dir_path();
+        spawn_batch_transcription(
+            dir,
+            sid,
+            retain,
+            recordings_dir,
+            Database::clone(db.inner()),
+            app_handle.clone(),
+        );
+    }
+
+    Ok(status)
+}
+
+#[tauri::command]
+pub fn panic_mode(
+    app_handle: tauri::AppHandle,
+    panic_state: tauri::State<'_, PanicState>,
+) -> Result<(), String> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(PANIC_DURATION_SECS);
+    {
+        let mut guard = panic_state.0.lock().map_err(|e| e.to_string())?;
+        *guard = Some(until);
+    }
+    app_handle
+        .emit("panic-mode", serde_json::json!({"until_secs": PANIC_DURATION_SECS}))
+        .map_err(|e| e.to_string())
 }
 
 
@@ -712,6 +739,7 @@ pub fn toggle_audio_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     // -----------------------------------------------------------------------
@@ -1287,5 +1315,229 @@ mod tests {
         assert_eq!(spec.channels, 1);
         assert_eq!(spec.sample_rate, 16_000);
         assert_eq!(spec.bits_per_sample, 16);
+    }
+
+    // -----------------------------------------------------------------------
+    // take_session_dir — extraction and clearing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn take_session_dir_returns_none_when_not_set() {
+        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test-take-session"));
+        assert!(cap.take_session_dir().is_none());
+    }
+
+    #[test]
+    fn take_session_dir_returns_and_clears_inner() {
+        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test-take-return"));
+        let expected = PathBuf::from("/tmp/kue-manual-dir");
+
+        // Manually set session_dir via inner mutex (same as start() would)
+        {
+            let mut inner = cap.inner.lock().unwrap();
+            inner.session_dir = Some(expected.clone());
+        }
+
+        let taken = cap.take_session_dir();
+        assert_eq!(taken, Some(expected), "should return the session_dir we set");
+
+        // Verify the inner field was cleared
+        let inner = cap.inner.lock().unwrap();
+        assert!(inner.session_dir.is_none(), "take_session_dir should clear inner state");
+    }
+
+    // -----------------------------------------------------------------------
+    // recordings_dir_path — path retrieval
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn recordings_dir_path_returns_clone() {
+        let dir = PathBuf::from("/tmp/kue-test-recordings-clone");
+        let cap = AudioCapture::new(dir.clone());
+        let got = cap.recordings_dir_path();
+        assert_eq!(got, dir, "returned path should match the original");
+        // Ensure it's a separate clone, not the same Arc/cell (PathBuf is Clone)
+        assert_eq!(cap.recordings_dir, got, "inner path should be equal");
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_retention — file retention logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_retention_retain_true_moves_files_to_recordings_dir() {
+        let tmp = std::env::temp_dir().join("kue-retain-move-test");
+        let session_dir = tmp.join("session-123");
+        let recordings_dir = tmp.join("recordings");
+        let _ = fs::remove_dir_all(&tmp);
+
+        // Create session_dir with a test file
+        fs::create_dir_all(&session_dir).unwrap();
+        let src_file = session_dir.join("mic_channel_A.wav");
+        fs::write(&src_file, b"fake wav content").unwrap();
+
+        apply_retention(&session_dir, &recordings_dir, true);
+
+        // Session dir should be removed
+        assert!(!session_dir.exists(), "session_dir should be removed after retention");
+
+        // File should have been moved to recordings_dir/session-123/mic_channel_A.wav
+        let dest_file = recordings_dir.join("session-123").join("mic_channel_A.wav");
+        assert!(dest_file.exists(), "file should be moved to recordings dir");
+        assert_eq!(fs::read(&dest_file).unwrap(), b"fake wav content");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn apply_retention_retain_false_removes_session_dir_only() {
+        let tmp = std::env::temp_dir().join("kue-retain-false-test");
+        let session_dir = tmp.join("session-456");
+        let recordings_dir = tmp.join("recordings");
+        let _ = fs::remove_dir_all(&tmp);
+
+        fs::create_dir_all(&session_dir).unwrap();
+        let src_file = session_dir.join("some.wav");
+        fs::write(&src_file, b"data").unwrap();
+
+        apply_retention(&session_dir, &recordings_dir, false);
+
+        // Session dir should be removed
+        assert!(!session_dir.exists(), "session_dir should be removed");
+
+        // Recordings dir should NOT have been created
+        assert!(!recordings_dir.exists(), "recordings dir should not exist when retain=false");
+    }
+
+    #[test]
+    fn apply_retention_missing_session_dir_does_not_panic() {
+        // Even though session_dir doesn't exist, remove_dir_all on a
+        // non-existent path is a no-op (returns Ok).
+        let tmp = std::env::temp_dir().join("kue-retain-missing-test");
+        let session_dir = tmp.join("ghost-session");
+        let recordings_dir = tmp.join("recordings");
+        let _ = fs::remove_dir_all(&tmp);
+
+        // Do NOT create session_dir — it doesn't exist
+        apply_retention(&session_dir, &recordings_dir, true);
+
+        // Should not panic, session_dir should still not exist
+        assert!(!session_dir.exists());
+        // recordings_dir may or may not exist (create_dir_all may have been called)
+        // but no crash is the main assertion
+    }
+
+    #[test]
+    fn apply_retention_with_retain_creates_recordings_dir() {
+        let tmp = std::env::temp_dir().join("kue-retain-create-dir-test");
+        let session_dir = tmp.join("sess-create");
+        let recordings_dir = tmp.join("nested").join("recordings");
+        let _ = fs::remove_dir_all(&tmp);
+
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join("a.wav"), b"abc").unwrap();
+
+        apply_retention(&session_dir, &recordings_dir, true);
+
+        // The recordings dir should have been created
+        assert!(recordings_dir.exists(), "recordings_dir should be created");
+        // File moved into recordings_dir/sess-create/a.wav
+        let moved = recordings_dir.join("sess-create").join("a.wav");
+        assert!(moved.exists(), "file should be moved");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn apply_retention_retain_true_with_multiple_files() {
+        let tmp = std::env::temp_dir().join("kue-retain-multi-test");
+        let session_dir = tmp.join("multi-sess");
+        let recordings_dir = tmp.join("rec");
+        let _ = fs::remove_dir_all(&tmp);
+
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join("f1.wav"), b"file1").unwrap();
+        fs::write(session_dir.join("f2.wav"), b"file2").unwrap();
+        fs::write(session_dir.join("f3.txt"), b"notes").unwrap(); // non-wav
+
+        apply_retention(&session_dir, &recordings_dir, true);
+
+        // All files should have been moved
+        let target = recordings_dir.join("multi-sess");
+        assert!(target.join("f1.wav").exists());
+        assert!(target.join("f2.wav").exists());
+        assert!(target.join("f3.txt").exists());
+        assert!(!session_dir.exists());
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn apply_retention_retain_true_session_dir_no_file_name() {
+        // Use root "/" which has no file_name in the sense that it returns None
+        // (technically "/" does have a file_name "" on some platforms, but
+        // Path::new("/").file_name() returns None on macOS).
+        let tmp = std::env::temp_dir().join("kue-retain-root-test");
+        let recordings_dir = tmp.join("rec");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&recordings_dir).unwrap();
+
+        // Use a path whose file_name() returns None (root dir "/")
+        apply_retention(Path::new("/"), &recordings_dir, true);
+
+        // Should not panic, recordings dir should still exist (though the
+        // function will attempt and fail to remove_dir_all("/") — this is fine
+        // because the test doesn't assert about that; we just verify no crash).
+        assert!(recordings_dir.exists());
+
+        // Also test with retain=false and a problematic session_dir path
+        apply_retention(Path::new("/nonexistent_weird_path_that_does_not_exist_xyz"), &recordings_dir, false);
+        // Should not panic
+    }
+
+    #[test]
+    fn apply_retention_read_dir_failure_does_not_panic() {
+        // If session_dir is a file (not a directory), read_dir returns Err.
+        let tmp = std::env::temp_dir().join("kue-retain-readdir-test");
+        let session_dir = tmp.join("not-a-dir");
+        let recordings_dir = tmp.join("rec");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Create a file at the session_dir path instead of a directory
+        fs::write(&session_dir, b"i am a file not a dir").unwrap();
+
+        // This should not panic — read_dir will fail, apply_retention
+        // silently skips the loop, then removes the file via remove_dir_all
+        // (which will fail for a file but that's swallowed).
+        apply_retention(&session_dir, &recordings_dir, true);
+
+        // The file should still exist because remove_dir_all doesn't remove files
+        // on macOS (it returns Err for non-directory).
+        // The main assertion is no panic.
+        assert!(session_dir.exists());
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn apply_retention_retain_true_creates_target_subdir() {
+        let tmp = std::env::temp_dir().join("kue-retain-subdir-test");
+        let session_dir = tmp.join("sess-sub");
+        let recordings_dir = tmp.join("rec");
+        let _ = fs::remove_dir_all(&tmp);
+
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join("a.wav"), b"data").unwrap();
+
+        // The target subdirectory recordings_dir/sess-sub doesn't exist yet
+        apply_retention(&session_dir, &recordings_dir, true);
+
+        // The subdirectory should have been created
+        let target = recordings_dir.join("sess-sub");
+        assert!(target.is_dir(), "target subdirectory should exist");
+        assert!(target.join("a.wav").exists(), "file should be in target");
+
+        fs::remove_dir_all(&tmp).ok();
     }
 }

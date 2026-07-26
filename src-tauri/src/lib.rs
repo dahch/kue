@@ -53,11 +53,16 @@ pub fn run() {
                 scheduler,
             );
 
+            // Register panic state
+            app.manage(orchestrator::PanicState::new());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             db::get_db_status,
-            audio::capture::toggle_audio_capture,
+            audio::capture::start_session,
+            audio::capture::stop_session,
+            audio::capture::panic_mode,
             rag::indexer::index_folder_cmd,
             rag::indexer::search_context,
             classifier::classify_text,
