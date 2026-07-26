@@ -64,6 +64,19 @@ graph TD
         CL1[classifier::classify_text<br/>heuristic + regex + Tauri cmd]
     end
 
+    subgraph "Orchestrator / Hint Engine (implemented)"
+        O1[orchestrator::HintScheduler<br/>pending hints with delay]
+        O2[orchestrator::HintJob<br/>text + qtype + mode + session]
+        O3[orchestrator::worker::<br/>start_hint_worker<br/>kue-hint-worker thread]
+        O4[orchestrator::generate_and_emit_hint<br/>classify→RAG→hint→emit]
+    end
+
+    subgraph "Tauri Events"
+        EV1[new-transcript]
+        EV2[question-detected]
+        EV3[new-hint]
+    end
+
     A -->|invoke| B1
     A -->|invoke| B2
     A -->|invoke| B3
@@ -82,7 +95,14 @@ graph TD
     O -->|audio samples| Q4
     Q4 --> CL1
     Q4 --> I
+    Q4 -->|HintJob via mpsc| O3
     CL1 --> I
+    O3 --> O1
+    O3 --> O4
+    O4 --> T
+    O4 --> EV3
+    Q4 --> EV1
+    Q4 --> EV2
     G --> H
     G --> I
     G --> J
@@ -96,7 +116,7 @@ graph TD
     style A fill:#e1f5fe,stroke:#0288d1
 ```
 
-**Legend:** Solid line = implemented. The STT pipeline integrates classification (VAD → STT → classify → events → DB). The classifier is wired into the pipeline and also exposed as a Tauri command (`classify_text`).
+**Legend:** Solid line = implemented. The STT pipeline integrates classification (VAD → STT → classify → events → DB). When a question is detected, the pipeline pushes a `HintJob` to the orchestrator worker thread via an mpsc channel. The worker queries RAG, builds a hint, and either emits it immediately (Practice) or schedules it via `HintScheduler` (Shadow, 2.5s delay). Expired hints are drained every 500ms in the worker's poll loop and emitted via `new-hint` Tauri event.
 
 ---
 
@@ -110,14 +130,15 @@ graph TD
 
 ### 2.2 Tauri Shell (`lib.rs`)
 
-File `src-tauri/src/lib.rs` (~40 lines):
+File `src-tauri/src/lib.rs` (~61 lines):
 
-```
+```rust
 mod audio;
 mod classifier;
 mod db;
+mod orchestrator;    // Hint engine — wired into lifecycle
 mod rag;
-mod stt;      // STT module (Moonshine) — integrated into lifecycle via toggle_audio_capture
+mod stt;             // STT module (Moonshine) — integrated via toggle_audio_capture
 mod types;
 
 run() {
@@ -127,34 +148,53 @@ run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
-            let database = db::init_db(app)?;           // Creates ~/Library/.../kue.db + migrates schema
+            let database = db::init_db(app)?;
             app.manage(database);
 
             let recordings_dir = app.path().app_data_dir()?.join("recordings");
             app.manage(audio::capture::AudioCapture::new(recordings_dir));
 
-            let model = rag::embeddings::load_embedding_model()?;  // Downloads/loads BERT on Metal
-            app.manage(std::sync::Mutex::new(model));    // Mutex for thread-safe access
+            let model = Arc::new(std::sync::Mutex::new(
+                rag::embeddings::load_embedding_model()?,
+            ));
+            app.manage(model.clone());
+
+            let scheduler = Arc::new(orchestrator::HintScheduler::new());
+            app.manage(scheduler.clone());
+
+            let (hint_tx, hint_rx) = std::sync::mpsc::channel();
+            let hint_job_tx: orchestrator::HintJobSender = Arc::new(hint_tx);
+            app.manage(hint_job_tx);
+
+            let db_for_worker = db::Database::clone(app.state::<db::Database>().inner());
+            orchestrator::worker::start_hint_worker(
+                hint_rx,
+                app.handle().clone(),
+                db_for_worker,
+                model,
+                scheduler,
+            );
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             db::get_db_status,
             audio::capture::toggle_audio_capture,
-            rag::indexer::index_folder_cmd,             // Indexes documents for RAG
-            rag::indexer::search_context,               // Vector search
-            classifier::classify_text,                  // Question classification
+            rag::indexer::index_folder_cmd,
+            rag::indexer::search_context,
+            classifier::classify_text,
         ])
         .run(tauri::generate_context!())
 }
 ```
 
-- **`mod audio`**, **`mod classifier`**, **`mod db`**, **`mod rag`**, **`mod stt`**, **`mod types`** — Backend submodules.
+- **`mod audio`**, **`mod classifier`**, **`mod db`**, **`mod orchestrator`**, **`mod rag`**, **`mod stt`**, **`mod types`** — Backend submodules.
 - **`cleanup_orphaned_temp_dirs()`** — Removes temporary `kue-session-*` directories left by crashed sessions.
 - **`plugin(tauri_plugin_shell)`** — Necessary to invoke external processes (planned for BYOK).
-- **`app.manage(database)`**, **`app.manage(AudioCapture)`**, **`app.manage(Mutex<EmbeddingModel>)`** — Injects `Database`, `AudioCapture` and the embeddings model as Tauri state.
+- **`app.manage(database)`**, **`app.manage(AudioCapture)`**, **`app.manage(Arc<Mutex<EmbeddingModel>>)`** — Injects `Database`, `AudioCapture` and the embeddings model (wrapped in `Arc` for sharing with the hint worker) as Tauri state.
+- **Orchestrator setup:** `HintScheduler` (manages delayed hints in Shadow mode), `HintJobSender` (mpsc channel for dispatching hint jobs), and `start_hint_worker` (spawns `kue-hint-worker` thread that processes jobs and drains expired hints every 500ms).
 - **`index_folder_cmd`**, **`search_context`**, and **`classify_text`** — Tauri commands for RAG and classifier.
-- **STT integration:** The STT pipeline is fully integrated into `toggle_audio_capture`. When `start=true`, the command creates a DB session, spawns an `STTPipeline` thread that consumes audio from the loopback channel, performs VAD → STT → classify → events → persistence. The `new-transcript` and `question-detected` events are emitted to the frontend.
+- **STT integration:** The STT pipeline is fully integrated into `toggle_audio_capture`. When `start=true`, the command creates a DB session, spawns an `STTPipeline` thread that consumes audio from the loopback channel, performs VAD → STT → classify → events → persistence → hint job dispatch. The `new-transcript` and `question-detected` events are emitted to the frontend; question-detected lines also push a `HintJob` to the orchestrator worker.
 
 ### 2.3 Database Module (`db/mod.rs`)
 
@@ -173,7 +213,7 @@ Substantial module (~1230 lines, 50 tests) that implements dual audio capture:
 
 ### 2.5 STT + Classifier Module (`stt/`, `classifier/`)
 
-**STT Module (`stt/`, ~630 lines, 81 tests)** — implements real-time transcription of Channel B, integrated into the app lifecycle via `toggle_audio_capture`:
+**STT Module (`stt/`, ~815 non-test lines, 84 tests)** — implements real-time transcription of Channel B, integrated into the app lifecycle via `toggle_audio_capture`:
 
 - **`stt/mod.rs`** — `STTEngine` trait with `load()` and `transcribe_audio_chunk()`, `STTConfig`, blanket impl for `Box<T>`.
 - **`stt/ffi.rs`** — `MoonshineFFIEngine`: loads `libmoonshine.dylib` at runtime via `libloading`, declares FFI bindings with `#[repr(C)]` for `CTranscript`, `CTranscriptLine`, etc. Calls the Moonshine streaming API: `create_stream` → `start_stream` → `add_audio_to_stream` → `transcribe_stream`. Frees resources in `Drop`.
@@ -181,18 +221,34 @@ Substantial module (~1230 lines, 50 tests) that implements dual audio capture:
 - **`stt/vad.rs`** — `SimpleVAD`: voice activity detection by RMS energy with configurable threshold, minimum speech duration, and silence timeout.
 - **`stt/pipeline.rs`** — `STTPipeline`: orchestrator that receives audio from loopback via `mpsc::Receiver`, runs VAD + segment buffer + STT engine + calls `classifier::classify()` on each transcribed line + emits `new-transcript` and `question-detected` events + persists in `transcript_lines`.
 
-**Lifecycle integration:** When `toggle_audio_capture` is called with `start=true`, the command creates a DB session (in `sessions` table), spawns an `STTPipeline` thread via `spawn_processing_thread()`, and connects it to the loopback audio stream. The pipeline runs until `stop()` is called, at which point the session is finalized and temp WAV files are cleaned up (or retained if `retain_audio` is enabled).
+**Lifecycle integration:** When `toggle_audio_capture` is called with `start=true`, the command creates a DB session (in `sessions` table), spawns an `STTPipeline` thread via `spawn_processing_thread()`, and connects it to the loopback audio stream. The pipeline runs until `stop()` is called, at which point the session is finalized, any pending shadow hints are cancelled via `HintCommand::CancelSession`, and temp WAV files are cleaned up (or retained if `retain_audio` is enabled).
 
 **Auto-detection:** At runtime, tries FFI first (`libmoonshine.dylib` in `MOONSHINE_LIB_DIR` or standard paths), falls back to CLI if the library is not found. No Whisper — Moonshine is the only option.
 
-**81 tests:** cover `parse_transcript` (null ptr, 0 lines, completed/incomplete, empty text, preferred line), `rms` (8 cases), VAD (15+ cases: silence, speech, timeout, reset, minimum duration, empty, threshold, boundary, accumulation, reset during speech, etc.), temp WAV writing (3 cases: data, empty, unique names), `STTPipeline` (engine selection, load delegation, start/end session, process chunk, flush segment, DB persistence, poisoned mutex, special characters, multiple lines).
+**84 tests:** cover `parse_transcript` (null ptr, 0 lines, completed/incomplete, empty text, preferred line), `rms` (8 cases), VAD (24 cases: silence, speech, timeout, reset, minimum duration, empty, threshold, boundary, accumulation, reset during speech, etc.), temp WAV writing (3 cases: data, empty, unique names), `STTPipeline` (engine selection, load delegation, start/end session, process chunk, flush segment, DB persistence, poisoned mutex, special characters, multiple lines, hint job dispatch).
 
 **Classifier Module (`classifier/mod.rs`, 48 tests)** — heuristics-based question classifier, no LLM:
 
 - **`classifier::classify()`** — pure function that receives text and returns `QuestionType` (Technical, Star, Architecture, Trap, None).
 - **`classifier::classify_text`** — Tauri command wrapper exposing classification to the frontend.
 - **Detection:** question mark (`?`) OR imperative verb triggers (bilingual EN/ES), exclusion list for small talk, 4 keyword lists (40-80 terms each) for type classification, tie-breaking (Trap > Architecture > Star > Technical), experience question heuristic, and zero-score fallback.
-- **Integration:** Called from `STTPipeline::flush_segment()` — each transcribed line is classified, and if not `None`, a `question-detected` event is emitted. Also registered as a standalone Tauri command for direct frontend use.
+- **Integration:** Called from `STTPipeline::flush_segment()` — each transcribed line is classified, and if not `None`, a `question-detected` event is emitted AND a `HintJob` is pushed to the orchestrator worker via `HintJobSender`. Also registered as a standalone Tauri command for direct frontend use.
+
+### 2.7 Orchestrator Module (`orchestrator/`)
+
+**Orchestrator module (`orchestrator/mod.rs` + `orchestrator/worker.rs`, ~400 non-test lines, 39 tests)** — binds classifier + RAG + hint emission into a cohesive hint engine:
+
+- **`orchestrator::HintJob`** — data struct carrying `session_id`, `text` (the transcribed question), `qtype` (classified question type), and `mode` (`"practice"` or `"shadow"`).
+- **`orchestrator::HintCommand`** — enum for the hint worker's message protocol: `Process(HintJob)` and `CancelSession(String)`.
+- **`orchestrator::HintJobSender`** — type alias `Arc<Sender<HintCommand>>`, shared sender handle injected as Tauri state.
+- **`orchestrator::HintScheduler`** — manages pending hints for Shadow mode. Hints are scheduled with a 2.5s delay (`SHADOW_DELAY_MS`); `tick(now)` returns expired hints. Supports `cancel_all(session_id)` to cancel pending hints when a session ends.
+- **`orchestrator::generate_and_emit_hint()`** — the core hint generation function. Guards against `None`/empty text, runs `build_hint_text()` (RAG search top_k=1, tag+metric formatting, generic fallback), and either emits `new-hint` event immediately (Practice) or schedules via `HintScheduler` (Shadow).
+- **`orchestrator::build_hint_text()`** — queries RAG via `search()`, if results have both `tag` and `metric` → formats as `"💡 {tag}: {metric}"` (max 8 words), otherwise truncates the chunk text to 8 words, falls back to generic hint per question type.
+- **`orchestrator::generic_hint()`** — per-type fallback strings (e.g., `"💡 Usa STAR: Situación, Tarea, Acción, Resultado"` for Star).
+- **`orchestrator::worker::start_hint_worker()`** — spawns the `kue-hint-worker` thread. Polls `HintCommand` channel with 500ms timeout. On `Process(job)`, calls `generate_and_emit_hint`. On timeout, calls `emit_expired_hints()` to drain the scheduler. On `CancelSession(sid)`, calls `scheduler.cancel_all()`.
+- **`orchestrator::emit_expired_hints()`** — drains all expired hints from the scheduler and emits them as `new-hint` Tauri events.
+
+**Integration:** The STT pipeline's `flush_segment()` pushes `HintCommand::Process` into the mpsc channel when a question is detected. The pipeline's shutdown path sends `HintCommand::CancelSession` to cancel any pending shadow hints.
 
 ### 2.6 Configuration
 
@@ -294,7 +350,7 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 | RAG embeddings + indexer | **Implemented**  | `candle-core`, `candle-nn`, `candle-transformers`, `hf-hub`, `tokenizers`, `bytemuck` | `rag/embeddings.rs`, `rag/indexer.rs` |
 | STT (Moonshine)         | **Implemented** (integrated in lifecycle via `toggle_audio_capture`) | `libloading` (dynamically loaded `libmoonshine.dylib`), `uuid`                       | `stt/mod.rs`, `stt/ffi.rs`, `stt/cli.rs`, `stt/vad.rs`, `stt/pipeline.rs` |
 | Question classifier     | **Implemented** (integrated in STT pipeline, standalone Tauri cmd) | —                                                                                     | `classifier/mod.rs`                  |
-| Hint generator          | **Not started**  | —                                                                                     | —                                    |
+| Hint generator          | **Implemented** (orchestrator module: HintScheduler + hint worker + mpsc dispatch) | —                                                                                     | `orchestrator/mod.rs`, `orchestrator/worker.rs` |
 | Overlay / real UI       | **Not started**  | —                                                                                     | —                                    |
 | Post-call BYOK          | **Not started**  | `tauri-plugin-shell` present                                                          | —                                    |
 
@@ -315,6 +371,10 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 - **FFI auto-detection pattern:** `MoonshineFFIEngine::is_available()` checks for `libmoonshine.dylib` at runtime; if not available, falls back to `MoonshineCLIEngine` without user intervention.
 - **Pipeline-integrated classification:** The classifier is not a separate service — it's called inline from `STTPipeline::flush_segment()` after each transcription, emitting a `question-detected` event if the text is a recognized question type.
 - **Pure function with Tauri wrapper (classifier):** `classify()` is a pure `fn(&str) -> QuestionType` (testable without Tauri), while `classify_text()` is a thin `#[tauri::command]` wrapper exposing it over IPC.
+- **Worker thread + channel (orchestrator):** The hint engine runs in a dedicated `kue-hint-worker` thread that receives `HintCommand` messages over an `mpsc` channel from the STT pipeline. Decouples the latency-sensitive audio path from the hint generation path (which hits RAG).
+- **Scheduler pattern (HintScheduler):** Shadow mode hints are stored in a `Vec<PendingHint>` with an `Instant` deadline. The worker polls via `tick(now)` every 500ms. This avoids timers/threads per hint — a single poll loop processes all expired hints at once.
+- **Cancel on session end:** The pipeline sends `HintCommand::CancelSession` when its thread exits, and the scheduler immediately removes all pending hints for that session. This prevents stale hints from appearing after the interview has ended.
+- **Arc<Mutex> shared model:** The `EmbeddingModel` is wrapped in `Arc<Mutex<...>>` and cloned into the hint worker, allowing both Tauri commands (IPC) and the worker thread to generate embeddings without contention on a single state slot.
 
 ---
 

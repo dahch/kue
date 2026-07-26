@@ -2,7 +2,7 @@
 
 > Codename: **Kue**.
 
-> **Implementation status:** Sprints 0–3 completed, Sprint 4 (overlay) next. The DB schema is implemented (27 tests), the audio capture module (mic + loopback, ~1230 lines, 50 tests), the RAG engine (embeddings + indexer, 14+43=57 tests), the STT module (5 files, ~815 non-test lines, 81 tests), and the classifier module (1 file, 48 tests). The STT module integrates Moonshine via FFI (libmoonshine.dylib) with CLI fallback (`moonshine-voice`), simple VAD, pipeline in its own thread, `new-transcript` events to the frontend and persistence in `transcript_lines`. The STT pipeline is integrated into the app lifecycle via `toggle_audio_capture` command, which creates DB sessions, spawns the pipeline thread, and persists transcripts. The classifier receives each transcribed line (called from `STTPipeline::flush_segment`) and emits a `question-detected` event when a question is recognized. A Tauri command `classify_text` is also registered for direct use from the frontend. Sections §3–§9 describe the complete planned product; see [`design.md`](./design.md) for what is actually built.
+> **Implementation status:** Sprints 0–3 completed, Sprint 4 (overlay) next. The DB schema is implemented (27 tests), the audio capture module (mic + loopback, ~1230 lines, 50 tests), the RAG engine (embeddings + indexer, 14+43=57 tests), the STT module (5 files, ~815 non-test lines, 84 tests), the classifier module (1 file, 48 tests), and the orchestrator module (2 files, ~400 non-test lines, 39 tests). The STT module integrates Moonshine via FFI (libmoonshine.dylib) with CLI fallback (`moonshine-voice`), simple VAD, pipeline in its own thread, `new-transcript` events to the frontend and persistence in `transcript_lines`. The STT pipeline is integrated into the app lifecycle via `toggle_audio_capture` command, which creates DB sessions, spawns the pipeline thread, and persists transcripts. The classifier receives each transcribed line (called from `STTPipeline::flush_segment`) and emits a `question-detected` event when a question is recognized. When a question is detected, the pipeline pushes a `HintJob` to the orchestrator module, which runs classifier + RAG search → hint text → immediate emit (Practice) or delayed emit (Shadow) via a dedicated worker thread (`kue-hint-worker`). Sections §3–§9 describe the complete planned product; see [`design.md`](./design.md) for what is actually built.
 
 ## 1. Objective
 
@@ -60,52 +60,52 @@ Desktop application (macOS-only in v1) that functions as a "memory copilot" for 
 ## 6. Module architecture
 
 ```text
-┌─────────────────────────────────────────────────────────────────┐
-│                        TAURI SHELL (Rust)                        │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │   Audio Capture                                           │   │
-│  │   - Channel A: Microphone (cpal) — your voice            │   │
-│  │   - Channel B: System Loopback (ScreenCaptureKit)         │   │
-│  │             — interviewer                                 │   │
-│  └──────────┬────────────────────────────────┬───────────────┘   │
-│             ▼                                ▼                   │
-│  ┌──────────────────────┐         ┌───────────────────────┐      │
-│  │ STT (Moonshine)      │         │ Local buffer (WAV)    │      │
-│  │ Only channel B in    │         │ Channel A+B, for       │      │
-│  │ real time            │         │ post-call              │      │
-│  └──────┬───────────────┘         └───────────────────────┘      │
-│         ▼ streaming text                                          │
-│  ┌──────────────────────────────────────────────────────────┐    │
-│  │  Question Classifier (heuristics + regex)                  │    │
-│  │  - Is it a question? (question mark + imperative verbs     │    │
-│  │    like "cuéntame", "dime", "descríbeme")                  │    │
-│  │  - Type: Technical / STAR / Architecture / Trick           │    │
-│  └──────────┬──────────────────────────────────────────────┘     │
-│             ▼ if it's a question                                  │
-│  ┌─────────────────────────────────────────────────────────┐     │
-│  │  RAG (sqlite-vec + candle)                               │     │
-│  │  - Question embedding                                    │     │
-│  │  - vec_distance_cosine against chunks_vec                 │     │
-│  │  - Retrieves the closest chunk (project/metric)           │     │
-│  └──────────┬─────────────────────────────────────────────┘      │
-│             ▼ retrieved chunk                                     │
-│  ┌─────────────────────────────────────────────────────────┐     │
-│  │  Hint Generator (pure Rust)                              │     │
-│  │  - Formats: "💡 {tag}: {metric}" (max 8 words)            │     │
-│  │  - In Shadow: only triggers if delay > 2.5s               │     │
-│  └──────────┬─────────────────────────────────────────────┘      │
-│             ▼ Tauri event                                         │
-│  ┌─────────────────────────────────────────────────────────┐     │
-│  │  Overlay (Tauri window)                                  │     │
-│  │  - always_on_top, click-through, semi-transparent         │     │
-│  │  - positionable, Panic button (silences hints)            │     │
-│  └─────────────────────────────────────────────────────────┘     │
+┌──────────────────────────────────────────────────────────────────────┐
+│                        TAURI SHELL (Rust)                             │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │   Audio Capture                                              │    │
+│  │   - Channel A: Microphone (cpal) — your voice               │    │
+│  │   - Channel B: System Loopback (ScreenCaptureKit)            │    │
+│  │             — interviewer                                    │    │
+│  └──────────┬──────────────────────────────────┬──────────────┘    │
+│             ▼                                  ▼                    │
+│  ┌──────────────────────┐         ┌───────────────────────┐        │
+│  │ STT (Moonshine)      │         │ Local buffer (WAV)    │        │
+│  │ Only channel B in    │         │ Channel A+B, for       │        │
+│  │ real time            │         │ post-call              │        │
+│  └──────┬───────────────┘         └───────────────────────┘        │
+│         ▼ streaming text                                             │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Question Classifier (heuristics + regex)                     │   │
+│  │  - Is it a question? (question mark + imperative verbs        │   │
+│  │    like "cuéntame", "dime", "descríbeme")                     │   │
+│  │  - Type: Technical / STAR / Architecture / Trick              │   │
+│  └──────────┬─────────────────────────────────────────────────┘   │
+│             ▼ if it's a question  (HintJob via mpsc channel)       │
+│  ┌────────────────────────────────────────────────────────────┐   │
+│  │  Orchestrator (HintScheduler + hint worker thread)          │   │
+│  │  ┌──────────────────────────────────────────────────────┐  │   │
+│  │  │  1. Classifies question type (Technical/STAR/etc.)   │  │   │
+│  │  │  2. Queries RAG (top_k=1, tag/metric if available)   │  │   │
+│  │  │  3. Builds hint: "💡 {tag}: {metric}" (≤8 words)    │  │   │
+│  │  │     or generic: "💡 Usa STAR: Situación, Tarea..."    │  │   │
+│  │  │  4a. Practice → emit "new-hint" event immediately    │  │   │
+│  │  │  4b. Shadow → schedule via HintScheduler, emit        │  │   │
+│  │  │     after 2.5s delay if not cancelled                │  │   │
+│  │  └──────────────────────────────────────────────────────┘  │   │
+│  └──────────┬─────────────────────────────────────────────────┘   │
+│             ▼ Tauri event ("new-hint")                              │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │  Overlay (Tauri window)                                       │ │
+│  │  - always_on_top, click-through, semi-transparent             │ │
+│  │  - positionable, Panic button (silences hints)                │ │
+│  └──────────────────────────────────────────────────────────────┘ │
 │                                                                     │
-│  ┌─────────────────────────────────────────────────────────┐     │
-│  │  SQLite (single source of truth)                         │     │
-│  │  transcripts · docs (vectors) · sessions · settings       │     │
-│  └─────────────────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────────────────┘
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │  SQLite (single source of truth)                              │ │
+│  │  transcripts · docs (vectors) · sessions · settings            │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 7. Question classifier — details
@@ -148,7 +148,7 @@ settings(key, value)  -- includes retain_audio (bool, default false); does NOT i
 | 0      | Base infrastructure | Tauri + React project. Rust dependencies (`cpal`, `screencapturekit-rs`, `tauri`, `rusqlite`+`sqlite-vec`, `candle`). Complete SQLite schema (sessions, transcript_lines, documents, chunks, chunks_vec, settings) with migrations. sqlite-vec registered. Dual audio capture (mic cpal + loopback SCK) with WAV writing. `get_db_status` and `toggle_audio_capture` commands. 48+ tests. | ✅ **Completed** |
 | 1      | STT (Moonshine)     | Moonshine integration on channel B. STTEngine trait + FFI engine (`libmoonshine.dylib`) + CLI fallback (`moonshine-voice transcribe`). Simple VAD (energy-based). Pipeline thread that receives audio from loopback, segments by VAD, transcribes, emits `new-transcript` event and persists in `transcript_lines`.                                                                       | ✅ **Completed** |
 | 2      | RAG Engine          | Local document indexing. sqlite-vec + candle generating and searching embeddings. Goal: query <20ms.                                                                                                                                                                                                                                                                                      | ✅ **Completed** |
-| 3 | Classifier & hints | Rules from §7 in Rust. `QuestionType` enum (Technical/STAR/Architecture/Trap/None) with heuristic + keyword-density scoring. `classify_text` Tauri command registered in invoke_handler. Classifier wired into STT pipeline — each transcribed line is classified and emits `question-detected` event (see `stt/pipeline.rs`). Hint generator pending. | ✅ **Completed** (48 tests) |
+| 3 | Classifier & hints | Rules from §7 in Rust. `QuestionType` enum (Technical/STAR/Architecture/Trap/None) with heuristic + keyword-density scoring. `classify_text` Tauri command registered in invoke_handler. Classifier wired into STT pipeline — each transcribed line is classified and emits `question-detected` event (see `stt/pipeline.rs`). Orchestrator module (`orchestrator/mod.rs` + `orchestrator/worker.rs`) integrates classifier + RAG to produce hints: RAG search (top_k=1), `💡 {tag}: {metric}` format (max 8 words), generic fallback per type. Dedicated hint worker thread (`kue-hint-worker`) processes HintJobs via mpsc channel, uses `HintScheduler` for Shadow mode's 2.5s delay, and emits `new-hint` events via Tauri. | ✅ **Completed** (48 classifier tests + 39 orchestrator tests) |
 | 4      | Overlay & UI        | Transparent window, always-on-top, click-through. Practice vs Shadow. Panic button.                                                                                                                                                                                                                                                                                                       | ⬜ Not started   |
 | 5      | Post-call & BYOK    | SQLite export/query. External API call. Secure key storage in keychain. Analysis saving.                                                                                                                                                                                                                                                                                                  | ⬜ Not started   |
 

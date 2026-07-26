@@ -171,3 +171,38 @@
 - *(Negative)* Very long words (e.g., German compounds, code with long identifiers) could approach the limit. Chunking doesn't respect paragraph/section boundaries — a chunk may cut an idea in half.
 
 **Alternatives considered:** Token-based chunking (more precise but requires the tokenizer in the indexing hot path, adding latency and complexity). Paragraph-based chunking (variable size, hard to control). No overlap (loses context between fragments).
+
+---
+
+### ADR-014: Dedicated hint worker thread with poll-based scheduler for delayed hints
+
+**Date:** 2026-07-26
+
+**Status:** Accepted
+
+**Context:** The hint engine needs to:
+- Accept hint jobs from the real-time STT pipeline without blocking it (the pipeline runs in a tight audio loop — any delay in hint generation would cause audio drops).
+- Support two emission modes: **Practice** (emit the hint immediately after classification + RAG) and **Shadow** (emit only after a 2.5s delay, simulating "the user is stuck").
+- Cancel pending hints if the session ends before the delay expires (otherwise stale hints would appear in a subsequent session).
+- Query the RAG index (SQLite + candle embedding) for each hint, which can take 5–20ms.
+
+**Decision:** A three-part architecture:
+
+1. **Worker thread + mpsc channel:** The STT pipeline sends `HintCommand::Process(HintJob)` messages over an `std::sync::mpsc::Sender` (wrapped in `Arc` as `HintJobSender`). A dedicated `kue-hint-worker` thread receives them. This decouples the audio-hot path from the hint generation path (RAG query).
+
+2. **Poll-based scheduler (`HintScheduler`):** Shadow mode hints are stored in a `Vec<PendingHint>` with a `fire_at: Instant` deadline. Rather than spawning one timer per hint, the worker thread polls the scheduler every 500ms via `tick(now)` which returns all hints whose deadline has passed. This avoids the complexity of per-hint timers and makes cancellation trivial (just remove from the vector).
+
+3. **Cancel-on-session-end:** When the STT pipeline thread exits (session stops), it sends `HintCommand::CancelSession(session_id)`. The worker calls `scheduler.cancel_all(session_id)`, which removes all pending hints for that session. This prevents stale hint emission.
+
+**Consequences:**
+- *(Positive)* The audio pipeline is never blocked by RAG queries or hint formatting.
+- *(Positive)* Shadow mode hint delay is simple and testable — it's just a time comparison in a vector, not a timer interface.
+- *(Positive)* Cancellation is O(n) in the number of pending hints — acceptable since at most ~20 questions are expected per session.
+- *(Positive)* 39 unit tests cover scheduler timing, cancellation, multi-session isolation, hint formatting variants, and generic fallbacks — all without a real Tauri runtime.
+- *(Negative)* Polling every 500ms means a hint can fire up to 500ms late in Shadow mode (2.5s → ~3.0s). This was deemed acceptable — it's within human perception tolerance for a "stuck" delay.
+- *(Negative)* The worker thread adds ~200KB of fixed overhead, negligible on a modern system.
+
+**Alternatives considered:**
+- **Inline generation in the pipeline thread** (simpler but blocks the audio loop for 5–20ms per RAG query — risk of audio buffer underruns at high question frequency).
+- **Per-hint timers (`std::thread::sleep` + `Instant`)** in the pipeline or separate threads (scales poorly with question count; cancellation requires complex `Arc<AtomicBool>` flags; testing requires real time).
+- **`tokio::spawn` + `tokio::time::delay`** (would introduce async runtime dependency just for this feature; increases compilation time and binary size).

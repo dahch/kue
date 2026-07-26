@@ -4,7 +4,7 @@
 
 Desktop application (macOS, Tauri v2) with real-time transcription, local RAG over your CV/projects, and ultra-short hints to maintain fluency under pressure. Post-call, optional analysis with your own LLM (BYOK).
 
-**Current status:** Sprints 0–3 completed — base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline) integrated into the app lifecycle, and question classifier (heuristics + regex) wired into the STT pipeline. All implemented and tested (+260 tests in Rust). The rest of the pipeline (hint generator → overlay) is in planning (see `spec.md`).
+**Current status:** Sprints 0–3 completed — base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline) integrated into the app lifecycle, and question classifier (heuristics + regex) wired into the STT pipeline. All implemented and tested (+300 tests in Rust). The remaining work (overlay → final UI) is in planning for Sprint 4 (see `spec.md`).
 
 ---
 
@@ -35,7 +35,7 @@ The app will open a window with debug controls to index folders (RAG) and search
 # Rust tests (database — all logic implemented)
 npm run test:rust:db
 
-# Rust tests (all modules, >260 tests)
+# Rust tests (all modules, >300 tests)
 npm run test:rust
 
 # Rust coverage (requires cargo-tarpaulin)
@@ -100,6 +100,16 @@ npm run coverage:rust:full
 │                 │  │    (VAD→STT→classify→   │   │    │
 │                 │  │     events→DB)           │   │    │
 │                 │  └─────────────────────────┘   │    │
+│                 │  ┌─────────────────────────┐   │    │
+│                 │  │  Orchestrator            │   │    │
+│                 │  │  - HintScheduler         │   │    │
+│                 │  │  - HintJob/HintCommand   │   │    │
+│                 │  │  - hint worker thread    │   │    │
+│                 │  │  - generate_and_emit_hint│   │    │
+│                 │  │  (classify→RAG→hint→     │   │    │
+│                 │  │   emit, Practice immedi-  │   │    │
+│                 │  │   ate / Shadow delayed)   │   │    │
+│                 │  └─────────────────────────┘   │    │
 │                 └───────────────────────────────┘    │
 │  ┌──────────────────────────────────────────────┐    │
 │  │  SQLite + sqlite-vec                          │    │
@@ -109,7 +119,7 @@ npm run coverage:rust:full
 └──────────────────────────────────────────────────────┘
 ```
 
-**Legend:** All listed code is functional and tested. `candle` implements BERT embeddings (`snowflake-arctic-embed-s`) in the `rag::embeddings` module, and `sqlite-vec` performs KNN vector search. The STT pipeline integrates Moonshine (FFI + CLI fallback), VAD, classification, and DB persistence. The classifier module uses heuristic rules (regex + keyword density) to categorize questions.
+**Legend:** All listed code is functional and tested. `candle` implements BERT embeddings (`snowflake-arctic-embed-s`) in the `rag::embeddings` module, and `sqlite-vec` performs KNN vector search. The STT pipeline integrates Moonshine (FFI + CLI fallback), VAD, classification, DB persistence, and pushes hint jobs to the orchestrator. The classifier module uses heuristic rules (regex + keyword density) to categorize questions. The orchestrator module stitches classifier + RAG → hints (immediate in Practice, delayed in Shadow) via a dedicated worker thread.
 
 ## Stack
 
@@ -120,6 +130,7 @@ npm run coverage:rust:full
 | Database | SQLite + sqlite-vec (vectors) |
 | Audio | cpal (mic) + screencapturekit-rs (loopback) + hound (WAV) |
 | STT + Classifier | Moonshine (FFI + CLI fallback) + heuristics/regex classifier |
+| Hint Engine | orchestrator module (HintScheduler + hint worker thread) |
 | Embeddings | candle (HuggingFace Rust) + `snowflake-arctic-embed-s` |
 | Post-call (planned) | BYOK (Anthropic/OpenAI/Ollama/etc.) |
 
@@ -149,6 +160,9 @@ kue/
 │   │   │   └── capture.rs # Dual capture (cpal + SCK), WAV writer, toggle_audio_capture cmd
 │   │   ├── classifier/
 │   │   │   └── mod.rs    # Question classification (heuristics + regex, 48 tests)
+│   │   ├── orchestrator/
+│   │   │   ├── mod.rs    # HintJob, HintScheduler, generate_and_emit_hint (39 tests)
+│   │   │   └── worker.rs # hint worker thread (poll loop + expired hint emission)
 │   │   ├── stt/
 │   │   │   ├── mod.rs    # STTEngine trait, STTConfig, re-exports
 │   │   │   ├── ffi.rs    # MoonshineFFIEngine (libmoonshine.dylib via libloading)
