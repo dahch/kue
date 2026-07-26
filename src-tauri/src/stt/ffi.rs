@@ -121,7 +121,19 @@ impl MoonshineFFIEngine {
             "moonshine.dll",
         ];
 
+        // Prefer the managed lib dir set by the provisioning module
+        // (app_data_dir/moonshine/lib), then fall back to dev paths.
+        // DYLD_LIBRARY_PATH is already set in lib.rs setup to include
+        // the managed lib dir, so @rpath/libonnxruntime.*.dylib
+        // resolution is handled there.
         let mut candidates = Vec::new();
+        let managed_dir = super::managed_lib_dir();
+        if let Some(ref managed) = managed_dir {
+            for name in &lib_names {
+                candidates.push(managed.join(name));
+            }
+        }
+
         for name in &lib_names {
             candidates.push(PathBuf::from(name));
             if let Ok(dir) = std::env::current_dir() {

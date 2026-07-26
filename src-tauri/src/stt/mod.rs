@@ -2,15 +2,25 @@ pub mod batch;
 pub mod cli;
 pub mod ffi;
 mod pipeline;
+pub mod provisioning;
 mod vad;
 
 pub use pipeline::STTPipeline;
 pub use vad::SimpleVAD;
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use crate::db::Database;
 use crate::types::Speaker;
+
+static MOONSHINE_BASE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Returns the managed lib directory set by the provisioning module,
+/// if available.
+pub(crate) fn managed_lib_dir() -> Option<PathBuf> {
+    MOONSHINE_BASE.get().map(|b| b.join("lib"))
+}
 
 /// Root-mean-square amplitude of i16 audio samples.
 pub(crate) fn rms(samples: &[i16]) -> f32 {
@@ -102,11 +112,27 @@ impl Default for STTConfig {
 
 impl STTConfig {
     /// Discover the Moonshine model directory at well-known locations,
-    /// falling back to a relative path if none is found.
+    /// preferring the managed app-data path, then dev paths, falling
+    /// back to a relative path if none is found.
     pub fn default_model_path() -> PathBuf {
+        // Managed path (set by provisioning module after first-launch download).
+        if let Some(base) = MOONSHINE_BASE.get() {
+            let p = base.join("models").join("en").join("medium-streaming");
+            if p.exists() {
+                return p;
+            }
+        }
+
+        // Dev paths (manual install from Sprint 1).
         if let Ok(home) = std::env::var("HOME") {
             let home_path = PathBuf::from(&home);
-            let p = home_path.join(".local").join("share").join("moonshine").join("models").join("en").join("medium-streaming");
+            let p = home_path
+                .join(".local")
+                .join("share")
+                .join("moonshine")
+                .join("models")
+                .join("en")
+                .join("medium-streaming");
             if p.exists() {
                 return p;
             }

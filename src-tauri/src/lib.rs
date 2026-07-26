@@ -69,6 +69,26 @@ pub fn run() {
             let batch_tracker = BatchTracker(Arc::new(Mutex::new(HashSet::new())));
             app.manage(batch_tracker);
 
+            // Prepend the managed moonshine lib dir to DYLD_LIBRARY_PATH so
+            // that @rpath/libonnxruntime.*.dylib is found alongside
+            // libmoonshine.dylib when loaded by the FFI engine. Safe here:
+            // no other threads have been spawned yet.
+            if let Ok(app_data) = app.path().app_data_dir() {
+                let managed_lib = app_data.join("moonshine").join("lib");
+                let current = std::env::var("DYLD_LIBRARY_PATH").unwrap_or_default();
+                let new = if current.is_empty() {
+                    managed_lib.to_string_lossy().to_string()
+                } else {
+                    format!("{}:{}", managed_lib.to_string_lossy(), current)
+                };
+                std::env::set_var("DYLD_LIBRARY_PATH", &new);
+            }
+
+            // Spawn background Moonshine provisioning (dylibs + model download
+            // on first launch, no-op otherwise). Progress is reported via
+            // `moonshine-download-progress` events.
+            stt::provisioning::ensure_moonshine_installed(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -86,6 +106,7 @@ pub fn run() {
             keys::save_key,
             keys::has_key,
             analyze::analyze_session,
+            stt::provisioning::retry_moonshine_download,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
