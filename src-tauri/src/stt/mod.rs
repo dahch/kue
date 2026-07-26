@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod cli;
 pub mod ffi;
 mod pipeline;
@@ -8,6 +9,9 @@ pub use vad::SimpleVAD;
 
 use std::path::PathBuf;
 
+use crate::db::Database;
+use crate::types::Speaker;
+
 /// Root-mean-square amplitude of i16 audio samples.
 pub(crate) fn rms(samples: &[i16]) -> f32 {
     if samples.is_empty() {
@@ -15,6 +19,46 @@ pub(crate) fn rms(samples: &[i16]) -> f32 {
     }
     let sum: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
     (sum / samples.len() as f64).sqrt() as f32
+}
+
+/// Insert a single transcript line into the database.
+pub(crate) fn persist_transcript_line(
+    db: &Database,
+    session_id: &str,
+    text: &str,
+    speaker: &Speaker,
+    started_at_ms: u64,
+    ended_at_ms: u64,
+) {
+    let conn = match db.conn.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[kue] STT: failed to lock DB: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = conn.execute(
+        "INSERT INTO transcript_lines (session_id, speaker, text, started_at_ms, ended_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![session_id, speaker.as_db_str(), text, started_at_ms, ended_at_ms],
+    ) {
+        eprintln!("[kue] STT: failed to persist transcript line: {e}");
+    }
+}
+
+/// Create an STT engine: FFI if available, otherwise CLI fallback.
+pub fn create_engine(config: &STTConfig) -> Box<dyn STTEngine> {
+    if ffi::MoonshineFFIEngine::is_available() {
+        eprintln!("[kue] STT: using Moonshine FFI engine");
+        Box::new(ffi::MoonshineFFIEngine::new())
+    } else if config.use_cli_fallback {
+        eprintln!("[kue] STT: Moonshine lib not found, falling back to CLI engine");
+        Box::new(cli::MoonshineCLIEngine::new())
+    } else {
+        eprintln!("[kue] STT: No Moonshine lib and CLI fallback disabled");
+        Box::new(cli::MoonshineCLIEngine::new())
+    }
 }
 
 pub trait STTEngine: Send {

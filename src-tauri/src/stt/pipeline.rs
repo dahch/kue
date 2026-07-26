@@ -5,9 +5,7 @@ use std::time::{Duration, Instant};
 
 use tauri::Emitter;
 
-use super::cli::MoonshineCLIEngine;
-use super::ffi::MoonshineFFIEngine;
-use super::{SimpleVAD, STTConfig, STTEngine};
+use super::{create_engine, persist_transcript_line, SimpleVAD, STTConfig, STTEngine};
 use crate::classifier::{classify, QuestionType};
 use crate::orchestrator::{HintCommand, HintJob, HintJobSender};
 use crate::types::{Speaker, TranscriptLine};
@@ -23,27 +21,16 @@ pub struct STTPipeline {
 
 impl STTPipeline {
     pub fn new(config: STTConfig) -> Self {
-    let engine: Box<dyn STTEngine> = if MoonshineFFIEngine::is_available() {
-            eprintln!("[kue] STT: using Moonshine FFI engine");
-            Box::new(MoonshineFFIEngine::new())
-        } else if config.use_cli_fallback {
-            eprintln!("[kue] STT: Moonshine lib not found, falling back to CLI engine");
-            Box::new(MoonshineCLIEngine::new())
-        } else {
-            eprintln!("[kue] STT: No Moonshine lib and CLI fallback disabled");
-            // Still create a CLI engine — it will always return None for
-            // transcription, effectively making the pipeline a no-op.
-            Box::new(MoonshineCLIEngine::new())
-        };
+        let engine = create_engine(&config);
 
-    Self {
-        engine,
-        config,
-        session_id: String::new(),
-        app_handle: None,
-        mode: String::new(),
-        hint_job_tx: None,
-    }
+        Self {
+            engine,
+            config,
+            session_id: String::new(),
+            app_handle: None,
+            mode: String::new(),
+            hint_job_tx: None,
+        }
     }
 
     pub fn with_app_handle(mut self, handle: tauri::AppHandle) -> Self {
@@ -191,8 +178,8 @@ impl STTPipeline {
             eprintln!("[kue] STT: \"{transcribed}\"");
 
             if !self.session_id.is_empty() {
-                Self::persist_transcript_line(
-                    db, &self.session_id, &transcribed, *segment_start_ms, ended_at_ms,
+                persist_transcript_line(
+                    db, &self.session_id, &transcribed, &Speaker::Interviewer, *segment_start_ms, ended_at_ms,
                 );
             }
 
@@ -232,24 +219,6 @@ impl STTPipeline {
 
         *in_segment = false;
         buffer.clear();
-    }
-
-    fn persist_transcript_line(db: &crate::db::Database, session_id: &str, text: &str, started_at_ms: u64, ended_at_ms: u64) {
-        let conn = match db.conn.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[kue] STT: failed to lock DB: {e}");
-                return;
-            }
-        };
-
-        if let Err(e) = conn.execute(
-            "INSERT INTO transcript_lines (session_id, speaker, text, started_at_ms, ended_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![session_id, Speaker::Interviewer.as_db_str(), text, started_at_ms, ended_at_ms],
-        ) {
-            eprintln!("[kue] STT: failed to persist transcript line: {e}");
-        }
     }
 }
 
@@ -603,7 +572,7 @@ mod tests {
     fn persist_transcript_line_inserts_row() {
         let db = create_test_db("session-persist-1");
 
-        STTPipeline::persist_transcript_line(&db, "session-persist-1", "hello", 100, 200);
+        super::persist_transcript_line(&db, "session-persist-1", "hello", &Speaker::Interviewer, 100, 200);
 
         let conn = db.conn.lock().unwrap();
         let (text, speaker, started, ended): (String, String, u64, u64) = conn
@@ -627,8 +596,8 @@ mod tests {
 
         // This should fail silently (the FK violation is caught by the
         // eprintln! guard — no panic, no crash)
-        STTPipeline::persist_transcript_line(
-            &db, "non-existent-session", "orphan text", 0, 100,
+        super::persist_transcript_line(
+            &db, "non-existent-session", "orphan text", &Speaker::Interviewer, 0, 100,
         );
 
         // Nothing should have been inserted
@@ -674,7 +643,7 @@ mod tests {
         };
 
         // This should handle the poisoned mutex gracefully (eprintln + return)
-        STTPipeline::persist_transcript_line(&db, "s-poisoned", "should not panic", 0, 100);
+        super::persist_transcript_line(&db, "s-poisoned", "should not panic", &Speaker::Interviewer, 0, 100);
         // The function should not panic — that's the main assertion.
         // Since the mutex is poisoned, no row was inserted.
     }
@@ -684,7 +653,7 @@ mod tests {
         let db = create_test_db("session-special");
         let special = "Hello, ¿cómo estás? 你好 👋 émoji & <stuff>";
 
-        STTPipeline::persist_transcript_line(&db, "session-special", special, 0, 100);
+        super::persist_transcript_line(&db, "session-special", special, &Speaker::Interviewer, 0, 100);
 
         let conn = db.conn.lock().unwrap();
         let text: String = conn
@@ -702,9 +671,9 @@ mod tests {
     fn persist_transcript_line_multiple_lines() {
         let db = create_test_db("session-multi");
 
-        STTPipeline::persist_transcript_line(&db, "session-multi", "first", 0, 100);
-        STTPipeline::persist_transcript_line(&db, "session-multi", "second", 150, 300);
-        STTPipeline::persist_transcript_line(&db, "session-multi", "third", 350, 500);
+        super::persist_transcript_line(&db, "session-multi", "first", &Speaker::Interviewer, 0, 100);
+        super::persist_transcript_line(&db, "session-multi", "second", &Speaker::Interviewer, 150, 300);
+        super::persist_transcript_line(&db, "session-multi", "third", &Speaker::Interviewer, 350, 500);
 
         let conn = db.conn.lock().unwrap();
         let count: i64 = conn
