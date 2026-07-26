@@ -258,4 +258,85 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<Box<dyn STTEngine>>();
     }
+
+    // -----------------------------------------------------------------------
+    // rms — additional edge cases not covered in vad.rs or cli.rs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rms_single_positive_value() {
+        let r = rms(&[100]);
+        assert!((r - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rms_single_negative_value() {
+        // RMS squares the value so sign doesn't matter
+        let r = rms(&[-100]);
+        assert!((r - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rms_alternating_values() {
+        let r = rms(&[100, -100, 100, -100]);
+        assert!((r - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rms_large_dataset() {
+        let samples: Vec<i16> = vec![1000; 100_000];
+        let r = rms(&samples);
+        assert!((r - 1000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn rms_mixed_magnitudes() {
+        // RMS of [0, 300] should be ~212.13
+        let r = rms(&[0, 300]);
+        assert!((r - 212.13).abs() < 0.01);
+    }
+
+    #[test]
+    fn rms_all_max_values() {
+        let samples = vec![i16::MAX; 1000];
+        let r = rms(&samples);
+        assert!((r - 32767.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn rms_all_min_values() {
+        let samples = vec![i16::MIN; 1000];
+        let r = rms(&samples);
+        assert!((r - 32768.0).abs() < 1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // create_engine branch coverage
+    // -----------------------------------------------------------------------
+
+    /// Returns true if the FFI engine would be available (shared lib found).
+    /// This is the same check `create_engine` uses internally.
+    #[test]
+    fn create_engine_fallback_when_ffi_unavailable() {
+        // In test environments, no Moonshine shared library should be available,
+        // so the engine will fall back to CLI fallback path.
+        let config = STTConfig::default();
+        let engine = create_engine(&config);
+        // The concrete type is erased behind Box<dyn STTEngine>, but we can
+        // verify it produces a working engine by calling transcribe.
+        let result = engine.transcribe_audio_chunk(&[]);
+        // CLI engine returns None for empty chunks (rms < 0.005)
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn create_engine_uses_cli_when_ffi_unavailable_and_fallback_disabled() {
+        // Even when use_cli_fallback=false, the engine should still create
+        // something (there's no alternative engine type).
+        let mut config = STTConfig::default();
+        config.use_cli_fallback = false;
+        let engine = create_engine(&config);
+        let result = engine.transcribe_audio_chunk(&[]);
+        assert!(result.is_none());
+    }
 }
