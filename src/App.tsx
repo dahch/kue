@@ -190,6 +190,9 @@ export function PostCallPanel({ session }: { session: SessionRow }) {
       </h2>
       <p className="mb-4 text-sm text-zinc-400">
         {modeLabel} &middot; {session.line_count} líneas
+        {session.company && (
+          <span> &middot; {session.company}{session.role ? ` (${session.role})` : ""}</span>
+        )}
       </p>
 
       <div className="mb-4">
@@ -322,6 +325,8 @@ export function PostCallPanel({ session }: { session: SessionRow }) {
 
 function MainApp() {
   const [mode, setMode] = useState<SessionMode>("practice");
+  const [company, setCompany] = useState("");
+  const [role, setRole] = useState("");
   const [running, setRunning] = useState(false);
   const [lastTranscript, setLastTranscript] = useState("");
   const [lastHint, setLastHint] = useState("");
@@ -369,12 +374,16 @@ function MainApp() {
 
   const handleStart = useCallback(async () => {
     try {
-      await invoke("start_session", { mode });
+      await invoke("start_session", {
+        mode,
+        company: company || null,
+        role: role || null,
+      });
       setRunning(true);
     } catch (e) {
       console.error("Failed to start session:", e);
     }
-  }, [mode]);
+  }, [mode, company, role]);
 
   const handleStop = useCallback(async () => {
     try {
@@ -437,6 +446,36 @@ function MainApp() {
           </button>
         </div>
       </div>
+
+      {/* Company / Role (opcional) */}
+      {!running && (
+        <div className="mb-4 flex w-full max-w-lg gap-3">
+          <div className="flex-1">
+            <label className="mb-1 block text-xs font-medium text-zinc-500">
+              Empresa <span className="text-zinc-600">(opcional)</span>
+            </label>
+            <input
+              type="text"
+              value={company}
+              onChange={(e) => setCompany(e.target.value)}
+              placeholder="Acme Corp"
+              className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-white placeholder-zinc-600"
+            />
+          </div>
+          <div className="flex-1">
+            <label className="mb-1 block text-xs font-medium text-zinc-500">
+              Rol <span className="text-zinc-600">(opcional)</span>
+            </label>
+            <input
+              type="text"
+              value={role}
+              onChange={(e) => setRole(e.target.value)}
+              placeholder="Senior Engineer"
+              className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-white placeholder-zinc-600"
+            />
+          </div>
+        </div>
+      )}
 
       {/* Session controls */}
       <div className="mb-6 flex w-full max-w-lg gap-3">
@@ -517,6 +556,11 @@ function MainApp() {
                 {new Date(s.started_at).toLocaleString()} &middot;{" "}
                 {s.mode === "practice" ? "Practice" : "Shadow"} &middot;{" "}
                 {s.line_count} líneas
+                {s.company && (
+                  <span className="ml-2 text-zinc-500">
+                    &middot; {s.company}{s.role ? ` (${s.role})` : ""}
+                  </span>
+                )}
               </button>
             ))}
           </div>

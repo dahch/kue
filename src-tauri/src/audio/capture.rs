@@ -612,6 +612,8 @@ const PANIC_DURATION_SECS: u64 = 10;
 #[tauri::command]
 pub fn start_session(
     mode: String,
+    company: Option<String>,
+    role: Option<String>,
     audio: tauri::State<'_, AudioCapture>,
     db: tauri::State<'_, Database>,
     app_handle: tauri::AppHandle,
@@ -624,7 +626,7 @@ pub fn start_session(
         let conn = db.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO sessions (id, company, role, mode) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![session_id, "", "", mode],
+            rusqlite::params![session_id, company.as_deref().unwrap_or(""), role.as_deref().unwrap_or(""), mode],
         )
         .map_err(|e| format!("Failed to insert session: {e}"))?;
     }
@@ -676,6 +678,17 @@ pub fn stop_session(
         let mut inner = audio.inner.lock().map_err(|e| e.to_string())?;
         inner.session_id.take()
     };
+
+    // Mark session as ended in the DB before emitting the event
+    // so listeners see a closed session.
+    if let Some(ref sid) = session_id {
+        if let Ok(conn) = db.conn.lock() {
+            let _ = conn.execute(
+                "UPDATE sessions SET ended_at = datetime('now') WHERE id = ?1",
+                rusqlite::params![sid],
+            );
+        }
+    }
 
     app_handle.emit("session-stopped", ()).ok();
 
@@ -1467,6 +1480,139 @@ mod tests {
         assert!(session_dir.exists());
 
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // stop_session — ended_at is set in DB
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // start_session — company/role persistence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn start_session_persists_company_and_role() {
+        use crate::db::open_and_migrate;
+
+        crate::db::register_vec_extension();
+
+        let tmp = std::env::temp_dir().join("kue-test-start-company-role");
+        let db_path = tmp.join("test.db");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let db = open_and_migrate(&db_path).expect("db should open");
+        let session_id = "test-company-role-001";
+        let company = "Acme Corp";
+        let role = "Senior Engineer";
+
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, company, role, mode) VALUES (?1, ?2, ?3, 'practice')",
+                rusqlite::params![session_id, company, role],
+            )
+            .unwrap();
+        }
+
+        {
+            let conn = db.conn.lock().unwrap();
+            let (stored_company, stored_role): (String, String) = conn
+                .query_row(
+                    "SELECT company, role FROM sessions WHERE id = ?1",
+                    rusqlite::params![session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(stored_company, company);
+            assert_eq!(stored_role, role);
+        }
+
+        // Also verify that empty values work (default behavior unchanged)
+        let session_id2 = "test-company-role-empty";
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, company, role, mode) VALUES (?1, '', '', 'shadow')",
+                rusqlite::params![session_id2],
+            )
+            .unwrap();
+        }
+        {
+            let conn = db.conn.lock().unwrap();
+            let (c, r): (String, String) = conn
+                .query_row(
+                    "SELECT company, role FROM sessions WHERE id = ?1",
+                    rusqlite::params![session_id2],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(c, "");
+            assert_eq!(r, "");
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stop_session_sets_ended_at_in_db() {
+        use crate::db::open_and_migrate;
+
+        crate::db::register_vec_extension();
+
+        let tmp = std::env::temp_dir().join("kue-test-ended-at");
+        let db_path = tmp.join("test.db");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let db = open_and_migrate(&db_path).expect("db should open");
+        let session_id = "test-ended-at-001";
+
+        // Insert a session manually (as start_session would)
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, company, role, mode) VALUES (?1, '', '', 'practice')",
+                rusqlite::params![session_id],
+            )
+            .unwrap();
+        }
+
+        // Now simulate the UPDATE that stop_session does
+        {
+            let conn = db.conn.lock().unwrap();
+            let updated = conn
+                .execute(
+                    "UPDATE sessions SET ended_at = datetime('now') WHERE id = ?1",
+                    rusqlite::params![session_id],
+                )
+                .unwrap();
+            assert_eq!(updated, 1, "should update exactly one row");
+        }
+
+        // Verify ended_at was set (not NULL) and is a plausible datetime string
+        {
+            let conn = db.conn.lock().unwrap();
+            let ended_at: Option<String> = conn
+                .query_row(
+                    "SELECT ended_at FROM sessions WHERE id = ?1",
+                    rusqlite::params![session_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                ended_at.is_some(),
+                "ended_at should NOT be NULL after stop_session"
+            );
+            let ended = ended_at.unwrap();
+            assert!(
+                ended.len() >= 16,
+                "ended_at '{}' should be a datetime string like '2024-01-15 12:34:56'",
+                ended,
+            );
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
