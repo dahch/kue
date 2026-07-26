@@ -12,6 +12,17 @@ pub struct Database {
     pub path: PathBuf,
 }
 
+impl Clone for Database {
+    fn clone(&self) -> Self {
+        let conn = Connection::open(&self.path)
+            .unwrap_or_else(|e| panic!("Failed to clone DB connection at {:?}: {e}", self.path));
+        Self {
+            conn: Mutex::new(conn),
+            path: self.path.clone(),
+        }
+    }
+}
+
 /// Must be called once before any `Connection::open` to register vec0.
 pub fn register_vec_extension() {
     // Compile-time guard: both types must be pointer-sized for the transmute to be safe.

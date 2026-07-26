@@ -96,6 +96,7 @@ struct AudioCaptureInner {
     loopback: Option<LoopbackHandle>,
     mic_writer: Option<JoinHandle<()>>,
     loopback_writer: Option<JoinHandle<()>>,
+    stt_thread: Option<JoinHandle<()>>,
     mode: String,
     session_dir: Option<PathBuf>,
 }
@@ -108,6 +109,7 @@ impl AudioCapture {
                 loopback: None,
                 mic_writer: None,
                 loopback_writer: None,
+                stt_thread: None,
                 mode: String::new(),
                 session_dir: None,
             }),
@@ -127,7 +129,10 @@ impl AudioCapture {
         std::env::temp_dir().join(format!("kue-session-{ts}"))
     }
 
-    pub fn start(&self, mode: &str) -> Result<AudioCaptureStatus, AudioError> {
+    pub fn start(
+        &self,
+        mode: &str,
+    ) -> Result<(AudioCaptureStatus, std::sync::mpsc::Receiver<Vec<i16>>), AudioError> {
         if !VALID_MODES.contains(&mode) {
             return Err(AudioError::InvalidMode(format!(
                 "Mode must be 'practice' or 'shadow', got '{mode}'"
@@ -155,7 +160,8 @@ impl AudioCapture {
 
         // -- Loopback (Canal B) --------------------------------------------
         let (loopback_tx, loopback_rx) = sync_channel::<Vec<i16>>(BUFFER_CAPACITY);
-        let loopback = start_loopback_capture(loopback_tx).map_err(|e| {
+        let (stt_tx, stt_rx) = sync_channel::<Vec<i16>>(BUFFER_CAPACITY);
+        let loopback = start_loopback_capture_tee(loopback_tx, stt_tx).map_err(|e| {
             let _ = fs::remove_dir_all(&session_dir);
             e
         })?;
@@ -167,10 +173,13 @@ impl AudioCapture {
         inner.mode = mode.to_string();
         inner.session_dir = Some(session_dir);
 
-        Ok(AudioCaptureStatus {
-            mic_active: true,
-            loopback_active: true,
-        })
+        Ok((
+            AudioCaptureStatus {
+                mic_active: true,
+                loopback_active: true,
+            },
+            stt_rx,
+        ))
     }
 
     pub fn stop(&self) -> AudioCaptureStatus {
@@ -183,6 +192,9 @@ impl AudioCapture {
         // Join writer threads so the WAV files are fully flushed.
         inner.mic_writer.take().map(|h| h.join().ok());
         inner.loopback_writer.take().map(|h| h.join().ok());
+
+        // Join STT thread (it will disconnect when the audio receiver drops)
+        inner.stt_thread.take().map(|h| h.join().ok());
 
         inner.mode = String::new();
         // session_dir stays for finalize_session to handle cleanup
@@ -239,11 +251,16 @@ impl AudioCapture {
         }
     }
 
-    pub fn toggle(&self, start: bool, mode: &str) -> Result<AudioCaptureStatus, AudioError> {
+    pub fn toggle(
+        &self,
+        start: bool,
+        mode: &str,
+    ) -> Result<(AudioCaptureStatus, Option<std::sync::mpsc::Receiver<Vec<i16>>>), AudioError> {
         if start {
-            self.start(mode)
+            let (status, rx) = self.start(mode)?;
+            Ok((status, Some(rx)))
         } else {
-            Ok(self.stop())
+            Ok((self.stop(), None))
         }
     }
 }
@@ -375,7 +392,13 @@ fn start_mic_capture(tx: SyncSender<Vec<i16>>) -> Result<cpal::Stream, AudioErro
 // Loopback capture (Canal B) – ScreenCaptureKit
 // ---------------------------------------------------------------------------
 
-fn start_loopback_capture(tx: SyncSender<Vec<i16>>) -> Result<SCStream, AudioError> {
+/// Same as `start_loopback_capture` but sends audio samples to TWO
+/// senders simultaneously — one for the WAV writer and one for the STT
+/// pipeline. This avoids an extra tee thread and keeps audio in sync.
+fn start_loopback_capture_tee(
+    wav_tx: SyncSender<Vec<i16>>,
+    stt_tx: SyncSender<Vec<i16>>,
+) -> Result<SCStream, AudioError> {
     let content = SCShareableContent::try_current().map_err(|e| {
         AudioError::PermissionDenied(format!(
             "Screen & System Audio Recording permission not granted. \
@@ -408,11 +431,12 @@ fn start_loopback_capture(tx: SyncSender<Vec<i16>>) -> Result<SCStream, AudioErr
         }
     }
 
-    struct LoopbackOutput {
-        tx: SyncSender<Vec<i16>>,
+    struct LoopbackOutputTee {
+        wav_tx: SyncSender<Vec<i16>>,
+        stt_tx: SyncSender<Vec<i16>>,
     }
 
-    impl StreamOutput for LoopbackOutput {
+    impl StreamOutput for LoopbackOutputTee {
         fn did_output_sample_buffer(
             &self,
             sample: CMSampleBuffer,
@@ -435,20 +459,21 @@ fn start_loopback_capture(tx: SyncSender<Vec<i16>>) -> Result<SCStream, AudioErr
                         f32_to_i16(f)
                     })
                     .collect();
-                let _ = self.tx.try_send(samples);
+                let _ = self.wav_tx.try_send(samples.clone());
+                let _ = self.stt_tx.try_send(samples);
             }
         }
     }
 
     let mut stream = SCStream::new(filter, config, AudioErrorHandler);
-    let output = LoopbackOutput { tx };
+    let output = LoopbackOutputTee { wav_tx, stt_tx };
     stream.add_output(output, SCStreamOutputType::Audio);
 
     stream
         .start_capture()
         .map_err(|e| AudioError::StreamError(format!("Failed to start loopback capture: {e}")))?;
 
-    println!("[kue] Loopback capture (Canal B) started — 16 kHz, mono via ScreenCaptureKit");
+    println!("[kue] Loopback capture (Canal B) with STT tee started — 16 kHz, mono via ScreenCaptureKit");
     Ok(stream)
 }
 
@@ -457,6 +482,7 @@ fn start_loopback_capture(tx: SyncSender<Vec<i16>>) -> Result<SCStream, AudioErr
 // ---------------------------------------------------------------------------
 
 use crate::db::Database;
+use crate::stt::{STTConfig, STTPipeline};
 
 #[tauri::command]
 pub fn toggle_audio_capture(
@@ -464,11 +490,48 @@ pub fn toggle_audio_capture(
     mode: String,
     audio: tauri::State<'_, AudioCapture>,
     db: tauri::State<'_, Database>,
+    app_handle: tauri::AppHandle,
 ) -> Result<AudioCaptureStatus, String> {
-    let status = audio.toggle(start, &mode).map_err(|e| e.to_string())?;
+    if start {
+        let (status, stt_rx) = audio.start(&mode).map_err(|e| e.to_string())?;
 
-    if !start {
-        // Session ended — read retain_audio setting (default: false)
+        // Create a new session in the DB
+        let session_id = uuid::Uuid::new_v4().to_string();
+        {
+            let conn = db.conn.lock().map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT INTO sessions (id, company, role, mode) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![session_id, "", "", mode],
+            )
+            .map_err(|e| format!("Failed to insert session: {e}"))?;
+        }
+
+        // Start the STT pipeline
+        let rx = stt_rx;
+        let config = STTConfig {
+            model_path: STTConfig::default_model_path(),
+            language: "en".to_string(),
+            ..Default::default()
+        };
+
+        let mut pipeline = STTPipeline::new(config).with_app_handle(app_handle);
+        if let Err(e) = pipeline.load_model() {
+            eprintln!("[kue] STT model load failed (best-effort): {e}");
+        }
+        pipeline.start_session(&session_id);
+
+        let db_for_stt = Database::clone(db.inner());
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let stt_thread = pipeline.spawn_processing_thread(rx, db_for_stt);
+
+        let mut inner = audio.inner.lock().unwrap();
+        inner.stt_thread = Some(stt_thread);
+
+        Ok(status)
+    } else {
+        let status = audio.stop();
+
+        // Read retain_audio setting (default: false)
         let retain = db
             .conn
             .lock()
@@ -484,10 +547,12 @@ pub fn toggle_audio_capture(
             .map(|v| v == "true")
             .unwrap_or(false);
         audio.finalize_session(retain);
-    }
 
-    Ok(status)
+        Ok(status)
+    }
 }
+
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -686,6 +751,7 @@ mod tests {
         assert!(inner.loopback.is_none());
         assert!(inner.mic_writer.is_none());
         assert!(inner.loopback_writer.is_none());
+        assert!(inner.stt_thread.is_none());
         assert!(inner.mode.is_empty());
         assert!(inner.session_dir.is_none());
     }
@@ -907,7 +973,7 @@ mod tests {
     #[test]
     fn audio_capture_toggle_stop_returns_inactive_status() {
         let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test"));
-        let status = cap.toggle(false, "practice").unwrap();
+        let (status, _) = cap.toggle(false, "practice").unwrap();
         assert!(!status.mic_active);
         assert!(!status.loopback_active);
     }
@@ -917,7 +983,7 @@ mod tests {
         let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test"));
         // Even with an invalid mode, toggle(start=false) should succeed
         // because it delegates to stop(), which ignores mode.
-        let status = cap.toggle(false, "INVALID_MODE_THAT_STOP_IGNORES").unwrap();
+        let (status, _) = cap.toggle(false, "INVALID_MODE_THAT_STOP_IGNORES").unwrap();
         assert!(!status.mic_active);
         assert!(!status.loopback_active);
     }
@@ -943,7 +1009,7 @@ mod tests {
         let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test"));
         let result = cap.toggle(true, "practice");
         match result {
-            Ok(status) => {
+            Ok((status, _)) => {
                 assert!(status.mic_active);
                 assert!(status.loopback_active);
                 cap.stop();
