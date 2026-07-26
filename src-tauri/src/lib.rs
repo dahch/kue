@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use tauri::Manager;
 
 mod audio;
 mod classifier;
 mod db;
+mod orchestrator;
 mod rag;
 mod stt;
 mod types;
@@ -23,8 +26,26 @@ pub fn run() {
             let recordings_dir = app.path().app_data_dir()?.join("recordings");
             app.manage(audio::capture::AudioCapture::new(recordings_dir));
 
-            let model = rag::embeddings::load_embedding_model()?;
-            app.manage(std::sync::Mutex::new(model));
+            let model = Arc::new(std::sync::Mutex::new(
+                rag::embeddings::load_embedding_model()?,
+            ));
+            app.manage(model.clone());
+
+            let scheduler = Arc::new(orchestrator::HintScheduler::new());
+            app.manage(scheduler.clone());
+
+            let (hint_tx, hint_rx) = std::sync::mpsc::channel();
+            let hint_job_tx: orchestrator::HintJobSender = Arc::new(hint_tx);
+            app.manage(hint_job_tx);
+
+            let db_for_worker = db::Database::clone(app.state::<db::Database>().inner());
+            orchestrator::worker::start_hint_worker(
+                hint_rx,
+                app.handle().clone(),
+                db_for_worker,
+                model,
+                scheduler,
+            );
 
             Ok(())
         })

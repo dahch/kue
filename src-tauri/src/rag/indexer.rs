@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::params;
 use serde::Serialize;
@@ -247,10 +247,10 @@ pub struct IndexSummary {
 pub fn index_folder_cmd(
     path: String,
     db: tauri::State<'_, crate::db::Database>,
-    model: tauri::State<'_, Mutex<crate::rag::embeddings::EmbeddingModel>>,
+    model: tauri::State<'_, Arc<Mutex<crate::rag::embeddings::EmbeddingModel>>>,
 ) -> Result<IndexSummary, String> {
     let db = db.inner();
-    let model = model.inner();
+    let model = model.inner().as_ref();
 
     let canonical = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
 
@@ -307,10 +307,10 @@ pub fn search_context(
     query: String,
     top_k: usize,
     db: tauri::State<'_, crate::db::Database>,
-    model: tauri::State<'_, Mutex<crate::rag::embeddings::EmbeddingModel>>,
+    model: tauri::State<'_, Arc<Mutex<crate::rag::embeddings::EmbeddingModel>>>,
 ) -> Result<Vec<SearchResult>, String> {
     let db = db.inner();
-    let model = model.inner();
+    let model = model.inner().as_ref();
     search(model, db, &query, top_k).map_err(|e| e.to_string())
 }
 

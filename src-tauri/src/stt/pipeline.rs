@@ -3,13 +3,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
 use tauri::Emitter;
 
 use super::cli::MoonshineCLIEngine;
 use super::ffi::MoonshineFFIEngine;
 use super::{SimpleVAD, STTConfig, STTEngine};
 use crate::classifier::{classify, QuestionType};
+use crate::orchestrator::{HintCommand, HintJob, HintJobSender};
 use crate::types::{Speaker, TranscriptLine};
 
 pub struct STTPipeline {
@@ -17,6 +17,8 @@ pub struct STTPipeline {
     config: STTConfig,
     session_id: String,
     app_handle: Option<tauri::AppHandle>,
+    mode: String,
+    hint_job_tx: Option<HintJobSender>,
 }
 
 impl STTPipeline {
@@ -39,11 +41,23 @@ impl STTPipeline {
         config,
         session_id: String::new(),
         app_handle: None,
+        mode: String::new(),
+        hint_job_tx: None,
     }
     }
 
     pub fn with_app_handle(mut self, handle: tauri::AppHandle) -> Self {
         self.app_handle = Some(handle);
+        self
+    }
+
+    pub fn with_mode(mut self, mode: &str) -> Self {
+        self.mode = mode.to_string();
+        self
+    }
+
+    pub fn with_hint_job_tx(mut self, tx: HintJobSender) -> Self {
+        self.hint_job_tx = Some(tx);
         self
     }
 
@@ -95,14 +109,11 @@ impl STTPipeline {
                             Err(RecvTimeoutError::Timeout) => {
                                 // Flush any pending speech segment on timeout
                                 if in_segment && !speech_buffer.is_empty() {
-                                    Self::flush_segment(
-                                        &self.engine,
+                                    self.flush_segment(
                                         &mut speech_buffer,
                                         &mut segment_start_ms,
                                         &mut in_segment,
                                         &session_start,
-                                        &self.session_id,
-                                        &self.app_handle,
                                         &db,
                                     );
                                 }
@@ -111,14 +122,11 @@ impl STTPipeline {
                             Err(RecvTimeoutError::Disconnected) => {
                                 eprintln!("[kue] STT pipeline: audio source disconnected");
                                 if in_segment && !speech_buffer.is_empty() {
-                                    Self::flush_segment(
-                                        &self.engine,
+                                    self.flush_segment(
                                         &mut speech_buffer,
                                         &mut segment_start_ms,
                                         &mut in_segment,
                                         &session_start,
-                                        &self.session_id,
-                                        &self.app_handle,
                                         &db,
                                     );
                                 }
@@ -138,33 +146,32 @@ impl STTPipeline {
                         }
                         speech_buffer.extend_from_slice(&samples);
                     } else if in_segment && !speech_buffer.is_empty() {
-                        Self::flush_segment(
-                            &self.engine,
+                        self.flush_segment(
                             &mut speech_buffer,
                             &mut segment_start_ms,
                             &mut in_segment,
                             &session_start,
-                            &self.session_id,
-                            &self.app_handle,
                             &db,
                         );
                         speech_buffer.clear();
                     }
                 }
 
+                // Cancel any pending hints for this session
+                if let Some(ref tx) = self.hint_job_tx {
+                    let _ = tx.send(HintCommand::CancelSession(self.session_id.clone()));
+                }
                 eprintln!("[kue] STT pipeline thread ended");
             })
             .expect("failed to spawn STT pipeline thread")
     }
 
     fn flush_segment(
-        engine: &dyn STTEngine,
+        &self,
         buffer: &mut Vec<i16>,
         segment_start_ms: &mut u64,
         in_segment: &mut bool,
         session_start: &Instant,
-        session_id: &str,
-        app_handle: &Option<tauri::AppHandle>,
         db: &crate::db::Database,
     ) {
         if buffer.is_empty() {
@@ -172,7 +179,7 @@ impl STTPipeline {
         }
 
         let ended_at_ms = session_start.elapsed().as_millis() as u64;
-        let text = engine.transcribe_audio_chunk(buffer);
+        let text = self.engine.transcribe_audio_chunk(buffer);
 
         if let Some(transcribed) = text {
             if transcribed.trim().is_empty() {
@@ -183,24 +190,18 @@ impl STTPipeline {
 
             eprintln!("[kue] STT: \"{transcribed}\"");
 
-            if !session_id.is_empty() {
+            if !self.session_id.is_empty() {
                 Self::persist_transcript_line(
-                    db, session_id, &transcribed, *segment_start_ms, ended_at_ms,
+                    db, &self.session_id, &transcribed, *segment_start_ms, ended_at_ms,
                 );
             }
 
-            if let Some(ref handle) = app_handle {
-                // Classify first (borrow), then move transcribed into event
+            if let Some(ref handle) = self.app_handle {
                 let qtype = classify(&transcribed);
-                let qtext = if qtype != QuestionType::None {
-                    Some(transcribed.clone())
-                } else {
-                    None
-                };
 
                 let line = TranscriptLine {
                     speaker: Speaker::Interviewer,
-                    text: transcribed,
+                    text: transcribed.clone(),
                     started_at_ms: *segment_start_ms,
                     ended_at_ms,
                 };
@@ -208,13 +209,22 @@ impl STTPipeline {
                     eprintln!("[kue] Failed to emit new-transcript event: {e}");
                 }
 
-                if let Some(text) = qtext {
+                if qtype != QuestionType::None {
                     if let Err(e) = handle.emit("question-detected", serde_json::json!({
-                        "text": text,
+                        "text": &transcribed,
                         "type": qtype.as_str(),
-                        "session_id": session_id,
+                        "session_id": self.session_id,
                     })) {
                         eprintln!("[kue] Failed to emit question-detected event: {e}");
+                    }
+
+                    if let Some(ref tx) = self.hint_job_tx {
+                        let _ = tx.send(HintCommand::Process(HintJob {
+                            session_id: self.session_id.clone(),
+                            text: transcribed.clone(),
+                            qtype,
+                            mode: self.mode.clone(),
+                        }));
                     }
                 }
             }
@@ -247,8 +257,10 @@ impl STTPipeline {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+    use crate::orchestrator::{HintCommand, HintJob};
     use rusqlite::Connection;
+
 
     // -----------------------------------------------------------------------
     // MockEngine — controllable STTEngine for pipeline tests
@@ -352,6 +364,17 @@ mod tests {
         assert!(result.is_none());
     }
 
+    fn make_pipeline(engine: MockEngine) -> STTPipeline {
+        STTPipeline {
+            engine: Box::new(engine),
+            config: STTConfig::default(),
+            session_id: String::new(),
+            app_handle: None,
+            mode: String::new(),
+            hint_job_tx: None,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // STTPipeline::load_model
     // -----------------------------------------------------------------------
@@ -359,13 +382,7 @@ mod tests {
     #[test]
     fn pipeline_load_model_delegates_to_engine() {
         let engine = MockEngine::new(None, Ok(()));
-        let config = STTConfig::default();
-        let mut pipeline = STTPipeline {
-            engine: Box::new(engine),
-            config,
-            session_id: String::new(),
-            app_handle: None,
-        };
+        let mut pipeline = make_pipeline(engine);
 
         let result = pipeline.load_model();
         assert!(result.is_ok());
@@ -374,13 +391,7 @@ mod tests {
     #[test]
     fn pipeline_load_model_propagates_engine_error() {
         let engine = MockEngine::new(None, Err("model not found"));
-        let config = STTConfig::default();
-        let mut pipeline = STTPipeline {
-            engine: Box::new(engine),
-            config,
-            session_id: String::new(),
-            app_handle: None,
-        };
+        let mut pipeline = make_pipeline(engine);
 
         let result = pipeline.load_model();
         assert_eq!(result.unwrap_err(), "model not found");
@@ -416,13 +427,7 @@ mod tests {
     #[test]
     fn pipeline_process_audio_chunk_delegates_to_engine() {
         let engine = MockEngine::new(Some("hello"), Ok(()));
-        let config = STTConfig::default();
-        let pipeline = STTPipeline {
-            engine: Box::new(engine),
-            config,
-            session_id: String::new(),
-            app_handle: None,
-        };
+        let pipeline = make_pipeline(engine);
 
         assert!(pipeline.process_audio_chunk(&[1, 2, 3]));
     }
@@ -430,13 +435,7 @@ mod tests {
     #[test]
     fn pipeline_process_audio_chunk_returns_false_when_engine_returns_none() {
         let engine = MockEngine::new(None, Ok(()));
-        let config = STTConfig::default();
-        let pipeline = STTPipeline {
-            engine: Box::new(engine),
-            config,
-            session_id: String::new(),
-            app_handle: None,
-        };
+        let pipeline = make_pipeline(engine);
 
         assert!(!pipeline.process_audio_chunk(&[1, 2, 3]));
     }
@@ -448,15 +447,16 @@ mod tests {
     #[test]
     fn flush_segment_empty_buffer_returns_early() {
         let engine = MockEngine::new(Some("unused"), Ok(()));
+        let pipeline = make_pipeline(engine);
         let mut buffer = Vec::new();
         let mut segment_start_ms = 42;
         let mut in_segment = true;
         let start = session_start();
         let db = create_test_db("sess-1");
 
-        STTPipeline::flush_segment(
-            &engine, &mut buffer, &mut segment_start_ms, &mut in_segment,
-            &start, "sess-1", &None, &db,
+        pipeline.flush_segment(
+            &mut buffer, &mut segment_start_ms, &mut in_segment,
+            &start, &db,
         );
 
         // Early return: no state change
@@ -472,15 +472,16 @@ mod tests {
     #[test]
     fn flush_segment_no_transcription_clears_buffer_and_resets_segment() {
         let engine = MockEngine::new(None, Ok(()));
+        let pipeline = make_pipeline(engine);
         let mut buffer = vec![100i16; 160];
         let mut segment_start_ms = 100;
         let mut in_segment = true;
         let start = session_start();
         let db = create_test_db("sess-2");
 
-        STTPipeline::flush_segment(
-            &engine, &mut buffer, &mut segment_start_ms, &mut in_segment,
-            &start, "sess-2", &None, &db,
+        pipeline.flush_segment(
+            &mut buffer, &mut segment_start_ms, &mut in_segment,
+            &start, &db,
         );
 
         assert!(buffer.is_empty());
@@ -494,15 +495,16 @@ mod tests {
     #[test]
     fn flush_segment_empty_text_clears_buffer_without_persisting() {
         let engine = MockEngine::new(Some("   "), Ok(()));
+        let pipeline = make_pipeline(engine);
         let mut buffer = vec![100i16; 160];
         let mut segment_start_ms = 100;
         let mut in_segment = true;
         let start = session_start();
         let db = create_test_db("sess-3");
 
-        STTPipeline::flush_segment(
-            &engine, &mut buffer, &mut segment_start_ms, &mut in_segment,
-            &start, "sess-3", &None, &db,
+        pipeline.flush_segment(
+            &mut buffer, &mut segment_start_ms, &mut in_segment,
+            &start, &db,
         );
 
         assert!(buffer.is_empty());
@@ -523,15 +525,16 @@ mod tests {
     #[test]
     fn flush_segment_skips_db_persistence_when_no_session() {
         let engine = MockEngine::new(Some("hello world"), Ok(()));
+        let pipeline = make_pipeline(engine);
         let mut buffer = vec![100i16; 160];
         let mut segment_start_ms = 100;
         let mut in_segment = true;
         let start = session_start();
         let db = create_test_db("unused");
 
-        STTPipeline::flush_segment(
-            &engine, &mut buffer, &mut segment_start_ms, &mut in_segment,
-            &start, "", &None, &db,
+        pipeline.flush_segment(
+            &mut buffer, &mut segment_start_ms, &mut in_segment,
+            &start, &db,
         );
 
         assert!(buffer.is_empty());
@@ -552,15 +555,17 @@ mod tests {
     #[test]
     fn flush_segment_persists_transcript_to_db() {
         let engine = MockEngine::new(Some("transcribed text"), Ok(()));
+        let mut pipeline = make_pipeline(engine);
+        pipeline.start_session("session-flush-1");
         let mut buffer = vec![100i16; 160];
         let mut segment_start_ms = 500;
         let mut in_segment = true;
         let start = session_start();
         let db = create_test_db("session-flush-1");
 
-        STTPipeline::flush_segment(
-            &engine, &mut buffer, &mut segment_start_ms, &mut in_segment,
-            &start, "session-flush-1", &None, &db,
+        pipeline.flush_segment(
+            &mut buffer, &mut segment_start_ms, &mut in_segment,
+            &start, &db,
         );
 
         // Verify buffer cleared and segment reset
@@ -731,5 +736,103 @@ mod tests {
         // that with_app_handle returns Self and the field is still accessible.
         // (app_handle will remain None since we can't construct a handle)
         assert!(pipeline.app_handle.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // HintJob channel — non-blocking send verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hint_job_not_sent_when_app_handle_none() {
+        let (tx, rx) = std::sync::mpsc::channel::<HintCommand>();
+        let sender: HintJobSender = Arc::new(tx);
+
+        let engine = MockEngine::new(Some("one question is enough"), Ok(()));
+        let mut pipeline = make_pipeline(engine);
+        pipeline.start_session("sess-chan");
+        pipeline.hint_job_tx = Some(sender);
+
+        let mut buffer = vec![200i16; 160];
+        let mut seg_start = 0u64;
+        let mut in_seg = true;
+        let start = session_start();
+        let db = create_test_db("sess-chan");
+
+        pipeline.flush_segment(
+            &mut buffer,
+            &mut seg_start,
+            &mut in_seg,
+            &start,
+            &db,
+        );
+
+        // Verify no send occurred (app_handle is None, so the hint_job_tx
+        // branch is never reached — this is the expected behaviour in a
+        // test environment)
+        let received = rx.try_recv();
+        assert!(received.is_err(), "channel should be empty when app_handle is None");
+    }
+
+    #[test]
+    fn hint_job_channel_process_command_roundtrip() {
+        let (tx, rx) = std::sync::mpsc::channel::<HintCommand>();
+        let sender: HintJobSender = Arc::new(tx);
+
+        {
+            let _ = sender.send(HintCommand::Process(HintJob {
+                session_id: "sess-rtt".into(),
+                text: "What is Rust?".into(),
+                qtype: QuestionType::Technical,
+                mode: "practice".into(),
+            }));
+        }
+
+        match rx.try_recv().unwrap() {
+            HintCommand::Process(job) => {
+                assert_eq!(job.session_id, "sess-rtt");
+                assert_eq!(job.text, "What is Rust?");
+                assert_eq!(job.qtype, QuestionType::Technical);
+                assert_eq!(job.mode, "practice");
+            }
+            _ => panic!("expected Process command"),
+        }
+    }
+
+    #[test]
+    fn hint_job_channel_cancel_session_roundtrip() {
+        let (tx, rx) = std::sync::mpsc::channel::<HintCommand>();
+        let sender: HintJobSender = Arc::new(tx);
+
+        let _ = sender.send(HintCommand::CancelSession("sess-cancel-1".into()));
+        match rx.try_recv().unwrap() {
+            HintCommand::CancelSession(sid) => assert_eq!(sid, "sess-cancel-1"),
+            _ => panic!("expected CancelSession"),
+        }
+    }
+
+    // ── Attempt: tauri::test::mock_app() for real AppHandle ──
+    //
+    // Enabled `features = ["test"]` in Cargo.toml to access `tauri::test`.
+    // The module exposes `mock_app()` → `App<MockRuntime>` → `AppHandle<MockRuntime>`.
+    // This is INCOMPATIBLE with `STTPipeline.app_handle: Option<tauri::AppHandle>`
+    // because `tauri::AppHandle` = `AppHandle<Wry>`, and Rust treats the Runtime
+    // generic invariantly.
+    //
+    // Compiler error documented below (line 832 is deliberately commented out
+    // to keep the test suite green while preserving the evidence):
+
+    #[test]
+    fn mock_app_runtime_type_mismatch_documented() {
+        let app = tauri::test::mock_app();
+        let _mock_handle = app.handle().clone();
+        // let _real_handle: tauri::AppHandle = app.handle().clone();
+        // ^^^ COMPILE ERROR (E0308):
+        //     expected `AppHandle<tauri_runtime_wry::Wry<...>>`
+        //        found `AppHandle<MockRuntime>`
+        //
+        // To bridge this gap STTPipeline (and all callers: capture.rs, lib.rs)
+        // would need to become generic over `R: Runtime` — a cross-cutting
+        // refactor well beyond this change.
+        drop(_mock_handle);
     }
 }

@@ -482,7 +482,9 @@ fn start_loopback_capture_tee(
 // ---------------------------------------------------------------------------
 
 use crate::db::Database;
+use crate::orchestrator::HintJobSender;
 use crate::stt::{STTConfig, STTPipeline};
+use tauri::Manager;
 
 #[tauri::command]
 pub fn toggle_audio_capture(
@@ -514,7 +516,12 @@ pub fn toggle_audio_capture(
             ..Default::default()
         };
 
-        let mut pipeline = STTPipeline::new(config).with_app_handle(app_handle);
+        let hint_job_tx = app_handle.state::<HintJobSender>().inner().clone();
+
+        let mut pipeline = STTPipeline::new(config)
+            .with_app_handle(app_handle)
+            .with_mode(&mode)
+            .with_hint_job_tx(hint_job_tx);
         if let Err(e) = pipeline.load_model() {
             eprintln!("[kue] STT model load failed (best-effort): {e}");
         }
