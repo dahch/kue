@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use candle_core::{Device, DType, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
@@ -118,6 +120,17 @@ impl Embedder for std::sync::Mutex<EmbeddingModel> {
                 eprintln!("[kue] model mutex poisoned in token_count: {e}");
                 0
             })
+    }
+}
+
+impl Embedder for Arc<Mutex<EmbeddingModel>> {
+    fn generate_embedding(&self, text: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let inner: &Mutex<EmbeddingModel> = self.as_ref();
+        inner.generate_embedding(text)
+    }
+
+    fn token_count(&self, text: &str) -> usize {
+        self.as_ref().token_count(text)
     }
 }
 
