@@ -1,6 +1,6 @@
 # Kue — Technical Design
 
-> Current status: **Sprint 0–5 completed** (base infrastructure + dual audio capture + STT + RAG engine + classifier + orchestrator + overlay window + hint display + mic VAD gating + Panic button + mode selection UI + post-call BYOK analysis). All v1 features implemented and tested. This document describes the living architecture of the project.
+> Current status: **Sprint 0–6 completed** (base infrastructure + dual audio capture + STT + RAG engine + classifier + orchestrator + overlay window + hint display + mic VAD gating + Panic button + mode selection UI + post-call BYOK analysis + Moonshine auto-provisioning). All v1 features implemented and tested. This document describes the living architecture of the project.
 
 ---
 
@@ -208,7 +208,7 @@ graph TD
 
 ### 2.2 Tauri Shell (`lib.rs`)
 
-File `src-tauri/src/lib.rs` (~73 lines):
+File `src-tauri/src/lib.rs` (~113 lines):
 
 ```rust
 mod analyze;         // Post-call BYOK analysis (Sprint 5)
@@ -219,8 +219,13 @@ mod keys;            // Keychain API key storage
 mod orchestrator;    // Hint engine + PanicState — wired into lifecycle
 mod overlay;         // Overlay window show/hide command
 mod rag;
-mod stt;             // STT module (Moonshine) — integrated via session lifecycle
+mod stt;             // STT module (Moonshine) — includes provisioning (Sprint 6)
 mod types;
+
+/// Shared state tracking which sessions have completed Channel A batch
+/// transcription. The batch thread writes to this set when done; the
+/// `is_transcript_ready` command and `analyze_session` read from it.
+struct BatchTracker(Arc<Mutex<HashSet<String>>>);
 
 run() {
     db::register_vec_extension();                     // Registers sqlite-vec before any connection
@@ -268,6 +273,24 @@ run() {
             let batch_tracker = BatchTracker(Arc::new(Mutex::new(HashSet::new())));
             app.manage(batch_tracker);
 
+            // Prepend the managed moonshine lib dir to DYLD_LIBRARY_PATH so
+            // that @rpath/libonnxruntime.*.dylib is found alongside
+            // libmoonshine.dylib when loaded by the FFI engine.
+            if let Ok(app_data) = app.path().app_data_dir() {
+                let managed_lib = app_data.join("moonshine").join("lib");
+                let current = std::env::var("DYLD_LIBRARY_PATH").unwrap_or_default();
+                let new = if current.is_empty() {
+                    managed_lib.to_string_lossy().to_string()
+                } else {
+                    format!("{}:{}", managed_lib.to_string_lossy(), current)
+                };
+                std::env::set_var("DYLD_LIBRARY_PATH", &new);
+            }
+
+            // Spawn background Moonshine provisioning (dylibs + model download
+            // on first launch, no-op otherwise). Progress via events.
+            stt::provisioning::ensure_moonshine_installed(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -285,16 +308,19 @@ run() {
             keys::save_key,
             keys::has_key,
             analyze::analyze_session,
+            stt::provisioning::retry_moonshine_download,
         ])
         .run(tauri::generate_context!())
 }
 ```
 
-- **`mod analyze`**, **`mod audio`**, **`mod classifier`**, **`mod db`**, **`mod keys`**, **`mod orchestrator`**, **`mod overlay`**, **`mod rag`**, **`mod stt`**, **`mod types`** — Backend submodules.
+- **`mod analyze`**, **`mod audio`**, **`mod classifier`**, **`mod db`**, **`mod keys`**, **`mod orchestrator`**, **`mod overlay`**, **`mod rag`**, **`mod stt`**, **`mod types`** — Backend submodules. `stt` includes `provisioning` (Sprint 6) for first-launch Moonshine auto-download.
 - **`cleanup_orphaned_temp_dirs()`** — Removes temporary `kue-session-*` directories left by crashed sessions.
-- **`plugin(tauri_plugin_shell)`** — Necessary to invoke external processes (planned for BYOK).
+- **`plugin(tauri_plugin_shell)`** — Standard Tauri v2 plugin for shell operations (not used for BYOK — that uses `reqwest`).
 - **Overlay click-through:** In `setup()`, the overlay window is configured with `set_ignore_cursor_events(true)` so mouse events pass through to the video call underneath.
 - **`app.manage(database)`**, **`app.manage(AudioCapture)`**, **`app.manage(Arc<Mutex<EmbeddingModel>>)`** — Injects `Database`, `AudioCapture` and the embeddings model (wrapped in `Arc` for sharing with the hint worker) as Tauri state.
+- **`BatchTracker`** — `Arc<Mutex<HashSet<String>>>` registered as Tauri state, tracks which sessions have completed Channel A batch transcription. Checked by `is_transcript_ready` command and `analyze_session`.
+- **Moonshine provisioning setup:** Prepends the managed moonshine lib dir to `DYLD_LIBRARY_PATH` (so `@rpath/libonnxruntime.*.dylib` is found at load time), then spawns a background `kue-moonshine-provision` thread via `ensure_moonshine_installed()` that downloads dylibs from PyPI and model files (~482 MB total) on first launch. Progress is reported via `moonshine-download-progress` events; the `retry_moonshine_download` Tauri command allows retry on failure.
 - **Orchestrator setup:** `HintScheduler` (manages delayed hints in Shadow mode), `HintJobSender` (mpsc channel for dispatching hint jobs), and `start_hint_worker` (spawns `kue-hint-worker` thread that processes jobs and drains expired hints every 500ms).
 - **`PanicState`** — Registered via `app.manage(PanicState::new())`. Stores an optional `Instant` deadline; when set, `hint_silenced_by_panic()` in the orchestrator returns `true` for all hint operations until the deadline expires (10s), effectively muting all hints.
 - **`start_session`**, **`stop_session`**, **`panic_mode`** — Tauri commands replacing the old `toggle_audio_capture`. `start_session` creates a DB session, spawns the dual capture and STP pipeline. `stop_session` stops capture, triggers batch transcription for Channel A, and emits `session-stopped`. `panic_mode` activates `PanicState` for 10s and emits `panic-mode` event.
@@ -515,6 +541,7 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 | WAV writing (hound)     | **Implemented**  | `hound` (active)                                                                      | `audio/capture.rs`                  |
 | RAG embeddings + indexer | **Implemented**  | `candle-core`, `candle-nn`, `candle-transformers`, `hf-hub`, `tokenizers`, `bytemuck` | `rag/embeddings.rs`, `rag/indexer.rs` |
 | STT (Moonshine)         | **Implemented** (integrated in lifecycle via `start_session`/`stop_session`) | `libloading` (dynamically loaded `libmoonshine.dylib`), `uuid`                       | `stt/mod.rs`, `stt/ffi.rs`, `stt/cli.rs`, `stt/vad.rs`, `stt/pipeline.rs` |
+| Moonshine auto-provisioning | **Implemented** (Sprint 6 — first-launch download of dylibs + model, progress events, retry command) | `sha2`, `hex`, `zip`, `reqwest` (blocking)                                          | `stt/provisioning.rs`            |
 | Channel A batch transcription | **Implemented** (ADR-015 — runs offline post-session in `kue-batch-transcribe` thread) | `hound`                                                                               | `stt/batch.rs`, `audio/capture.rs` (spawn_batch_transcription) |
 | Question classifier     | **Implemented** (integrated in STT pipeline, standalone Tauri cmd) | —                                                                                     | `classifier/mod.rs`                  |
 | Hint generator          | **Implemented** (orchestrator module: HintScheduler + hint worker + mpsc dispatch) | —                                                                                     | `orchestrator/mod.rs`, `orchestrator/worker.rs` |
@@ -570,7 +597,7 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 | Crate                  | Purpose                                           | Version |
 | ---------------------- | ------------------------------------------------- | ------- |
 | `tauri`                | Native application shell                          | 2       |
-| `tauri-plugin-shell`   | External process invocation (BYOK)                | 2       |
+| `tauri-plugin-shell`   | Tauri v2 shell plugin (general)                   | 2       |
 | `rusqlite`             | SQLite client with bundled                        | 0.33    |
 | `sqlite-vec`           | Vector index within SQLite                        | 0.1.9   |
 | `cpal`                 | Microphone audio capture                          | 0.15    |
@@ -586,4 +613,8 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 | `libloading`           | Dynamic loading of libmoonshine.dylib (STT FFI)    | 0.8     |
 | `uuid`                 | Session IDs and unique temp file names            | 1       |
 | `anyhow` / `thiserror` | Idiomatic error handling                          | 1 / 2   |
-| `keyring`              | OS native keychain for API key storage (macOS)    | 3       |
+| `keyring`              | OS native keychain for API key storage (macOS)    | 2       |
+| `sha2`                 | SHA-256 verification for provisioned files        | 0.10    |
+| `hex`                  | Hex encoding for SHA-256 hashes                   | 0.4     |
+| `zip`                  | ZIP extraction for Moonshine wheel dylibs         | 2       |
+| `reqwest`              | HTTP client for post-call BYOK analysis           | 0.12    |

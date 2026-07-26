@@ -271,3 +271,59 @@ The transcription runs in a separate thread (`kue-batch-transcribe`) so as not t
 - **Store keys in the `settings` table** (rejected — keys in plain text in SQLite is a security risk).
 - **Post-call analysis via Tauri plugin/shell** (rejected — `reqwest` is simpler and more reliable than subprocess invocation).
 - **Analyze in the batch transcription thread** (rejected — mixing concerns; the batch thread's job is to produce transcripts, not consume them).
+
+---
+
+### ADR-017: Moonshine auto-provisioning on first launch
+
+**Date:** 2026-07-26
+
+**Status:** Accepted
+
+**Context:** Moonshine STT requires two external resources that are not bundled with the binary:
+1. **dylibs:** `libmoonshine.dylib` (~27 MB) + `libonnxruntime.1.23.2.dylib` (~26 MB), shipped inside a PyPI wheel (`moonshine-voice` v0.0.73).
+2. **Model files:** 8 ONNX/config files for the Medium Streaming English model (~429 MB total), hosted on `download.moonshine.ai`.
+
+Previously (Sprints 1–5), the user had to manually download and place these files at `~/.local/share/moonshine/` or `~/moonshine-models/`. This created a poor onboarding experience: first use required following external instructions, the user saw Moonshine-related errors on first launch, and troubleshooting required knowing the filesystem layout.
+
+Sprint 6 needed to eliminate this friction while ensuring:
+- The download runs in a background thread — it must not block the Tauri setup or UI startup.
+- Progress is reported so the frontend can display a download indicator.
+- Integrity verification is performed (SHA-256) to detect corrupted downloads or CDN compromise.
+- Retry is possible if the download fails (network issues, temporary server errors).
+- Idempotency — re-launching the app after a partial download should not re-download intact files.
+- Offline resilience — if there's no internet, the app should not crash; it should degrade gracefully (falling back to CLI engine if available, or showing a clear error).
+
+**Decision:** A dedicated provisioning module (`stt/provisioning.rs`) that:
+
+1. **Runs in a background thread** (`kue-moonshine-provision`) spawned from `lib.rs::setup()` via `ensure_moonshine_installed()`. The thread downloads and verifies all resources while the UI is already responsive.
+
+2. **Downloads dylibs from PyPI:** Fetches the `moonshine_voice` v0.0.73 wheel (SHA-256 pinned at build time), verifies the hash, then extracts `libmoonshine.dylib` and `libonnxruntime.1.23.2.dylib` via the `zip` crate into `{app_data_dir}/moonshine/lib/`.
+
+3. **Downloads the model from `download.moonshine.ai`:** Fetches 8 files (adapter.ort, cross_kv.ort, decoder_kv.ort, decoder_kv_with_attention.ort, encoder.ort, frontend.ort, streaming_config.json, tokenizer.bin) into `{app_data_dir}/moonshine/models/en/medium-streaming/`. Each file's size is checked against expected values (±10%), and its SHA-256 hash is verified.
+
+4. **Progress reporting:** Emits `moonshine-download-progress` Tauri events with stage, file index/count, and downloaded/total bytes, throttled to at most one every 250ms.
+
+5. **Completion signalling:** Emits `moonshine-provisioned` on success or `moonshine-provision-error` on failure.
+
+6. **Retry command:** `retry_moonshine_download` Tauri command removes partial files and re-launches provisioning.
+
+7. **Path resolution:** The global `MOONSHINE_BASE` static is set after successful provisioning. The FFI engine's `is_available()` and the `STTConfig::default_model_path()` both check this managed path first, then fall back to dev paths (`~/.local/share/moonshine/`, `~/moonshine-models/`, relative path), ensuring backward compatibility.
+
+8. **DYLD_LIBRARY_PATH:** The managed lib dir is prepended to `DYLD_LIBRARY_PATH` during `setup()` so that `@rpath/libonnxruntime.*.dylib` is resolvable at load time. This is safe because no other threads have been spawned yet.
+
+**Consequences:**
+- *(Positive)* First-launch friction is eliminated — the user doesn't need to manually download or configure anything.
+- *(Positive)* Integrity verification (SHA-256 + size checks) protects against corrupted downloads and CDN compromise (with the caveat that model hashes were pinned at build time from a one-time download — see the code comments).
+- *(Positive)* Idempotent — partial downloads are detected by size/hash and only the missing/corrupt files are re-downloaded.
+- *(Positive)* The background thread doesn't block Tauri setup or UI startup.
+- *(Negative)* The download is large (~482 MB total) and requires internet on first launch. Mitigated by the progress events (frontend should show a download bar — not yet implemented as of Sprint 6).
+- *(Negative)* PyPI wheel SHA-256 must be updated when the moonshine-voice version is bumped. The hash is a compile-time constant in `provisioning.rs`.
+- *(Negative)* The model hash pins are not vendor-published — they were computed at build time and protect against *future* CDN compromise but not against already-tampered files at the time of pinning. Documented as a trust caveat in the code.
+- *(Negative)* Functions requiring a concrete `tauri::AppHandle` (the download, progress emission, and retry logic) cannot be unit tested — only the pure helper functions (SHA-256, size validation, ZIP extraction dylib detection) have unit coverage (~30 tests). This is a known limitation of `tauri::test::mock_app` returning `AppHandle<MockRuntime>` which cannot substitute for the concrete runtime. Mitigated by having all testable helpers fully covered.
+
+**Alternatives considered:**
+- **Bundle dylibs + model in the binary** (rejected — would make the binary ~530 MB and violate package manager norms).
+- **Manual download** (the pre-Sprint 6 approach — rejected because it created unacceptable onboarding friction).
+- **Single monolithic download** instead of per-file (rejected — per-file allows resumption/retry of individual files and avoids re-downloading 429 MB on a single hash failure).
+- **Use `reqwest` async instead of blocking** (rejected — would require introducing a Tokio runtime just for provisioning; the blocking thread is simpler and the download is not latency-critical).

@@ -4,7 +4,7 @@
 
 Desktop application (macOS, Tauri v2) with real-time transcription, local RAG over your CV/projects, and ultra-short hints to maintain fluency under pressure. Post-call, optional analysis with your own LLM (BYOK).
 
-**Current status:** Sprints 0–5 completed. All v1 features implemented and tested: base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline + batch transcription for Channel A), question classifier (heuristics + regex with bilingual EN/ES keyword lists including trap keywords for regret/failure) wired into the STT pipeline, orchestrator (HintScheduler + hint worker + PanicState) producing hints from classifier+RAG, overlay window (transparent, always-on-top, click-through, 400×100) with hint display component (3s auto-dismiss via React `Overlay` component), mic VAD for Shadow-mode hint cancellation, panic/mute button (10s hint silence via `PanicState`), mode selection UI (Practice/Shadow in `App.tsx`), Channel A batch transcription at session end (ADR-015), and post-call BYOK analysis with keychain-stored API keys and LLM provider selection (Anthropic/OpenAI/Ollama/etc.). All implemented and tested (~400 tests in Rust). Remaining work: hint positioning clean-ups — see `spec.md`.
+**Current status:** Sprints 0–6 completed. All v1 features implemented and tested: base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline + batch transcription for Channel A), question classifier (heuristics + regex with bilingual EN/ES keyword lists including trap keywords for regret/failure) wired into the STT pipeline, orchestrator (HintScheduler + hint worker + PanicState) producing hints from classifier+RAG, overlay window (transparent, always-on-top, click-through, 400×100) with hint display component (3s auto-dismiss via React `Overlay` component), mic VAD for Shadow-mode hint cancellation, panic/mute button (10s hint silence via `PanicState`), mode selection UI (Practice/Shadow in `App.tsx`), Channel A batch transcription at session end (ADR-015), post-call BYOK analysis with keychain-stored API keys and LLM provider selection (Anthropic/OpenAI/Ollama/etc.), and Moonshine auto-provisioning (`stt/provisioning.rs` downloads dylibs + model on first launch, reports progress via `moonshine-download-progress` events, retry via `retry_moonshine_download` Tauri command). All implemented and tested (~400 tests in Rust). Remaining work: hint positioning clean-ups — see `spec.md`.
 
 ---
 
@@ -91,6 +91,8 @@ npm run coverage:rust:full
 │  │            │ │    analysis, analyze_session)   │    │
 │  │            │ │  - keys (keychain API key       │    │
 │  │            │ │    storage, save_key/has_key)   │    │
+│  │            │ │  - stt::provisioning::retry_    │    │
+│  │            │ │    moonshine_download cmd       │    │
 │  │            │ │  - db::get_sessions             │    │
 │  │            │ │  - db::get_session_transcript   │    │
 │  └────────────┘ │  - cpal (mic capture)           │    │
@@ -121,6 +123,11 @@ npm run coverage:rust:full
 │                 │  │  - stt::batch             │ │    │
 │                 │  │    (post-session Ch. A    │ │    │
 │                 │  │     VAD+STT, speaker=user)│ │    │
+│                 │  │  - stt::provisioning      │ │    │
+│                 │  │    (auto-download dylibs  │ │    │
+│                 │  │     + model on 1st launch,│ │    │
+│                 │  │     progress events,      │ │    │
+│                 │  │     retry_moonshine_download cmd)│ │
 │                 │  │  - stt::mod (module-level │ │    │
 │                 │  │    persist_transcript_    │ │    │
 │                 │  │    line & create_engine)  │ │    │
@@ -147,7 +154,7 @@ npm run coverage:rust:full
 └────────────────────────────────────────────────────────┘
 ```
 
-**Legend:** All listed code is functional and tested. `candle` implements BERT embeddings (`snowflake-arctic-embed-s`) in the `rag::embeddings` module, and `sqlite-vec` performs KNN vector search. Session control is handled by three separate Tauri commands (`start_session`, `stop_session`, `panic_mode`) instead of a single `toggle_audio_capture`. The STT pipeline integrates Moonshine (FFI + CLI fallback), VAD, classification, DB persistence, and pushes hint jobs to the orchestrator. The classifier module uses heuristic rules (regex + keyword density, bilingual EN/ES) with trap keywords for regret and failure topics. The orchestrator module stitches classifier + RAG → hints (immediate in Practice, delayed in Shadow) via a dedicated worker thread; in Shadow mode, hints are gated by `audio::mic_vad::MicVadState` — if the user starts speaking on Channel A before the 2.5s delay expires, the hint is silently cancelled. A `PanicState` registered in Tauri state silences all hints for 10s when activated via the panic button/mute command. At session end, Channel A (mic) audio is batch-transcribed via Moonshine + SimpleVAD in a dedicated thread (`kue-batch-transcribe`) and persisted with `speaker='user'` (ADR-015). After batch transcription completes, the full transcript (both speakers) is available for post-call analysis: the `analyze_session` command sends the transcript + RAG context to a user-configured LLM via BYOK (Anthropic/OpenAI/Ollama/etc.), with API keys stored in the OS keychain (not in the `settings` table). The overlay window (transparent, always-on-top, click-through, 400×100) displays hints via an `Overlay` React component that listens for `new-hint` Tauri events, auto-shows in Shadow mode via `session-started`, auto-hides on `session-stopped`, and displays a panic indicator on `panic-mode`. Hints auto-dismiss after 3s.
+**Legend:** All listed code is functional and tested. `candle` implements BERT embeddings (`snowflake-arctic-embed-s`) in the `rag::embeddings` module, and `sqlite-vec` performs KNN vector search. Session control is handled by three separate Tauri commands (`start_session`, `stop_session`, `panic_mode`) instead of a single `toggle_audio_capture`. The STT pipeline integrates Moonshine (FFI + CLI fallback), VAD, classification, DB persistence, and pushes hint jobs to the orchestrator. The classifier module uses heuristic rules (regex + keyword density, bilingual EN/ES) with trap keywords for regret and failure topics. The orchestrator module stitches classifier + RAG → hints (immediate in Practice, delayed in Shadow) via a dedicated worker thread; in Shadow mode, hints are gated by `audio::mic_vad::MicVadState` — if the user starts speaking on Channel A before the 2.5s delay expires, the hint is silently cancelled. A `PanicState` registered in Tauri state silences all hints for 10s when activated via the panic button/mute command. At session end, Channel A (mic) audio is batch-transcribed via Moonshine + SimpleVAD in a dedicated thread (`kue-batch-transcribe`) and persisted with `speaker='user'` (ADR-015). After batch transcription completes, the full transcript (both speakers) is available for post-call analysis: the `analyze_session` command sends the transcript + RAG context to a user-configured LLM via BYOK (Anthropic/OpenAI/Ollama/etc.), with API keys stored in the OS keychain (not in the `settings` table). On first launch, `stt::provisioning` auto-downloads Moonshine dylibs + model (~482 MB) from PyPI and `download.moonshine.ai`, reporting progress via `moonshine-download-progress` events and offering retry via the `retry_moonshine_download` Tauri command. The overlay window (transparent, always-on-top, click-through, 400×100) displays hints via an `Overlay` React component that listens for `new-hint` Tauri events, auto-shows in Shadow mode via `session-started`, auto-hides on `session-stopped`, and displays a panic indicator on `panic-mode`. Hints auto-dismiss after 3s.
 
 ## Stack
 
@@ -157,7 +164,7 @@ npm run coverage:rust:full
 | App Core | Rust (Tauri v2), session commands: `start_session`/`stop_session`/`panic_mode` |
 | Database | SQLite + sqlite-vec (vectors) |
 | Audio | cpal (mic) + screencapturekit-rs (loopback) + hound (WAV) |
-| STT + Classifier | Moonshine (FFI + CLI fallback) + heuristics/regex classifier (bilingual EN/ES, trap keywords for regret/failure) + batch transcription (Ch. A) |
+| STT + Classifier | Moonshine (FFI + CLI fallback) + heuristics/regex classifier (bilingual EN/ES, trap keywords for regret/failure) + batch transcription (Ch. A) + auto-provisioning (`stt/provisioning.rs` downloads dylibs + model on first launch) |
 | Hint Engine | orchestrator module (HintScheduler + hint worker thread + PanicState) |
 | Embeddings | candle (HuggingFace Rust) + `snowflake-arctic-embed-s` |
 | Overlay Window | Tauri v2 multi-window (transparent, click-through, always-on-top, auto-show/hide on session events) |
@@ -210,6 +217,8 @@ kue/
 │   │   │   ├── cli.rs       # MoonshineCLIEngine (fallback to moonshine-voice CLI)
 │   │   │   ├── vad.rs       # SimpleVAD (energy-based)
 │   │   │   ├── pipeline.rs  # STTPipeline (thread loopback→VAD→STT→classify→events→DB→HintJobs)
+│   │   │   ├── provisioning.rs # First-launch auto-download of Moonshine dylibs + model,
+│   │   │   │                    #   progress events, retry_moonshine_download Tauri command
 │   │   │   └── batch.rs     # Channel A batch transcription (VAD+STT, post-session)
 │   │   ├── rag/
 │   │   │   ├── mod.rs       # Re-export of embeddings and indexer
