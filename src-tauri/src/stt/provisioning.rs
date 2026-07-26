@@ -199,6 +199,15 @@ pub fn is_provisioned(base: &Path) -> bool {
 // Retry command (exposed to frontend)
 // ---------------------------------------------------------------------------
 
+/// Tauri command: check whether Moonshine dylibs + model are fully
+/// provisioned on disk. Used by the frontend to decide whether to show
+/// the download progress UI on first launch.
+#[tauri::command]
+pub fn is_moonshine_provisioned(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let base = resolve_base(&app_handle)?;
+    Ok(is_provisioned(&base))
+}
+
 /// Tauri command: retry Moonshine provisioning after a previous failure.
 /// Returns immediately — the frontend should listen for
 /// `moonshine-provisioned` / `moonshine-provision-error` events to

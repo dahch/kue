@@ -106,6 +106,7 @@ pub fn run() {
             keys::save_key,
             keys::has_key,
             analyze::analyze_session,
+            stt::provisioning::is_moonshine_provisioned,
             stt::provisioning::retry_moonshine_download,
         ])
         .run(tauri::generate_context!())
