@@ -1,6 +1,6 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QuestionType {
     Technical,
@@ -683,5 +683,227 @@ mod tests {
         assert_eq!(QuestionType::Architecture.as_str(), "architecture");
         assert_eq!(QuestionType::Trap.as_str(), "trap");
         assert_eq!(QuestionType::None.as_str(), "none");
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_empty_after_trim_returns_none() {
+        // classify() trims the input first
+        assert_eq!(classify("  \t  \n  "), QuestionType::None);
+    }
+
+    #[test]
+    fn classify_question_mark_only() {
+        // Just a "?" — no keywords, imperative triggers, or actual text
+        // has_question_mark = true, but everything else is empty → Technical
+        assert_eq!(classify("?"), QuestionType::Technical);
+    }
+
+    #[test]
+    fn classify_question_mark_with_whitespace() {
+        assert_eq!(classify("  ?  "), QuestionType::Technical);
+    }
+
+    #[test]
+    fn classify_uppercase_keywords_still_match() {
+        // All-caps keywords should match after to_lowercase()
+        assert_eq!(
+            classify("¿CÓMO IMPLEMENTASTE LA CACHÉ?"),
+            QuestionType::Technical
+        );
+    }
+
+    #[test]
+    fn classify_mixed_case_keywords_match() {
+        assert_eq!(
+            classify("Tell Me About A Conflict In Your Team"),
+            QuestionType::Star
+        );
+    }
+
+    #[test]
+    fn classify_keyword_in_middle_of_text_detected() {
+        // "cuándo" is a fallback trigger — it should be detected even
+        // when not at the start
+        assert_eq!(
+            classify("¿Puedes decirme cuándo fue eso?"),
+            QuestionType::Star
+        );
+    }
+
+    #[test]
+    fn classify_imperative_not_at_start_but_marked() {
+        // "dime" in the body (after leading word) is handled by body check
+        assert_eq!(
+            classify("Y dime sobre tu experiencia"),
+            QuestionType::Star
+        );
+    }
+
+    #[test]
+    fn classify_only_question_mark_no_text_technical_default() {
+        // No keywords matched but has question mark → defaults to Technical
+        assert_eq!(classify("?"), QuestionType::Technical);
+    }
+
+    #[test]
+    fn classify_fallback_technical_via_como() {
+        // "cómo" in the text triggers the fallback technical_score increment
+        assert_eq!(
+            classify("¿Cómo lo hiciste?"),
+            QuestionType::Technical
+        );
+    }
+
+    #[test]
+    fn classify_fallback_technical_via_what_technology() {
+        assert_eq!(
+            classify("What technology is best for this?"),
+            QuestionType::Technical
+        );
+    }
+
+    #[test]
+    fn classify_fallback_behavioral_via_tell_about() {
+        assert_eq!(
+            classify("Tell me about your experience"),
+            QuestionType::Star
+        );
+    }
+
+    #[test]
+    fn classify_very_long_text_does_not_panic() {
+        let long_text = "¿Cómo implementaste ".repeat(100) + "?";
+        let result = classify(&long_text);
+        // Should not panic and should return a valid QuestionType
+        assert!(matches!(result, QuestionType::Technical | QuestionType::None));
+    }
+
+    #[test]
+    fn classify_tie_breaking_trap_wins_over_architecture_when_equal() {
+        // Trap = 1, Architecture = 1 → Trap wins (priority check)
+        // "debilidad" (trap) + "diseño" (architecture), same score
+        let text = "¿Cuál es tu mayor debilidad en el diseño?";
+        assert_eq!(classify(text), QuestionType::Trap);
+    }
+
+    #[test]
+    fn classify_architecture_beats_trap_when_score_higher() {
+        // Architecture = 2, Trap = 1 → Architecture wins (higher score)
+        let text = "¿Cuál es tu mayor debilidad en el diseño de la arquitectura?";
+        assert_eq!(classify(text), QuestionType::Architecture);
+    }
+
+    #[test]
+    fn classify_tie_breaking_architecture_vs_star() {
+        // Architecture = 1, Star = 1 → Architecture wins
+        let text = "¿Cómo diseñaste la solución trabajando en equipo?";
+        assert_eq!(classify(text), QuestionType::Architecture);
+    }
+
+    #[test]
+    fn classify_tie_breaking_star_vs_technical() {
+        // Star = 1, Technical = 1 → Star wins
+        let text = "¿Cuéntame de un error que tuviste en el equipo?";
+        assert_eq!(classify(text), QuestionType::Star);
+    }
+
+    #[test]
+    fn classify_tie_breaking_trap_wins_with_two_keywords() {
+        // Trap = 2 (debilidad, defecto), Star = 1, Architecture = 0
+        // Trap wins because trap_score == max_score
+        let text = "¿Cuál es tu mayor debilidad y qué defecto tienes?";
+        assert_eq!(classify(text), QuestionType::Trap);
+    }
+
+    #[test]
+    fn classify_single_trap_keyword_wins_over_technical() {
+        // Trap = 1, Technical = 0 → Trap wins
+        let text = "¿Cuál es tu mayor debilidad?";
+        assert_eq!(classify(text), QuestionType::Trap);
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration: classify_text Tauri command — all edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_text_whitespace_only() {
+        assert_eq!(classify_text("   ".into()), QuestionType::None);
+    }
+
+    #[test]
+    fn classify_text_special_characters() {
+        assert_eq!(
+            classify_text("¿Qué librería usaste para async?".into()),
+            QuestionType::Technical
+        );
+    }
+
+    #[test]
+    fn classify_text_single_word_imperative() {
+        assert_eq!(
+            classify_text("Cuéntame".into()),
+            QuestionType::Star
+        );
+    }
+
+    #[test]
+    fn classify_text_imperative_with_filler_prefix() {
+        assert_eq!(
+            classify_text("Bueno cuéntame de un proyecto difícil".into()),
+            QuestionType::Star
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // QuestionType Clone, Copy, PartialEq
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn question_type_is_copy() {
+        let a = QuestionType::Technical;
+        let b = a; // Copy, not move
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn question_type_debug_format() {
+        let debug = format!("{:?}", QuestionType::Star);
+        assert_eq!(debug, "Star");
+    }
+
+    // -----------------------------------------------------------------------
+    // QuestionType serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn question_type_serialize_technical() {
+        let json = serde_json::to_string(&QuestionType::Technical).unwrap();
+        assert_eq!(json, r#""technical""#);
+    }
+
+    #[test]
+    fn question_type_serialize_star() {
+        let json = serde_json::to_string(&QuestionType::Star).unwrap();
+        assert_eq!(json, r#""star""#);
+    }
+
+    #[test]
+    fn question_type_serialize_none() {
+        let json = serde_json::to_string(&QuestionType::None).unwrap();
+        assert_eq!(json, r#""none""#);
+    }
+
+    #[test]
+    fn question_type_deserialize() {
+        let q: QuestionType = serde_json::from_str(r#""architecture""#).unwrap();
+        assert_eq!(q, QuestionType::Architecture);
+
+        let q: QuestionType = serde_json::from_str(r#""trap""#).unwrap();
+        assert_eq!(q, QuestionType::Trap);
     }
 }
