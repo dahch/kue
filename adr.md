@@ -229,3 +229,45 @@ The transcription runs in a separate thread (`kue-batch-transcribe`) so as not t
 **Alternatives considered:**
 - **Live streaming of Channel A** in parallel with Channel B (doubles CPU/Moonshine usage during the live call, with no functional benefit since nothing consumes that transcription in real time).
 - **Keep the current scope** without transcribing Channel A (rejected because it would prevent post-call from fulfilling its purpose — without user answers the LLM cannot evaluate STAR structure or response quality).
+
+---
+
+### ADR-016: Post-call BYOK analysis with keychain-stored API keys
+
+**Date:** 2026-07-26
+
+**Status:** Accepted
+
+**Context:** Sprint 5 needed to implement post-call analysis of the full transcript (both speakers). The requirement was:
+- Allow the user to send the transcript + relevant RAG context to an LLM of their choice.
+- Support multiple providers (Anthropic, OpenAI, Gemini, OpenRouter, Ollama) without vendor lock-in.
+- Keep the user's API key secure — never stored in the app's SQLite database or written to disk in plain text.
+- The analysis should be structured (summary, weak questions, missed projects, STAR improvements) and returned in a parseable JSON format.
+- The batch transcription of Channel A (ADR-015) completes asynchronously, so the analysis must wait for it to finish.
+
+**Decision:**
+
+1. **Standalone Tauri command (`analyze_session`):** A single `#[tauri::command]` that receives a `session_id`, `provider` string, and optional `model` string. It reads the transcript from SQLite, queries RAG for relevant context, builds a prompt, makes an HTTP request (`reqwest`), parses the JSON response, and returns an `AnalyzeResult`. This runs in the Tauri command thread (not the audio/orchestrator thread) since there is no real-time constraint.
+
+2. **OS Keychain storage via `keyring`:** API keys are stored in the macOS Keychain using the `keyring` crate, identified by service name `"kue"` and the provider name as the user identifier. The `save_key` and `has_key` Tauri commands expose this to the frontend. Keys are never stored in the `settings` table, and a test (`key_never_in_settings_table`) explicitly verifies this.
+
+3. **Structured prompt with JSON schema:** The `build_analysis_prompt` function constructs a Spanish-language prompt that demands a specific JSON schema (`summary`, `weak_questions`, `forgotten_projects`, `star_improvements`). The response parser handles both raw JSON and JSON embedded in markdown code blocks.
+
+4. **Provider-specific HTTP adapters:** Each provider (Anthropic, OpenAI, Gemini, OpenRouter, Ollama) has its own URL builder and header format. The `reqwest` client makes POST requests with the appropriate `Authorization` header (or `x-goog-api-key` for Gemini).
+
+5. **Batch transcription completion gating:** The `analyze_session` command checks `BatchTracker` (a `HashSet` of completed session IDs registered as Tauri state) before proceeding. If the session's Channel A transcription hasn't finished, the command returns an error. The frontend checks `is_transcript_ready` and listens for `post-call-transcript-ready` before enabling the "Analyze" button.
+
+**Consequences:**
+- *(Positive)* Zero infrastructure cost for the developer — the user brings their own key and pays their own API usage.
+- *(Positive)* Maximum privacy flexibility — the user can use a local Ollama instance for fully offline analysis.
+- *(Positive)* No impact on real-time performance — analysis runs in its own command handler, not in the audio/orchestrator threads.
+- *(Positive)* Keys are stored in the OS keychain, not in the app's SQLite database, matching best practices for credential storage.
+- *(Negative)* Initial friction — the user must obtain and configure their own API key. Mitigated by the `ApiKeyInput` component which shows a clear UI for each provider.
+- *(Negative)* Provider-specific HTTP adapters require maintenance if APIs change. Mitigated by keeping the adapter logic in a single file (`analyze.rs`) with per-provider functions.
+- *(Negative)* The LLM response must be valid JSON — providers that struggle with structured output may return unparseable responses. Mitigated by the markdown-aware JSON parser and clear error messages.
+
+**Alternatives considered:**
+- **Built-in LLM provider managed by the app** (rejected — would require the developer to pay for API costs and manage a billing system).
+- **Store keys in the `settings` table** (rejected — keys in plain text in SQLite is a security risk).
+- **Post-call analysis via Tauri plugin/shell** (rejected — `reqwest` is simpler and more reliable than subprocess invocation).
+- **Analyze in the batch transcription thread** (rejected — mixing concerns; the batch thread's job is to produce transcripts, not consume them).
