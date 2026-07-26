@@ -4,26 +4,26 @@
 
 Desktop application (macOS, Tauri v2) with real-time transcription, local RAG over your CV/projects, and ultra-short hints to maintain fluency under pressure. Post-call, optional analysis with your own LLM (BYOK).
 
-**Current status:** Sprint 0–2 completed — base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), and STT module (Moonshine FFI + CLI fallback + VAD + pipeline) implemented and tested (+200 tests in Rust). The STT module is complete and tested but not yet integrated into the app lifecycle. The rest of the pipeline (classifier → hints → overlay) is in planning (see `spec.md`).
+**Current status:** Sprints 0–3 completed — base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline) integrated into the app lifecycle, and question classifier (heuristics + regex) wired into the STT pipeline. All implemented and tested (+260 tests in Rust). The rest of the pipeline (hint generator → overlay) is in planning (see `spec.md`).
 
 ---
 
-## Prerrequisitos
+## Prerequisites
 
 - **Rust** 1.79+ (`rustup install 1.79`)
-- **Node.js** 18+ (recomendado 20 LTS)
-- **macOS 13+** (ScreenCaptureKit requerido para captura de audio de sistema)
+- **Node.js** 18+ (recommended 20 LTS)
+- **macOS 13+** (ScreenCaptureKit required for system audio loopback)
 
 ## Getting Started
 
 ```bash
-# Clonar el repositorio
+# Clone the repository
 git clone <repo-url> && cd kue
 
-# Instalar dependencias del frontend
+# Install frontend dependencies
 npm install
 
-# Iniciar en modo desarrollo (Tauri + Vite)
+# Start development mode (Tauri + Vite)
 npm run tauri:dev
 ```
 
@@ -35,7 +35,7 @@ The app will open a window with debug controls to index folders (RAG) and search
 # Rust tests (database — all logic implemented)
 npm run test:rust:db
 
-# Rust tests (all modules, >200 tests)
+# Rust tests (all modules, >260 tests)
 npm run test:rust
 
 # Rust coverage (requires cargo-tarpaulin)
@@ -43,7 +43,7 @@ npm run coverage:rust:db
 npm run coverage:rust:full
 ```
 
-## Scripts disponibles
+## Available Scripts
 
 | Command | Description |
 |---|---|
@@ -54,7 +54,7 @@ npm run coverage:rust:full
 | `npm run tauri:dev` | Tauri + Vite in development mode |
 | `npm run tauri:build` | Production build (generates .dmg) |
 | `npm run test:rust:db` | Tests for the database module only |
-| `npm run test:rust` | Tests for all Rust modules (>200 tests) |
+| `npm run test:rust` | Tests for all Rust modules (>260 tests) |
 | `npm run coverage:rust` | Runs Rust tests (alias for `test:rust`) |
 | `npm run coverage:rust:check` | Checks availability of coverage tools |
 | `npm run coverage:rust:db` | Coverage for the database module (tarpaulin) |
@@ -73,8 +73,10 @@ npm run coverage:rust:full
 │  │          │   │  - audio::toggle_audio_capture│    │
 │  │          │   │  - rag::index_folder_cmd     │    │
 │  │          │   │  - rag::search_context cmd   │    │
-│  │          │   │  - stt module (tested, not   │    │
-│  │          │   │    wired in lifecycle)       │    │
+ │  │          │   │  - stt::pipeline (VAD→STT→  │    │
+│  │          │   │    classify→events→DB)       │    │
+│  │          │   │  - classifier::classify_text │    │
+│  │          │   │    (question classification) │    │
 │  └──────────┘   │  - types (TranscriptLine,     │    │
 │                 │    Speaker)                    │    │
 │                 │  - cpal (mic capture)          │    │
@@ -95,7 +97,8 @@ npm run coverage:rust:full
 │                 │  │  - stt::cli (fallback)  │   │    │
 │                 │  │  - stt::vad (energy)    │   │    │
 │                 │  │  - stt::pipeline        │   │    │
-│                 │  │    (VAD→STT→events→DB)  │   │    │
+│                 │  │    (VAD→STT→classify→   │   │    │
+│                 │  │     events→DB)           │   │    │
 │                 │  └─────────────────────────┘   │    │
 │                 └───────────────────────────────┘    │
 │  ┌──────────────────────────────────────────────┐    │
@@ -106,7 +109,7 @@ npm run coverage:rust:full
 └──────────────────────────────────────────────────────┘
 ```
 
-**Legend:** All listed code is functional and tested. `candle` implements BERT embeddings (`snowflake-arctic-embed-s`) in the `rag::embeddings` module, and `sqlite-vec` performs KNN vector search. The STT module is implemented (FFI + CLI + VAD + pipeline thread) but not yet integrated into the app lifecycle — see `design.md` for details.
+**Legend:** All listed code is functional and tested. `candle` implements BERT embeddings (`snowflake-arctic-embed-s`) in the `rag::embeddings` module, and `sqlite-vec` performs KNN vector search. The STT pipeline integrates Moonshine (FFI + CLI fallback), VAD, classification, and DB persistence. The classifier module uses heuristic rules (regex + keyword density) to categorize questions.
 
 ## Stack
 
@@ -116,7 +119,7 @@ npm run coverage:rust:full
 | App Core | Rust (Tauri v2) |
 | Database | SQLite + sqlite-vec (vectors) |
 | Audio | cpal (mic) + screencapturekit-rs (loopback) + hound (WAV) |
-| STT | Moonshine (FFI + CLI fallback, not integrated in lifecycle) |
+| STT + Classifier | Moonshine (FFI + CLI fallback) + heuristics/regex classifier |
 | Embeddings | candle (HuggingFace Rust) + `snowflake-arctic-embed-s` |
 | Post-call (planned) | BYOK (Anthropic/OpenAI/Ollama/etc.) |
 
@@ -144,6 +147,8 @@ kue/
 │   │   ├── audio/
 │   │   │   ├── mod.rs    # Re-export of the capture module
 │   │   │   └── capture.rs # Dual capture (cpal + SCK), WAV writer, toggle_audio_capture cmd
+│   │   ├── classifier/
+│   │   │   └── mod.rs    # Question classification (heuristics + regex, 48 tests)
 │   │   ├── stt/
 │   │   │   ├── mod.rs    # STTEngine trait, STTConfig, re-exports
 │   │   │   ├── ffi.rs    # MoonshineFFIEngine (libmoonshine.dylib via libloading)

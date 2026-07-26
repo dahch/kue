@@ -2,7 +2,7 @@
 
 > Codename: **Kue**.
 
-> **Implementation status:** Sprint 0–2 completed. The DB schema is implemented (27 tests), the audio capture module (mic + loopback, ~1230 lines, 50 tests), the RAG engine (embeddings + indexer, 14+57=71 tests) and the STT module (5 files, ~630 lines, 81 tests) as well. The STT module integrates Moonshine via FFI (libmoonshine.dylib) with CLI fallback (`moonshine-voice`), simple VAD, pipeline in its own thread, `new-transcript` events to the frontend and persistence in `transcript_lines`. STT is not yet integrated into the app lifecycle (the Tauri commands and pipeline thread spawn are pending). Sections §3–§9 describe the complete planned product; see [`design.md`](./design.md) for what is actually built.
+> **Implementation status:** Sprints 0–3 completed, Sprint 4 (overlay) next. The DB schema is implemented (27 tests), the audio capture module (mic + loopback, ~1230 lines, 50 tests), the RAG engine (embeddings + indexer, 14+43=57 tests), the STT module (5 files, ~815 non-test lines, 81 tests), and the classifier module (1 file, 48 tests). The STT module integrates Moonshine via FFI (libmoonshine.dylib) with CLI fallback (`moonshine-voice`), simple VAD, pipeline in its own thread, `new-transcript` events to the frontend and persistence in `transcript_lines`. The STT pipeline is integrated into the app lifecycle via `toggle_audio_capture` command, which creates DB sessions, spawns the pipeline thread, and persists transcripts. The classifier receives each transcribed line (called from `STTPipeline::flush_segment`) and emits a `question-detected` event when a question is recognized. A Tauri command `classify_text` is also registered for direct use from the frontend. Sections §3–§9 describe the complete planned product; see [`design.md`](./design.md) for what is actually built.
 
 ## 1. Objective
 
@@ -13,6 +13,7 @@ Desktop application (macOS-only in v1) that functions as a "memory copilot" for 
 **Target market:** software engineers, data scientists, and technical professionals preparing for interviews, or wanting memory support during real hiring processes.
 
 **Value proposition:**
+
 - **No cheating:** doesn't generate answers; only recalls your own metrics, projects, and structure.
 - **Total privacy:** STT, RAG, and classification run 100% locally. The only data that leaves the machine is the post-call transcript, and only if the user decides to send it to an external LLM (BYOK).
 - **Low stress:** reduces performance anxiety by recalling key points at the right moment, not before or after.
@@ -20,6 +21,7 @@ Desktop application (macOS-only in v1) that functions as a "memory copilot" for 
 ## 3. Goals / non-goals (v1)
 
 **Yes:**
+
 - Real-time transcription with speaker separation by audio channel.
 - **Practice** mode (mock interview, instructive and immediate hints) and **Shadow** mode (real interview, hints only if stuck >2.5s).
 - Own context ingestion (PDF/TXT/MD) indexed locally via RAG.
@@ -27,6 +29,7 @@ Desktop application (macOS-only in v1) that functions as a "memory copilot" for 
 - On-demand post-call analysis with BYOK.
 
 **No (v1):**
+
 - Windows and Linux — **macOS-only for now**, evaluated for v2 based on how well this v1 works.
 - Full answers generated live — out of scope by design, not by deadline.
 - Multi-device sync or cloud backend.
@@ -34,25 +37,25 @@ Desktop application (macOS-only in v1) that functions as a "memory copilot" for 
 
 ## 4. Main features
 
-| Module | Description | Mode |
-|---|---|---|
-| **Practice** | Mock interview with generous feedback; more instructive hints, the classifier explains the structure. | Local |
-| **Shadow** | Real interview; sparse hints, only appear if the user gets stuck (delay > 2.5s after the question). | Local |
-| **Post-Call** | Button that analyzes the full transcript: summary, weak questions, forgotten projects, improvable STAR structure. | BYOK |
+| Module        | Description                                                                                                       | Mode  |
+| ------------- | ----------------------------------------------------------------------------------------------------------------- | ----- |
+| **Practice**  | Mock interview with generous feedback; more instructive hints, the classifier explains the structure.             | Local |
+| **Shadow**    | Real interview; sparse hints, only appear if the user gets stuck (delay > 2.5s after the question).               | Local |
+| **Post-Call** | Button that analyzes the full transcript: summary, weak questions, forgotten projects, improvable STAR structure. | BYOK  |
 
 ## 5. Technology stack
 
-| Layer | Technology | Justification |
-|---|---|---|
-| Frontend | React + TypeScript | Dynamic UI, rapid prototyping. |
-| App Core | Rust (Tauri) | Native audio access, transparent windows (overlay), single binary. |
-| Audio capture | `cpal` (mic) + `screencapturekit-rs` (system loopback) | ScreenCaptureKit (macOS 13+) captures system audio without virtual drivers — avoids depending on BlackHole. Requires user permission in Settings → Privacy → Screen & System Audio Recording (no signing entitlement can bypass it). |
-| STT | Moonshine (Medium) | Local, streaming, <260ms latency, native diarization as fallback. |
-| Embeddings (RAG) | candle (HuggingFace Rust) | Native inference in Rust. Decided: `snowflake-arctic-embed-s` (384-d, same scheme as MiniLM, better performance on MTEB/BEIR benchmarks). |
-| Vector DB / Storage | SQLite + sqlite-vec | Vector search within the same `.db` file as transcripts/sessions. |
-| Question classifier | Rust, heuristics + regex | Without external LLM — see §7 for rule details. |
-| Post-call analysis | BYOK (Anthropic/OpenAI/Gemini/OpenRouter/Ollama/OpenAI-compatible) | No latency pressure, user controls cost and privacy. |
-| Secrets (API keys) | Native OS keychain via `tauri-plugin-stronghold` or keyring | Never plain text in the `settings` table. |
+| Layer               | Technology                                                         | Justification                                                                                                                                                                                                                        |
+| ------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Frontend            | React + TypeScript                                                 | Dynamic UI, rapid prototyping.                                                                                                                                                                                                       |
+| App Core            | Rust (Tauri)                                                       | Native audio access, transparent windows (overlay), single binary.                                                                                                                                                                   |
+| Audio capture       | `cpal` (mic) + `screencapturekit-rs` (system loopback)             | ScreenCaptureKit (macOS 13+) captures system audio without virtual drivers — avoids depending on BlackHole. Requires user permission in Settings → Privacy → Screen & System Audio Recording (no signing entitlement can bypass it). |
+| STT                 | Moonshine (Medium)                                                 | Local, streaming, <260ms latency, native diarization as fallback.                                                                                                                                                                    |
+| Embeddings (RAG)    | candle (HuggingFace Rust)                                          | Native inference in Rust. Decided: `snowflake-arctic-embed-s` (384-d, same scheme as MiniLM, better performance on MTEB/BEIR benchmarks).                                                                                            |
+| Vector DB / Storage | SQLite + sqlite-vec                                                | Vector search within the same `.db` file as transcripts/sessions.                                                                                                                                                                    |
+| Question classifier | Rust, heuristics + regex                                           | Without external LLM — see §7 for rule details.                                                                                                                                                                                      |
+| Post-call analysis  | BYOK (Anthropic/OpenAI/Gemini/OpenRouter/Ollama/OpenAI-compatible) | No latency pressure, user controls cost and privacy.                                                                                                                                                                                 |
+| Secrets (API keys)  | Native OS keychain via `tauri-plugin-stronghold` or keyring        | Never plain text in the `settings` table.                                                                                                                                                                                            |
 
 ## 6. Module architecture
 
@@ -107,11 +110,19 @@ Desktop application (macOS-only in v1) that functions as a "memory copilot" for 
 
 ## 7. Question classifier — details
 
-Heuristic rules, no LLM:
-- Direct signal: question mark.
-- Signal by imperative verb at sentence start (without "?"): "cuéntame", "dime", "descríbeme", "explícame", "camínenme por" — covers typical behavioral questions that in English/Spanish don't always carry a question mark.
-- Type classification (technical / STAR / architecture / trick) by keywords associated with each category.
-- Expected false positives in small talk — mitigate with an exclusion list of courtesy phrases ("¿cómo estás?", "¿me escuchas bien?").
+Heuristic rules, no LLM. Implemented at `src-tauri/src/classifier/mod.rs`:
+
+- **Question signal:** question mark (`?`) **OR** imperative verb near sentence start — "cuéntame", "dime", "descríbeme", "explícame", "camínenme por", "tell me", "describe", "explain", "walk me through", and variants. Leading filler words ("Bueno", "So") are tolerated.
+- **Exclusion list:** small talk phrases like "¿cómo estás?", "¿me escuchas bien?", "how are you?", "can you hear me?" → `None`.
+- **Type classification (Technical / STAR / Architecture / Trap):** keyword density scoring across four categories, each with ~20–40 keywords in Spanish and English:
+  - **Technical:** code, debug, API, database, algorithm, performance, concurrency, async, framework, "how did you implement", etc.
+  - **STAR:** leadership, team, conflict, situation, negotiation, collaboration, failure, "tell me about a time", "give me an example", etc.
+  - **Architecture:** scalability, design, pattern, microservices, event sourcing, hexagonal, DDD, coupling, distributed, high availability, etc.
+  - **Trap:** weakness, failure, worst, mistake, "what would you do differently", "why should we hire you", etc.
+- **Experience question heuristic:** If the text matches "cuéntame", "tell me about", "walk me through" (without "code"), "dime", etc., it defaults to STAR.
+- **Fallback:** Questions without any keyword match default to Technical.
+- **Tie-breaking:** Trap > Architecture > STAR > Technical when multiple categories have the same score.
+- **Bilingual:** All keyword lists and imperative triggers cover both Spanish and English.
 
 ## 8. Data model
 
@@ -132,14 +143,14 @@ settings(key, value)  -- includes retain_audio (bool, default false); does NOT i
 
 ## 10. Development plan (MVP)
 
-| Sprint | Objective | Deliverables | Status |
-|---|---|---|---|---|
-| 0 | Base infrastructure | Tauri + React project. Rust dependencies (`cpal`, `screencapturekit-rs`, `tauri`, `rusqlite`+`sqlite-vec`, `candle`). Complete SQLite schema (sessions, transcript_lines, documents, chunks, chunks_vec, settings) with migrations. sqlite-vec registered. Dual audio capture (mic cpal + loopback SCK) with WAV writing. `get_db_status` and `toggle_audio_capture` commands. 48+ tests. | ✅ **Completed** |
-| 1 | STT (Moonshine) | Moonshine integration on channel B. STTEngine trait + FFI engine (`libmoonshine.dylib`) + CLI fallback (`moonshine-voice transcribe`). Simple VAD (energy-based). Pipeline thread that receives audio from loopback, segments by VAD, transcribes, emits `new-transcript` event and persists in `transcript_lines`. | ✅ **Completed** |
-| 2 | RAG Engine | Local document indexing. sqlite-vec + candle generating and searching embeddings. Goal: query <20ms. | ✅ **Completed** |
-| 3 | Classifier & hints | Rules from §7 in Rust. 5-8 word hint generation. Tauri events to frontend. | ⬜ Not started |
-| 4 | Overlay & UI | Transparent window, always-on-top, click-through. Practice vs Shadow. Panic button. | ⬜ Not started |
-| 5 | Post-call & BYOK | SQLite export/query. External API call. Secure key storage in keychain. Analysis saving. | ⬜ Not started |
+| Sprint | Objective           | Deliverables                                                                                                                                                                                                                                                                                                                                                                              | Status           |
+| ------ | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- |
+| 0      | Base infrastructure | Tauri + React project. Rust dependencies (`cpal`, `screencapturekit-rs`, `tauri`, `rusqlite`+`sqlite-vec`, `candle`). Complete SQLite schema (sessions, transcript_lines, documents, chunks, chunks_vec, settings) with migrations. sqlite-vec registered. Dual audio capture (mic cpal + loopback SCK) with WAV writing. `get_db_status` and `toggle_audio_capture` commands. 48+ tests. | ✅ **Completed** |
+| 1      | STT (Moonshine)     | Moonshine integration on channel B. STTEngine trait + FFI engine (`libmoonshine.dylib`) + CLI fallback (`moonshine-voice transcribe`). Simple VAD (energy-based). Pipeline thread that receives audio from loopback, segments by VAD, transcribes, emits `new-transcript` event and persists in `transcript_lines`.                                                                       | ✅ **Completed** |
+| 2      | RAG Engine          | Local document indexing. sqlite-vec + candle generating and searching embeddings. Goal: query <20ms.                                                                                                                                                                                                                                                                                      | ✅ **Completed** |
+| 3 | Classifier & hints | Rules from §7 in Rust. `QuestionType` enum (Technical/STAR/Architecture/Trap/None) with heuristic + keyword-density scoring. `classify_text` Tauri command registered in invoke_handler. Classifier wired into STT pipeline — each transcribed line is classified and emits `question-detected` event (see `stt/pipeline.rs`). Hint generator pending. | ✅ **Completed** (48 tests) |
+| 4      | Overlay & UI        | Transparent window, always-on-top, click-through. Practice vs Shadow. Panic button.                                                                                                                                                                                                                                                                                                       | ⬜ Not started   |
+| 5      | Post-call & BYOK    | SQLite export/query. External API call. Secure key storage in keychain. Analysis saving.                                                                                                                                                                                                                                                                                                  | ⬜ Not started   |
 
 ## 11. Open Questions / risks
 

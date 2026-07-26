@@ -1,6 +1,6 @@
 # Kue — Technical Design
 
-> Current status: **Sprint 0–2 completed** (base infrastructure + dual audio capture + STT + RAG engine). This document describes the living architecture of the project, indicating which parts are implemented and which are planned.
+> Current status: **Sprint 0–3 completed** (base infrastructure + dual audio capture + STT + RAG engine + classifier). This document describes the living architecture of the project, indicating which parts are implemented and which are planned.
 
 ---
 
@@ -53,11 +53,15 @@ graph TD
         T[rag::indexer<br/>ingest / search / chunk / folder]
     end
 
-    subgraph "STT Module (implemented, not integrated in lifecycle)"
+    subgraph "STT Module (implemented, lifecycle-integrated)"
         Q1[stt::MoonshineFFIEngine<br/>libmoonshine.dylib via libloading]
         Q2[stt::MoonshineCLIEngine<br/>moonshine-voice CLI fallback]
         Q3[stt::SimpleVAD<br/>energy-based]
-        Q4[stt::STTPipeline<br/>thread loopback→VAD→STT→events→DB]
+        Q4[stt::STTPipeline<br/>thread VAD→STT→classify→events→DB]
+    end
+
+    subgraph "Classifier (implemented, lifecycle-integrated)"
+        CL1[classifier::classify_text<br/>heuristic + regex + Tauri cmd]
     end
 
     A -->|invoke| B1
@@ -75,6 +79,10 @@ graph TD
     E --> EM
     N --> P
     O --> P
+    O -->|audio samples| Q4
+    Q4 --> CL1
+    Q4 --> I
+    CL1 --> I
     G --> H
     G --> I
     G --> J
@@ -88,7 +96,7 @@ graph TD
     style A fill:#e1f5fe,stroke:#0288d1
 ```
 
-**Legend:** Solid line = implemented. Dashed line = planned/stub. The STT module is implemented and tested but not integrated into the app lifecycle (setup/invoke_handler).
+**Legend:** Solid line = implemented. The STT pipeline integrates classification (VAD → STT → classify → events → DB). The classifier is wired into the pipeline and also exposed as a Tauri command (`classify_text`).
 
 ---
 
@@ -102,13 +110,14 @@ graph TD
 
 ### 2.2 Tauri Shell (`lib.rs`)
 
-File `src-tauri/src/lib.rs` (~37 lines):
+File `src-tauri/src/lib.rs` (~40 lines):
 
 ```
 mod audio;
+mod classifier;
 mod db;
 mod rag;
-mod stt;      // STT module (Moonshine) — implemented and tested, pending integration into the setup lifecycle
+mod stt;      // STT module (Moonshine) — integrated into lifecycle via toggle_audio_capture
 mod types;
 
 run() {
@@ -134,17 +143,18 @@ run() {
             audio::capture::toggle_audio_capture,
             rag::indexer::index_folder_cmd,             // Indexes documents for RAG
             rag::indexer::search_context,               // Vector search
+            classifier::classify_text,                  // Question classification
         ])
         .run(tauri::generate_context!())
 }
 ```
 
-- **`mod audio`**, **`mod db`**, **`mod rag`**, **`mod stt`**, **`mod types`** — Backend submodules.
+- **`mod audio`**, **`mod classifier`**, **`mod db`**, **`mod rag`**, **`mod stt`**, **`mod types`** — Backend submodules.
 - **`cleanup_orphaned_temp_dirs()`** — Removes temporary `kue-session-*` directories left by crashed sessions.
 - **`plugin(tauri_plugin_shell)`** — Necessary to invoke external processes (planned for BYOK).
 - **`app.manage(database)`**, **`app.manage(AudioCapture)`**, **`app.manage(Mutex<EmbeddingModel>)`** — Injects `Database`, `AudioCapture` and the embeddings model as Tauri state.
-- **`index_folder_cmd`** and **`search_context`** — Tauri commands for the RAG engine.
-- **Note:** STT (`mod stt`) is implemented and tested (STTPipeline, MoonshineFFIEngine, MoonshineCLIEngine, SimpleVAD) but is not yet integrated into `setup` — no pipeline thread is spawned nor Tauri commands registered for it. Full integration will require connecting the audio loopback to the STT pipeline, registering `start_session`/`stop_session` commands, and emitting `new-transcript` events to the frontend.
+- **`index_folder_cmd`**, **`search_context`**, and **`classify_text`** — Tauri commands for RAG and classifier.
+- **STT integration:** The STT pipeline is fully integrated into `toggle_audio_capture`. When `start=true`, the command creates a DB session, spawns an `STTPipeline` thread that consumes audio from the loopback channel, performs VAD → STT → classify → events → persistence. The `new-transcript` and `question-detected` events are emitted to the frontend.
 
 ### 2.3 Database Module (`db/mod.rs`)
 
@@ -161,19 +171,28 @@ Substantial module (~1230 lines, 50 tests) that implements dual audio capture:
 - **`toggle_audio_capture` command:** Tauri command that starts/stops both captures, validating mode (`practice`|`shadow`) against the DB CHECK constraint.
 - **51 tests:** cover f32→i16 conversion (edge cases: NaN, infinity, clamping, very small values), state serialization (4 combinations), directory creation, path format, invalid mode (multiple variants), toggle (4 paths), WAV writer (creation, multiple buffers, invalid path, empty buffer, cyclic lifecycle), and consistency between mode validation and DB.
 
-### 2.5 STT Module (`stt/`)
+### 2.5 STT + Classifier Module (`stt/`, `classifier/`)
 
-Module (~630 lines, 81 tests) that implements real-time transcription of Channel B. The module code is complete and tested, but **is not integrated into the app lifecycle** — no STTPipeline is spawned in `setup()` nor are Tauri commands registered for STT sessions. Integration will require connecting the loopback audio to the pipeline, registering `start_session`/`stop_session` commands, and emitting `new-transcript` events:
+**STT Module (`stt/`, ~630 lines, 81 tests)** — implements real-time transcription of Channel B, integrated into the app lifecycle via `toggle_audio_capture`:
 
 - **`stt/mod.rs`** — `STTEngine` trait with `load()` and `transcribe_audio_chunk()`, `STTConfig`, blanket impl for `Box<T>`.
 - **`stt/ffi.rs`** — `MoonshineFFIEngine`: loads `libmoonshine.dylib` at runtime via `libloading`, declares FFI bindings with `#[repr(C)]` for `CTranscript`, `CTranscriptLine`, etc. Calls the Moonshine streaming API: `create_stream` → `start_stream` → `add_audio_to_stream` → `transcribe_stream`. Frees resources in `Drop`.
 - **`stt/cli.rs`** — `MoonshineCLIEngine` (fallback): writes WAV segments to temp with UUID, invokes `moonshine-voice transcribe --wav-path <file>` as a subprocess, parses the last line of output.
 - **`stt/vad.rs`** — `SimpleVAD`: voice activity detection by RMS energy with configurable threshold, minimum speech duration, and silence timeout.
-- **`stt/pipeline.rs`** — `STTPipeline`: orchestrator that receives audio from loopback via `mpsc::Receiver`, runs VAD + segment buffer + STT engine + emits `new-transcript` event (with `types::TranscriptLine`) + persists in `transcript_lines`.
+- **`stt/pipeline.rs`** — `STTPipeline`: orchestrator that receives audio from loopback via `mpsc::Receiver`, runs VAD + segment buffer + STT engine + calls `classifier::classify()` on each transcribed line + emits `new-transcript` and `question-detected` events + persists in `transcript_lines`.
+
+**Lifecycle integration:** When `toggle_audio_capture` is called with `start=true`, the command creates a DB session (in `sessions` table), spawns an `STTPipeline` thread via `spawn_processing_thread()`, and connects it to the loopback audio stream. The pipeline runs until `stop()` is called, at which point the session is finalized and temp WAV files are cleaned up (or retained if `retain_audio` is enabled).
 
 **Auto-detection:** At runtime, tries FFI first (`libmoonshine.dylib` in `MOONSHINE_LIB_DIR` or standard paths), falls back to CLI if the library is not found. No Whisper — Moonshine is the only option.
 
 **81 tests:** cover `parse_transcript` (null ptr, 0 lines, completed/incomplete, empty text, preferred line), `rms` (8 cases), VAD (15+ cases: silence, speech, timeout, reset, minimum duration, empty, threshold, boundary, accumulation, reset during speech, etc.), temp WAV writing (3 cases: data, empty, unique names), `STTPipeline` (engine selection, load delegation, start/end session, process chunk, flush segment, DB persistence, poisoned mutex, special characters, multiple lines).
+
+**Classifier Module (`classifier/mod.rs`, 48 tests)** — heuristics-based question classifier, no LLM:
+
+- **`classifier::classify()`** — pure function that receives text and returns `QuestionType` (Technical, Star, Architecture, Trap, None).
+- **`classifier::classify_text`** — Tauri command wrapper exposing classification to the frontend.
+- **Detection:** question mark (`?`) OR imperative verb triggers (bilingual EN/ES), exclusion list for small talk, 4 keyword lists (40-80 terms each) for type classification, tie-breaking (Trap > Architecture > Star > Technical), experience question heuristic, and zero-score fallback.
+- **Integration:** Called from `STTPipeline::flush_segment()` — each transcribed line is classified, and if not `None`, a `question-detected` event is emitted. Also registered as a standalone Tauri command for direct frontend use.
 
 ### 2.6 Configuration
 
@@ -273,8 +292,8 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 | Loopback capture (SCK)  | **Implemented**  | `screencapturekit` (active)                                                           | `audio/capture.rs`                  |
 | WAV writing (hound)     | **Implemented**  | `hound` (active)                                                                      | `audio/capture.rs`                  |
 | RAG embeddings + indexer | **Implemented**  | `candle-core`, `candle-nn`, `candle-transformers`, `hf-hub`, `tokenizers`, `bytemuck` | `rag/embeddings.rs`, `rag/indexer.rs` |
-| STT (Moonshine)         | **Implemented** (not integrated in lifecycle) | `libloading` (dynamically loaded `libmoonshine.dylib`), `uuid`                       | `stt/mod.rs`, `stt/ffi.rs`, `stt/cli.rs`, `stt/vad.rs`, `stt/pipeline.rs` |
-| Question classifier     | **Not started**  | —                                                                                     | —                                    |
+| STT (Moonshine)         | **Implemented** (integrated in lifecycle via `toggle_audio_capture`) | `libloading` (dynamically loaded `libmoonshine.dylib`), `uuid`                       | `stt/mod.rs`, `stt/ffi.rs`, `stt/cli.rs`, `stt/vad.rs`, `stt/pipeline.rs` |
+| Question classifier     | **Implemented** (integrated in STT pipeline, standalone Tauri cmd) | —                                                                                     | `classifier/mod.rs`                  |
 | Hint generator          | **Not started**  | —                                                                                     | —                                    |
 | Overlay / real UI       | **Not started**  | —                                                                                     | —                                    |
 | Post-call BYOK          | **Not started**  | `tauri-plugin-shell` present                                                          | —                                    |
@@ -294,6 +313,8 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 - **Session-scoped temp dirs:** Capture WAVs are written to `temp_dir()/kue-session-{timestamp}/`, streamed by Moonshine and deleted at session end. The `settings` table with `retain_audio` (opt-in, default `false`) controls persistence. `cleanup_orphaned_temp_dirs()` in `lib.rs` cleans orphan directories from crashed sessions.
 - **Safe Send wrappers:** `MicHandle` and `LoopbackHandle` manually implement `Send` for `cpal::Stream` and `SCStream`, justified with safety comments by ownership invariant.
 - **FFI auto-detection pattern:** `MoonshineFFIEngine::is_available()` checks for `libmoonshine.dylib` at runtime; if not available, falls back to `MoonshineCLIEngine` without user intervention.
+- **Pipeline-integrated classification:** The classifier is not a separate service — it's called inline from `STTPipeline::flush_segment()` after each transcription, emitting a `question-detected` event if the text is a recognized question type.
+- **Pure function with Tauri wrapper (classifier):** `classify()` is a pure `fn(&str) -> QuestionType` (testable without Tauri), while `classify_text()` is a thin `#[tauri::command]` wrapper exposing it over IPC.
 
 ---
 

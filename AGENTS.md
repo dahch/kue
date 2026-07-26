@@ -1,10 +1,10 @@
 # Kue — OpenCode Agents
 
-No hay agentes de OpenCode configurados actualmente en `.opencode/agents/`.
+No OpenCode agents are currently configured in `.opencode/agents/`.
 
-El proyecto no tiene flujos de automatización propios más allá de los skills instalados globalmente (listados en `skills-lock.json`):
+The project has no custom automation flows beyond globally installed skills (listed in `skills-lock.json`):
 
-| Skill | Fuente |
+| Skill | Source |
 |---|---|
 | accessibility | addyosmani/web-quality-skills |
 | composition-patterns | vercel-labs/agent-skills |
@@ -18,4 +18,4 @@ El proyecto no tiene flujos de automatización propios más allá de los skills 
 | typescript-advanced-types | wshobson/agents |
 | vite | antfu/skills |
 
-Para crear un nuevo agente, agrega un archivo `.opencode/agents/<nombre>/AGENT.md` siguiendo la [especificación de OpenCode](https://github.com/opencode-ai/agents).
+To create a new agent, add a `.opencode/agents/<name>/AGENT.md` file following the [OpenCode agent specification](https://github.com/opencode-ai/agents).
