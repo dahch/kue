@@ -265,18 +265,6 @@ impl AudioCapture {
         }
     }
 
-    pub fn toggle(
-        &self,
-        start: bool,
-        mode: &str,
-    ) -> Result<(AudioCaptureStatus, Option<std::sync::mpsc::Receiver<Vec<i16>>>), AudioError> {
-        if start {
-            let (status, rx) = self.start(mode)?;
-            Ok((status, Some(rx)))
-        } else {
-            Ok((self.stop(), None))
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,61 +1053,6 @@ mod tests {
                     // Must be a hardware error, not an InvalidMode error.
                     assert!(!matches!(e, AudioError::InvalidMode(_)));
                 }
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // toggle() — routes to start/stop correctly
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn audio_capture_toggle_stop_returns_inactive_status() {
-        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test"));
-        let (status, _) = cap.toggle(false, "practice").unwrap();
-        assert!(!status.mic_active);
-        assert!(!status.loopback_active);
-    }
-
-    #[test]
-    fn audio_capture_toggle_stop_ignores_mode() {
-        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test"));
-        // Even with an invalid mode, toggle(start=false) should succeed
-        // because it delegates to stop(), which ignores mode.
-        let (status, _) = cap.toggle(false, "INVALID_MODE_THAT_STOP_IGNORES").unwrap();
-        assert!(!status.mic_active);
-        assert!(!status.loopback_active);
-    }
-
-    #[test]
-    fn audio_capture_toggle_start_validates_mode_before_hardware() {
-        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test"));
-        let err = cap.toggle(true, "invalid").unwrap_err();
-        assert!(matches!(err, AudioError::InvalidMode(_)));
-    }
-
-    #[test]
-    fn audio_capture_toggle_start_empty_mode() {
-        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test"));
-        let err = cap.toggle(true, "").unwrap_err();
-        assert!(matches!(err, AudioError::InvalidMode(_)));
-    }
-
-    /// Like `audio_capture_start_valid_modes_hardware` — requires real hardware.
-    #[test]
-    #[ignore = "requires real audio hardware; may block on some systems"]
-    fn audio_capture_toggle_start_delegates_to_start() {
-        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test"));
-        let result = cap.toggle(true, "practice");
-        match result {
-            Ok((status, _)) => {
-                assert!(status.mic_active);
-                assert!(status.loopback_active);
-                cap.stop();
-            }
-            Err(e) => {
-                // Must be a hardware error, not an InvalidMode error.
-                assert!(!matches!(e, AudioError::InvalidMode(_)));
             }
         }
     }
