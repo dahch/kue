@@ -161,6 +161,93 @@ pub fn get_db_status(db: tauri::State<'_, Database>) -> Result<DbStatus, String>
     get_db_status_inner(db.inner())
 }
 
+#[derive(Debug, Serialize)]
+pub struct SessionRow {
+    pub id: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub company: String,
+    pub role: String,
+    pub mode: String,
+    pub line_count: i64,
+}
+
+#[tauri::command]
+pub fn get_sessions(db: tauri::State<'_, Database>) -> Result<Vec<SessionRow>, String> {
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.id, s.started_at, s.ended_at, s.company, s.role, s.mode,
+                    (SELECT COUNT(*) FROM transcript_lines WHERE session_id = s.id) as line_count
+             FROM sessions s
+             ORDER BY s.started_at DESC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SessionRow {
+                id: row.get(0)?,
+                started_at: row.get::<_, String>(1)?,
+                ended_at: row.get(2)?,
+                company: row.get::<_, String>(3)?,
+                role: row.get::<_, String>(4)?,
+                mode: row.get::<_, String>(5)?,
+                line_count: row.get(6)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut sessions = Vec::new();
+    for row in rows {
+        sessions.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(sessions)
+}
+
+#[derive(Debug, Serialize)]
+pub struct TranscriptLineRow {
+    pub id: i64,
+    pub speaker: String,
+    pub text: String,
+    pub started_at_ms: u64,
+    pub ended_at_ms: u64,
+}
+
+#[tauri::command]
+pub fn get_session_transcript(
+    session_id: String,
+    db: tauri::State<'_, Database>,
+) -> Result<Vec<TranscriptLineRow>, String> {
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, speaker, text, started_at_ms, ended_at_ms
+             FROM transcript_lines
+             WHERE session_id = ?1
+             ORDER BY started_at_ms ASC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok(TranscriptLineRow {
+                id: row.get(0)?,
+                speaker: row.get(1)?,
+                text: row.get(2)?,
+                started_at_ms: row.get(3)?,
+                ended_at_ms: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut lines = Vec::new();
+    for row in rows {
+        lines.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(lines)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -844,5 +931,255 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1, "should allow NULL tag and metric");
+    }
+
+    // -----------------------------------------------------------------------
+    // get_session_transcript — integration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_session_transcript_empty_session() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("test.db");
+        let db = open_and_migrate_with_vec(&db_path).unwrap();
+
+        // No sessions at all → empty vec
+        let session_id = "nonexistent";
+        let conn = db.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, speaker, text, started_at_ms, ended_at_ms
+                 FROM transcript_lines
+                 WHERE session_id = ?1
+                 ORDER BY started_at_ms ASC",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params![session_id], |row| {
+                Ok(TranscriptLineRow {
+                    id: row.get(0)?,
+                    speaker: row.get(1)?,
+                    text: row.get(2)?,
+                    started_at_ms: row.get(3)?,
+                    ended_at_ms: row.get(4)?,
+                })
+            })
+            .unwrap();
+        let lines: Vec<TranscriptLineRow> = rows.filter_map(|r| r.ok()).collect();
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn get_session_transcript_with_lines() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("test.db");
+        let db = open_and_migrate_with_vec(&db_path).unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, company, role, mode) VALUES ('sess-t1', 'Acme', 'Dev', 'practice')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO transcript_lines (session_id, speaker, text, started_at_ms, ended_at_ms)
+             VALUES ('sess-t1', 'interviewer', 'Hello?', 0, 1000)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO transcript_lines (session_id, speaker, text, started_at_ms, ended_at_ms)
+             VALUES ('sess-t1', 'user', 'Yes, I am here', 1000, 3000)",
+            [],
+        ).unwrap();
+        drop(conn);
+
+        let guard = db.conn.lock().unwrap();
+        let mut stmt = guard.prepare(
+            "SELECT id, speaker, text, started_at_ms, ended_at_ms
+             FROM transcript_lines
+             WHERE session_id = ?1
+             ORDER BY started_at_ms ASC",
+        ).unwrap();
+        let lines: Vec<TranscriptLineRow> = stmt
+            .query_map(rusqlite::params!["sess-t1"], |row| {
+                Ok(TranscriptLineRow {
+                    id: row.get(0)?,
+                    speaker: row.get(1)?,
+                    text: row.get(2)?,
+                    started_at_ms: row.get(3)?,
+                    ended_at_ms: row.get(4)?,
+                })
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].speaker, "interviewer");
+        assert_eq!(lines[1].speaker, "user");
+        assert!(lines[1].started_at_ms > lines[0].started_at_ms);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_sessions — integration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_sessions_returns_all_sessions() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("test.db");
+        let db = open_and_migrate_with_vec(&db_path).unwrap();
+
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, company, role, mode) VALUES ('s1', 'Acme', 'Dev', 'practice')",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, company, role, mode) VALUES ('s2', 'Globex', 'Sr Eng', 'shadow')",
+                [],
+            ).unwrap();
+            // Add a transcript line to s2 so line_count = 1
+            conn.execute(
+                "INSERT INTO transcript_lines (session_id, speaker, text, started_at_ms, ended_at_ms)
+                 VALUES ('s2', 'interviewer', 'Q?', 0, 100)",
+                [],
+            ).unwrap();
+        }
+
+        let conn = db.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.started_at, s.ended_at, s.company, s.role, s.mode,
+                    (SELECT COUNT(*) FROM transcript_lines WHERE session_id = s.id) as line_count
+             FROM sessions s
+             ORDER BY s.started_at DESC",
+        ).unwrap();
+        let sessions: Vec<SessionRow> = stmt
+            .query_map([], |row| {
+                Ok(SessionRow {
+                    id: row.get(0)?,
+                    started_at: row.get::<_, String>(1)?,
+                    ended_at: row.get(2)?,
+                    company: row.get::<_, String>(3)?,
+                    role: row.get::<_, String>(4)?,
+                    mode: row.get::<_, String>(5)?,
+                    line_count: row.get(6)?,
+                })
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(sessions.len(), 2);
+        for s in &sessions {
+            if s.id == "s1" {
+                assert_eq!(s.company, "Acme");
+                assert_eq!(s.line_count, 0);
+            } else if s.id == "s2" {
+                assert_eq!(s.mode, "shadow");
+                assert_eq!(s.line_count, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn get_sessions_returns_empty_when_no_sessions() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("test.db");
+        let db = open_and_migrate_with_vec(&db_path).unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.started_at, s.ended_at, s.company, s.role, s.mode,
+                    (SELECT COUNT(*) FROM transcript_lines WHERE session_id = s.id) as line_count
+             FROM sessions s
+             ORDER BY s.started_at DESC",
+        ).unwrap();
+        let sessions: Vec<SessionRow> = stmt
+            .query_map([], |row| {
+                Ok(SessionRow {
+                    id: row.get(0)?,
+                    started_at: row.get::<_, String>(1)?,
+                    ended_at: row.get(2)?,
+                    company: row.get::<_, String>(3)?,
+                    role: row.get::<_, String>(4)?,
+                    mode: row.get::<_, String>(5)?,
+                    line_count: row.get(6)?,
+                })
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(sessions.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema invariants: session id format
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_id_auto_generates_hex_id() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("test.db");
+        let db = open_and_migrate_with_vec(&db_path).unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sessions (company, role, mode) VALUES ('Test', 'Eng', 'practice')",
+            [],
+        ).unwrap();
+        let id: String = conn
+            .query_row("SELECT id FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        // id is hex(randomblob(16)) → 32 hex chars
+        assert_eq!(id.len(), 32, "auto-generated id should be 32 hex chars");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "id should be hex");
+    }
+
+    // -----------------------------------------------------------------------
+    // Database struct edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn database_clone_creates_new_connection() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("test_clone.db");
+        let db1 = open_and_migrate_with_vec(&db_path).unwrap();
+        let db2 = Database::clone(&db1);
+
+        // Both should point to the same file
+        assert_eq!(db1.path, db2.path);
+
+        // Both connections should be independently usable
+        {
+            let conn = db1.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sessions (company, role, mode) VALUES ('C1', 'R1', 'practice')",
+                [],
+            ).unwrap();
+        }
+        {
+            let conn = db2.conn.lock().unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 1, "clone should see the same data via WAL/file");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // DbStatus serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn db_status_serialization() {
+        let status = DbStatus {
+            path: "/tmp/test.db".into(),
+            tables: vec!["sessions".into(), "chunks".into()],
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains(r#""path":"#));
+        assert!(json.contains(r#""tables":"#));
+        assert!(json.contains(r#""sessions""#));
+        assert!(json.contains(r#""chunks""#));
     }
 }
