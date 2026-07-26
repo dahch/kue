@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import Onboarding from "./Onboarding";
 import Overlay from "./Overlay";
 import ProvisioningProgress from "./ProvisioningProgress";
 
@@ -572,8 +573,24 @@ function MainApp() {
 
 function App() {
   const [isOverlay, setIsOverlay] = useState(false);
-  const [showMain, setShowMain] = useState(false);
-  const handleProvisioned = useCallback(() => setShowMain(true), []);
+  const [showProvisioning, setShowProvisioning] = useState(true);
+  const [showOnboarding, setShowOnboarding] = useState(false);
+
+  const handleProvisioned = useCallback(async () => {
+    try {
+      const firstRun: boolean = await invoke("is_first_run");
+      if (firstRun) {
+        setShowOnboarding(true);
+      }
+    } catch (e) {
+      console.error("is_first_run check failed, skipping onboarding:", e);
+    }
+    setShowProvisioning(false);
+  }, []);
+
+  const handleOnboardingComplete = useCallback(() => {
+    setShowOnboarding(false);
+  }, []);
 
   useEffect(() => {
     const win = getCurrentWebviewWindow();
@@ -586,8 +603,12 @@ function App() {
     return <Overlay />;
   }
 
-  if (!showMain) {
+  if (showProvisioning) {
     return <ProvisioningProgress onProvisioned={handleProvisioned} />;
+  }
+
+  if (showOnboarding) {
+    return <Onboarding onComplete={handleOnboardingComplete} />;
   }
 
   return <MainApp />;

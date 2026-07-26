@@ -9,6 +9,7 @@ mod classifier;
 mod db;
 mod keys;
 mod logging;
+mod onboarding;
 mod orchestrator;
 mod overlay;
 mod rag;
@@ -115,6 +116,10 @@ pub fn run() {
             analyze::analyze_session,
             stt::provisioning::is_moonshine_provisioned,
             stt::provisioning::retry_moonshine_download,
+            onboarding::is_first_run,
+            onboarding::mark_onboarding_done,
+            onboarding::check_screen_recording_permission,
+            onboarding::is_embedding_model_loaded,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

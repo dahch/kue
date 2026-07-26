@@ -7,6 +7,9 @@ use tauri::Manager;
 
 use crate::rag::embeddings::EMBEDDING_DIM;
 
+pub const SETTING_FIRST_RUN: &str = "first_run";
+pub const SETTING_RETAIN_AUDIO: &str = "retain_audio";
+
 pub struct Database {
     pub conn: Mutex<Connection>,
     pub path: PathBuf,
@@ -113,8 +116,12 @@ pub fn open_and_migrate(db_path: &Path) -> Result<Database, Box<dyn std::error::
 
     // Seed default settings
     conn.execute(
-        "INSERT OR IGNORE INTO settings (key, value) VALUES ('retain_audio', 'false')",
-        [],
+        "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, 'false')",
+        [SETTING_RETAIN_AUDIO],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, 'pending')",
+        [SETTING_FIRST_RUN],
     )?;
 
     Ok(Database {
@@ -871,7 +878,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 3, "should support multiple settings (including retain_audio default)");
+        assert_eq!(count, 4, "should support multiple settings (retain_audio + first_run defaults)");
     }
 
     #[test]
