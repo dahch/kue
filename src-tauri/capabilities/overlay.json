@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "overlay",
+  "description": "Minimal capability for the hint overlay window",
+  "windows": ["overlay"],
+  "permissions": [
+    "core:default"
+  ]
+}

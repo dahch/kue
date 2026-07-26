@@ -12,11 +12,23 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Kue",
         "width": 800,
         "height": 600,
         "resizable": true,
         "fullscreen": false
+      },
+      {
+        "label": "overlay",
+        "title": "",
+        "visible": false,
+        "decorations": false,
+        "transparent": true,
+        "always-on-top": true,
+        "skip-taskbar": true,
+        "width": 400,
+        "height": 100
       }
     ],
     "security": {

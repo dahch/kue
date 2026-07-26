@@ -6,6 +6,7 @@ mod audio;
 mod classifier;
 mod db;
 mod orchestrator;
+mod overlay;
 mod rag;
 mod stt;
 mod types;
@@ -20,6 +21,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
+            // Configure overlay window for click-through behavior
+            if let Some(overlay) = app.get_webview_window("overlay") {
+                let _ = overlay.set_ignore_cursor_events(true);
+            }
+
             let database = db::init_db(app)?;
             app.manage(database);
 
@@ -55,6 +61,7 @@ pub fn run() {
             rag::indexer::index_folder_cmd,
             rag::indexer::search_context,
             classifier::classify_text,
+            overlay::show_overlay,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
