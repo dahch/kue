@@ -4,7 +4,7 @@
 
 Desktop application (macOS, Tauri v2) with real-time transcription, local RAG over your CV/projects, and ultra-short hints to maintain fluency under pressure. Post-call, optional analysis with your own LLM (BYOK).
 
-**Current status:** Sprints 0–3 completed, Sprint 4 (overlay) partially implemented — base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline) integrated into the app lifecycle, question classifier (heuristics + regex) wired into the STT pipeline, orchestrator (HintScheduler + hint worker) producing hints from classifier+RAG, overlay window (transparent, always-on-top, click-through) with hint display component, and mic VAD for Shadow-mode hint cancellation. All implemented and tested (+400 tests in Rust). The remaining work (Panic button, mode selection UI, post-call analysis) is in Sprint 4–5 (see `spec.md`).
+**Current status:** Sprints 0–3 completed, Sprint 4 (overlay) nearly complete, Sprint 5 (post-call) next. All core modules are implemented and tested: base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline + batch transcription for Channel A), question classifier (heuristics + regex) wired into the STT pipeline, orchestrator (HintScheduler + hint worker) producing hints from classifier+RAG, overlay window (transparent, always-on-top, click-through, 400×100) with hint display component (3s auto-dismiss via React `Overlay` component), mic VAD for Shadow-mode hint cancellation, and Channel A batch transcription at session end (ADR-015). All implemented and tested (>400 tests in Rust). Remaining work for v1: Panic button, mode selection UI, hint positioning (Sprint 4), and post-call BYOK analysis (Sprint 5) — see `spec.md`.
 
 ---
 
@@ -35,7 +35,7 @@ The app will open a window with debug controls to index folders (RAG) and search
 # Rust tests (database — all logic implemented)
 npm run test:rust:db
 
-# Rust tests (all modules, >300 tests)
+# Rust tests (all modules, >400 tests)
 npm run test:rust
 
 # Rust coverage (requires cargo-tarpaulin)
@@ -106,6 +106,9 @@ npm run coverage:rust:full
 │                 │  │  - stt::pipeline          │ │    │
 │                 │  │    (VAD→STT→classify→     │ │    │
 │                 │  │     events→DB)            │ │    │
+│                 │  │  - stt::batch             │ │    │
+│                 │  │    (post-session Ch. A    │ │    │
+│                 │  │     VAD+STT, speaker=user)│ │    │
 │                 │  └───────────────────────────┘ │    │
 │                 │  ┌───────────────────────────┐ │    │
 │                 │  │  Orchestrator              │ │    │
@@ -128,7 +131,7 @@ npm run coverage:rust:full
 └────────────────────────────────────────────────────────┘
 ```
 
-**Legend:** All listed code is functional and tested. `candle` implements BERT embeddings (`snowflake-arctic-embed-s`) in the `rag::embeddings` module, and `sqlite-vec` performs KNN vector search. The STT pipeline integrates Moonshine (FFI + CLI fallback), VAD, classification, DB persistence, and pushes hint jobs to the orchestrator. The classifier module uses heuristic rules (regex + keyword density) to categorize questions. The orchestrator module stitches classifier + RAG → hints (immediate in Practice, delayed in Shadow) via a dedicated worker thread; in Shadow mode, hints are gated by `audio::mic_vad::MicVadState` — if the user starts speaking on Channel A before the 2.5s delay expires, the hint is silently cancelled. The overlay window (transparent, always-on-top, click-through, 400×100) displays hints via an `Overlay` React component that listens for `new-hint` Tauri events and auto-dismisses after 3s.
+**Legend:** All listed code is functional and tested. `candle` implements BERT embeddings (`snowflake-arctic-embed-s`) in the `rag::embeddings` module, and `sqlite-vec` performs KNN vector search. The STT pipeline integrates Moonshine (FFI + CLI fallback), VAD, classification, DB persistence, and pushes hint jobs to the orchestrator. The classifier module uses heuristic rules (regex + keyword density) to categorize questions. The orchestrator module stitches classifier + RAG → hints (immediate in Practice, delayed in Shadow) via a dedicated worker thread; in Shadow mode, hints are gated by `audio::mic_vad::MicVadState` — if the user starts speaking on Channel A before the 2.5s delay expires, the hint is silently cancelled. At session end, Channel A (mic) audio is batch-transcribed via Moonshine + SimpleVAD in a dedicated thread (`kue-batch-transcribe`) and persisted with `speaker='user'` (ADR-015). The overlay window (transparent, always-on-top, click-through, 400×100) displays hints via an `Overlay` React component that listens for `new-hint` Tauri events and auto-dismisses after 3s.
 
 ## Stack
 
@@ -138,7 +141,7 @@ npm run coverage:rust:full
 | App Core | Rust (Tauri v2) |
 | Database | SQLite + sqlite-vec (vectors) |
 | Audio | cpal (mic) + screencapturekit-rs (loopback) + hound (WAV) |
-| STT + Classifier | Moonshine (FFI + CLI fallback) + heuristics/regex classifier |
+| STT + Classifier | Moonshine (FFI + CLI fallback) + heuristics/regex classifier + batch transcription (Ch. A) |
 | Hint Engine | orchestrator module (HintScheduler + hint worker thread) |
 | Embeddings | candle (HuggingFace Rust) + `snowflake-arctic-embed-s` |
 | Overlay Window | Tauri v2 multi-window (transparent, click-through, always-on-top) |
@@ -183,7 +186,8 @@ kue/
 │   │   │   ├── ffi.rs       # MoonshineFFIEngine (libmoonshine.dylib via libloading)
 │   │   │   ├── cli.rs       # MoonshineCLIEngine (fallback to moonshine-voice CLI)
 │   │   │   ├── vad.rs       # SimpleVAD (energy-based)
-│   │   │   └── pipeline.rs  # STTPipeline (thread loopback→VAD→STT→events→DB)
+│   │   │   ├── pipeline.rs  # STTPipeline (thread loopback→VAD→STT→events→DB)
+│   │   │   └── batch.rs     # Channel A batch transcription (VAD+STT, post-session)
 │   │   └── rag/
 │   │       ├── mod.rs       # Re-export of embeddings and indexer
 │   │       ├── embeddings.rs # BERT model (snowflake-arctic-embed-s), embedding generation

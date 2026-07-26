@@ -206,3 +206,26 @@
 - **Inline generation in the pipeline thread** (simpler but blocks the audio loop for 5–20ms per RAG query — risk of audio buffer underruns at high question frequency).
 - **Per-hint timers (`std::thread::sleep` + `Instant`)** in the pipeline or separate threads (scales poorly with question count; cancellation requires complex `Arc<AtomicBool>` flags; testing requires real time).
 - **`tokio::spawn` + `tokio::time::delay`** (would introduce async runtime dependency just for this feature; increases compilation time and binary size).
+
+---
+
+### ADR-015: Channel A is batch-transcribed at session end, not in streaming
+
+**Date:** 2026-07-26
+
+**Status:** Accepted
+
+**Context:** ADR-004 correctly decided that real-time STT only applies to Channel B, because no component of the hint pipeline (classifier, orchestrator, overlay) needs to transcribe the user's voice. But that decision left `Speaker::User` as dead code — the final transcript never captures the user's answers, which prevents post-call analysis (Sprint 5) from evaluating actual response quality, since it only records the interviewer's questions.
+
+**Decision:** At session end (`stop_session`), before applying the audio retention policy (ADR-011), a batch transcription of the Channel A WAV runs using the same Moonshine engine and `SimpleVAD` already used for Channel B, but without any connection to the classifier or orchestrator — only VAD segmentation + transcription + persistence in `transcript_lines` with `speaker='user'`. There is no latency constraint because the session is already over.
+
+The transcription runs in a separate thread (`kue-batch-transcribe`) so as not to block the Tauri `stop_session` command. The batch thread takes ownership of the temp `session_dir` and applies the retention policy (ADR-011) on completion — ensuring the WAV is not deleted before it is transcribed. On completion, it emits a `post-call-transcript-ready` event with the `session_id` so the frontend can reflect the state if needed.
+
+**Consequences:**
+- *(Positive)* The complete transcript (both speakers) is available for post-call, fulfilling what spec §2 promises. No additional CPU cost during the live call — the highest-load moment (STT + RAG + overlay running live) is not affected.
+- *(Negative)* The user response transcript is not available until batch processing finishes (a few seconds after session end, depending on duration) — it's not instant like Channel B.
+- *(Negative)* Reading the entire WAV into memory for VAD segmentation can consume several MB for long sessions — acceptable because it happens in a separate post-session thread, not during live capture.
+
+**Alternatives considered:**
+- **Live streaming of Channel A** in parallel with Channel B (doubles CPU/Moonshine usage during the live call, with no functional benefit since nothing consumes that transcription in real time).
+- **Keep the current scope** without transcribing Channel A (rejected because it would prevent post-call from fulfilling its purpose — without user answers the LLM cannot evaluate STAR structure or response quality).

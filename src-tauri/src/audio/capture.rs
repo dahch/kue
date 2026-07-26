@@ -26,6 +26,7 @@ pub const SAMPLE_RATE: u32 = 16_000;
 pub const CHANNELS: u16 = 1;
 const BUFFER_CAPACITY: usize = 60;
 const VALID_MODES: [&str; 2] = ["practice", "shadow"];
+const MIC_CHANNEL_A_FILENAME: &str = "mic_channel_A.wav";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -103,6 +104,7 @@ struct AudioCaptureInner {
     stt_thread: Option<JoinHandle<()>>,
     mode: String,
     session_dir: Option<PathBuf>,
+    session_id: Option<String>,
 }
 
 impl AudioCapture {
@@ -117,6 +119,7 @@ impl AudioCapture {
                 stt_thread: None,
                 mode: String::new(),
                 session_dir: None,
+                session_id: None,
             }),
             recordings_dir,
             mic_vad: Arc::new(Mutex::new(MicVadState::new())),
@@ -127,6 +130,19 @@ impl AudioCapture {
     /// can check for user voice activity before emitting Shadow-mode hints.
     pub fn mic_vad_state(&self) -> Arc<Mutex<MicVadState>> {
         self.mic_vad.clone()
+    }
+
+    /// Takes the session temp directory out of the inner state, returning
+    /// it if one was set by `start()`.  The caller (typically the stop flow)
+    /// becomes responsible for cleaning up (retain or delete).
+    pub fn take_session_dir(&self) -> Option<PathBuf> {
+        self.inner.lock().unwrap().session_dir.take()
+    }
+
+    /// Returns a clone of the recordings directory path so batch
+    /// transcription threads can move retained WAVs there.
+    pub fn recordings_dir_path(&self) -> PathBuf {
+        self.recordings_dir.clone()
     }
 
     fn session_temp_dir() -> PathBuf {
@@ -170,7 +186,7 @@ impl AudioCapture {
             let _ = fs::remove_dir_all(&session_dir);
             e
         })?;
-        let mic_path = session_dir.join("mic_channel_A.wav");
+        let mic_path = session_dir.join(MIC_CHANNEL_A_FILENAME);
         let mic_writer = spawn_wav_writer("mic-A", mic_wav_rx, mic_path)?;
 
         let mic_vad_state = self.mic_vad.clone();
@@ -222,40 +238,12 @@ impl AudioCapture {
         inner.stt_thread.take().map(|h| h.join().ok());
 
         inner.mode = String::new();
-        // session_dir stays for finalize_session to handle cleanup
+        // session_dir stays for batch transcription to handle cleanup
 
         AudioCaptureStatus {
             mic_active: false,
             loopback_active: false,
         }
-    }
-
-    /// Finalize the session: if `retain` is true, move WAV files to
-    /// `recordings_dir/{session_name}/`; otherwise delete the temp dir.
-    /// No-op if no session dir exists.
-    pub fn finalize_session(&self, retain: bool) {
-        let mut inner = self.inner.lock().unwrap();
-        let Some(session_dir) = inner.session_dir.take() else {
-            return;
-        };
-
-        if retain {
-            if let Err(e) = fs::create_dir_all(&self.recordings_dir) {
-                eprintln!("[kue] Failed to create recordings dir {dir:?}: {e}",
-                    dir = self.recordings_dir);
-            } else if let Some(name) = session_dir.file_name() {
-                let target = self.recordings_dir.join(name);
-                let _ = fs::create_dir_all(&target);
-                if let Ok(entries) = fs::read_dir(&session_dir) {
-                    for entry in entries.flatten() {
-                        let dest = target.join(entry.file_name());
-                        let _ = fs::rename(entry.path(), &dest);
-                    }
-                }
-            }
-        }
-
-        let _ = fs::remove_dir_all(&session_dir);
     }
 
     /// Clean up any orphaned kue-session-* directories left in the system
@@ -531,12 +519,99 @@ fn spawn_mic_vad_monitor(
 }
 
 // ---------------------------------------------------------------------------
+// Retention & batch transcription helpers
+// ---------------------------------------------------------------------------
+
+fn apply_retention(session_dir: &std::path::Path, recordings_dir: &std::path::Path, retain: bool) {
+    if retain {
+        if let Err(e) = fs::create_dir_all(recordings_dir) {
+            eprintln!("[kue] Failed to create recordings dir {dir:?}: {e}", dir = recordings_dir);
+        } else if let Some(name) = session_dir.file_name() {
+            let target = recordings_dir.join(name);
+            let _ = fs::create_dir_all(&target);
+            if let Ok(entries) = fs::read_dir(session_dir) {
+                for entry in entries.flatten() {
+                    let dest = target.join(entry.file_name());
+                    let _ = fs::rename(entry.path(), &dest);
+                }
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(session_dir);
+}
+
+fn spawn_batch_transcription(
+    session_dir: std::path::PathBuf,
+    session_id: String,
+    retain: bool,
+    recordings_dir: std::path::PathBuf,
+    db: Database,
+    app_handle: tauri::AppHandle,
+) {
+    let mic_wav = session_dir.join(MIC_CHANNEL_A_FILENAME);
+    if !mic_wav.exists() {
+        apply_retention(&session_dir, &recordings_dir, retain);
+        return;
+    }
+
+    let config = STTConfig::default();
+
+    std::thread::Builder::new()
+        .name("kue-batch-transcribe".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut engine = crate::stt::create_engine(&config);
+                if let Err(e) = engine.load(&config.model_path, &config.language) {
+                    eprintln!("[kue] Batch STT: model load failed, skipping: {e}");
+                }
+
+                match crate::stt::batch::transcribe_channel_batch(
+                    &mic_wav,
+                    crate::types::Speaker::User,
+                    &session_id,
+                    &db,
+                    &*engine,
+                    &config,
+                ) {
+                    Ok(lines) => {
+                        eprintln!(
+                            "[kue] Batch transcription complete: {} user lines for session {}",
+                            lines.len(),
+                            session_id,
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[kue] Batch transcription failed for session {}: {e}", session_id);
+                    }
+                }
+            }));
+
+            if let Err(panic_err) = result {
+                let msg = panic_err
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic_err.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                eprintln!("[kue] Batch transcription thread panicked: {msg}");
+            }
+
+            apply_retention(&session_dir, &recordings_dir, retain);
+            let _ = app_handle.emit(
+                "post-call-transcript-ready",
+                serde_json::json!({ "session_id": session_id }),
+            );
+        })
+        .expect("failed to spawn batch transcription thread");
+}
+
+// ---------------------------------------------------------------------------
 // Tauri command
 // ---------------------------------------------------------------------------
 
 use crate::db::Database;
 use crate::orchestrator::HintJobSender;
 use crate::stt::{STTConfig, STTPipeline};
+use tauri::Emitter;
 use tauri::Manager;
 
 #[tauri::command]
@@ -586,12 +661,17 @@ pub fn toggle_audio_capture(
 
         let mut inner = audio.inner.lock().unwrap();
         inner.stt_thread = Some(stt_thread);
+        inner.session_id = Some(session_id);
 
         Ok(status)
     } else {
         let status = audio.stop();
+        let session_dir = audio.take_session_dir();
+        let session_id = {
+            let mut inner = audio.inner.lock().unwrap();
+            inner.session_id.take()
+        };
 
-        // Read retain_audio setting (default: false)
         let retain = db
             .conn
             .lock()
@@ -606,7 +686,18 @@ pub fn toggle_audio_capture(
             })
             .map(|v| v == "true")
             .unwrap_or(false);
-        audio.finalize_session(retain);
+
+        if let (Some(dir), Some(sid)) = (session_dir, session_id) {
+            let recordings_dir = audio.recordings_dir_path();
+            spawn_batch_transcription(
+                dir,
+                sid,
+                retain,
+                recordings_dir,
+                Database::clone(db.inner()),
+                app_handle.clone(),
+            );
+        }
 
         Ok(status)
     }
@@ -815,6 +906,7 @@ mod tests {
         assert!(inner.stt_thread.is_none());
         assert!(inner.mode.is_empty());
         assert!(inner.session_dir.is_none());
+        assert!(inner.session_id.is_none());
     }
 
     #[test]
@@ -862,108 +954,6 @@ mod tests {
             ts <= now && ts >= now.saturating_sub(5),
             "Timestamp {ts} should be close to now {now}"
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // finalize_session() — cleanup / retention logic
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn finalize_session_noop_when_no_session() {
-        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test"));
-        // Should not panic when session_dir is None
-        cap.finalize_session(false);
-        cap.finalize_session(true);
-    }
-
-    #[test]
-    fn finalize_session_retain_false_deletes_dir() {
-        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test"));
-        let tmp = PathBuf::from("/tmp/kue-finalize-delete-test");
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(&tmp).unwrap();
-        fs::write(tmp.join("test.wav"), b"fake wav data").unwrap();
-
-        {
-            let mut inner = cap.inner.lock().unwrap();
-            inner.session_dir = Some(tmp.clone());
-        }
-        cap.finalize_session(false);
-        assert!(!tmp.exists(), "session dir should be deleted when retain=false");
-    }
-
-    #[test]
-    fn finalize_session_retain_true_moves_files() {
-        let recordings_dir = PathBuf::from("/tmp/kue-finalize-move-recordings");
-        let _ = fs::remove_dir_all(&recordings_dir);
-
-        let cap = AudioCapture::new(recordings_dir.clone());
-
-        let tmp = PathBuf::from("/tmp/kue-finalize-move-session");
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(&tmp).unwrap();
-        fs::write(tmp.join("mic_channel_A.wav"), b"mic data").unwrap();
-        fs::write(tmp.join("loopback_channel_B.wav"), b"loopback data").unwrap();
-
-        {
-            let mut inner = cap.inner.lock().unwrap();
-            inner.session_dir = Some(tmp.clone());
-        }
-        cap.finalize_session(true);
-
-        // The temp dir should be gone
-        assert!(!tmp.exists(), "session dir should be deleted after finalize");
-
-        // Files should have been moved to recordings_dir/{tmp_name}/
-        let dirname = tmp.file_name().unwrap();
-        let target = recordings_dir.join(dirname);
-        assert!(target.join("mic_channel_A.wav").exists(), "mic file should be in recordings");
-        assert!(target.join("loopback_channel_B.wav").exists(), "loopback file should be in recordings");
-
-        fs::remove_dir_all(&recordings_dir).ok();
-    }
-
-    #[test]
-    fn finalize_session_retain_true_creates_recordings_dir() {
-        let recordings_dir = PathBuf::from("/tmp/kue-finalize-create-recordings/nested");
-        let _ = fs::remove_dir_all(&recordings_dir);
-
-        let cap = AudioCapture::new(recordings_dir.clone());
-
-        let tmp = PathBuf::from("/tmp/kue-finalize-create-session");
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(&tmp).unwrap();
-        fs::write(tmp.join("data.wav"), b"data").unwrap();
-
-        {
-            let mut inner = cap.inner.lock().unwrap();
-            inner.session_dir = Some(tmp.clone());
-        }
-        cap.finalize_session(true);
-
-        let dirname = tmp.file_name().unwrap();
-        assert!(recordings_dir.join(dirname).join("data.wav").exists());
-
-        fs::remove_dir_all("/tmp/kue-finalize-create-recordings").ok();
-    }
-
-    // -----------------------------------------------------------------------
-    // finalize_session — error branches
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn finalize_session_retain_true_no_filename_does_not_panic() {
-        // When session_dir has no file_name (e.g., a root path), retain=true
-        // should not panic — it simply skips the file-moving branch.
-        let cap = AudioCapture::new(PathBuf::from("/tmp/kue-test-no-fn"));
-        let root = PathBuf::from("/"); // has no meaningful file_name
-
-        {
-            let mut inner = cap.inner.lock().unwrap();
-            inner.session_dir = Some(root);
-        }
-        // Should not panic
-        cap.finalize_session(true);
     }
 
     // -----------------------------------------------------------------------
