@@ -1,5 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { invoke } from "@tauri-apps/api/core";
+import Overlay from "./Overlay";
 
 interface IndexSummary {
   folder: string;
@@ -18,7 +20,7 @@ interface SearchResult {
   score: number;
 }
 
-function App() {
+function MainApp() {
   const [indexResult, setIndexResult] = useState<string>("");
   const [query, setQuery] = useState("");
   const [searchResults, setSearchResults] = useState<string>("");
@@ -112,6 +114,23 @@ function App() {
       </div>
     </div>
   );
+}
+
+function App() {
+  const [isOverlay, setIsOverlay] = useState(false);
+
+  useEffect(() => {
+    const win = getCurrentWebviewWindow();
+    if (win.label === "overlay") {
+      setIsOverlay(true);
+    }
+  }, []);
+
+  if (isOverlay) {
+    return <Overlay />;
+  }
+
+  return <MainApp />;
 }
 
 export default App;
