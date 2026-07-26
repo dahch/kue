@@ -16,23 +16,30 @@
     "coverage:rust:check": "cd src-tauri && (which cargo-llvm-cov && echo 'llvm-cov available' || echo 'llvm-cov not available') && (which cargo-tarpaulin && echo 'tarpaulin available' || echo 'tarpaulin not available')",
     "coverage:rust:db": "cd src-tauri && cargo tarpaulin --lib --out Html --output-dir ../coverage/rust -- --test db::tests",
     "coverage:rust:full": "cd src-tauri && cargo tarpaulin --lib --out Html --output-dir ../coverage/rust",
-    "coverage:rust:text": "cd src-tauri && cargo tarpaulin --lib --out Stdout 2>&1"
+    "coverage:rust:text": "cd src-tauri && cargo tarpaulin --lib --out Stdout 2>&1",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
     "@tauri-apps/api": "^2.5.0",
-    "@tauri-apps/plugin-shell": "^2.2.1"
+    "@tauri-apps/plugin-shell": "^2.2.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.5.0",
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
     "@types/react": "^18.3.23",
     "@types/react-dom": "^18.3.7",
     "@vitejs/plugin-react": "^4.4.1",
     "autoprefixer": "^10.4.21",
+    "jsdom": "^29.1.1",
     "postcss": "^8.5.3",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.3",
-    "vite": "^6.3.5"
+    "vite": "^6.3.5",
+    "vitest": "^4.1.10"
   }
 }
