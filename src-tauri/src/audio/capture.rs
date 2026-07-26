@@ -17,6 +17,7 @@ use screencapturekit::sc_stream_configuration::SCStreamConfiguration;
 use serde::Serialize;
 
 use super::mic_vad::MicVadState;
+use crate::BatchTracker;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -547,6 +548,7 @@ fn spawn_batch_transcription(
     recordings_dir: std::path::PathBuf,
     db: Database,
     app_handle: tauri::AppHandle,
+    batch_tracker: BatchTracker,
 ) {
     let mic_wav = session_dir.join(MIC_CHANNEL_A_FILENAME);
     if !mic_wav.exists() {
@@ -596,6 +598,9 @@ fn spawn_batch_transcription(
             }
 
             apply_retention(&session_dir, &recordings_dir, retain);
+            if let Ok(mut tracker) = batch_tracker.0.lock() {
+                tracker.insert(session_id.clone());
+            }
             let _ = app_handle.emit(
                 "post-call-transcript-ready",
                 serde_json::json!({ "session_id": session_id }),
@@ -675,6 +680,7 @@ pub fn stop_session(
     audio: tauri::State<'_, AudioCapture>,
     db: tauri::State<'_, Database>,
     app_handle: tauri::AppHandle,
+    batch_tracker: tauri::State<'_, BatchTracker>,
 ) -> Result<AudioCaptureStatus, String> {
     let status = audio.stop();
     let session_dir = audio.take_session_dir();
@@ -709,10 +715,20 @@ pub fn stop_session(
             recordings_dir,
             Database::clone(db.inner()),
             app_handle.clone(),
+            BatchTracker::clone(batch_tracker.inner()),
         );
     }
 
     Ok(status)
+}
+
+#[tauri::command]
+pub fn is_transcript_ready(
+    session_id: String,
+    batch_tracker: tauri::State<'_, BatchTracker>,
+) -> Result<bool, String> {
+    let tracker = batch_tracker.0.lock().map_err(|e| e.to_string())?;
+    Ok(tracker.contains(&session_id))
 }
 
 #[tauri::command]
