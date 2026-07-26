@@ -4,7 +4,7 @@
 
 Desktop application (macOS, Tauri v2) with real-time transcription, local RAG over your CV/projects, and ultra-short hints to maintain fluency under pressure. Post-call, optional analysis with your own LLM (BYOK).
 
-**Current status:** Sprints 0–6 completed. All v1 features implemented and tested: base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline + batch transcription for Channel A), question classifier (heuristics + regex with bilingual EN/ES keyword lists including trap keywords for regret/failure) wired into the STT pipeline, orchestrator (HintScheduler + hint worker + PanicState) producing hints from classifier+RAG, overlay window (transparent, always-on-top, click-through, 400×100) with hint display component (3s auto-dismiss via React `Overlay` component), mic VAD for Shadow-mode hint cancellation, panic/mute button (10s hint silence via `PanicState`), mode selection UI (Practice/Shadow in `App.tsx`), Channel A batch transcription at session end (ADR-015), post-call BYOK analysis with keychain-stored API keys and LLM provider selection (Anthropic/OpenAI/Ollama/etc.), and Moonshine auto-provisioning (`stt/provisioning.rs` downloads dylibs + model on first launch, reports progress via `moonshine-download-progress` events, retry via `retry_moonshine_download` Tauri command). All implemented and tested (~534 tests in Rust). Remaining work: hint positioning clean-ups — see `spec.md`.
+**Current status:** Sprints 0–6 completed. All v1 features implemented and tested: base infrastructure (Tauri + SQLite/sqlite-vec), dual audio capture (microphone via `cpal` + system loopback via ScreenCaptureKit), RAG engine (embeddings with `candle` + vector search with `sqlite-vec`), STT module (Moonshine FFI + CLI fallback + VAD + pipeline + batch transcription for Channel A), question classifier (heuristics + regex with bilingual EN/ES keyword lists including trap keywords for regret/failure) wired into the STT pipeline, orchestrator (HintScheduler + hint worker + PanicState) producing hints from classifier+RAG, overlay window (transparent, always-on-top, click-through, 400×100) with hint display component (3s auto-dismiss via React `Overlay` component), mic VAD for Shadow-mode hint cancellation, panic/mute button (10s hint silence via `PanicState`), mode selection UI (Practice/Shadow in `App.tsx`), Channel A batch transcription at session end (ADR-015), post-call BYOK analysis with keychain-stored API keys and LLM provider selection (Anthropic/OpenAI/Ollama/etc.), Moonshine auto-provisioning (`stt/provisioning.rs` downloads dylibs + model on first launch, reports progress via `moonshine-download-progress` events, retry via `retry_moonshine_download` and status check via `is_moonshine_provisioned` Tauri commands), and a `ProvisioningProgress` frontend component with progress bar, file counter, error display, and retry button. All implemented and tested (~520 tests in Rust). Remaining work: hint positioning clean-ups — see `spec.md`.
 
 ---
 
@@ -27,15 +27,19 @@ npm install
 npm run tauri:dev
 ```
 
-The app will open a session control UI (mode selector, start/stop, panic button, transcript log, session history, post-call analysis panel). The Rust backend connects to SQLite and creates the schema at `~/Library/Application Support/com.kue.app/kue.db`.
+If Moonshine is not yet provisioned on first launch, a `ProvisioningProgress` UI (progress bar, file counter, stage label, retry button) blocks entry until downloads complete. Once provisioned, the app opens a session control UI (mode selector, start/stop, panic button, transcript log, session history, post-call analysis panel). The Rust backend connects to SQLite and creates the schema at `~/Library/Application Support/com.kue.app/kue.db`.
 
 ## Tests
 
 ```bash
+# Frontend unit tests (Vitest + Testing Library, jsdom)
+npm run test
+npm run test:watch    # watch mode
+
 # Rust tests (database — all logic implemented)
 npm run test:rust:db
 
-# Rust tests (all modules, ~534 tests)
+# Rust tests (all modules, ~520 tests)
 npm run test:rust
 
 # Rust coverage (requires cargo-tarpaulin)
@@ -162,11 +166,11 @@ npm run coverage:rust:full
 
 | Layer | Technology |
 |---|---|
-| Frontend | React 18 + TypeScript + Tailwind CSS 3 |
+| Frontend | React 18 + TypeScript + Tailwind CSS 3 + Vitest + Testing Library |
 | App Core | Rust (Tauri v2), session commands: `start_session`/`stop_session`/`panic_mode` |
 | Database | SQLite + sqlite-vec (vectors) |
 | Audio | cpal (mic) + screencapturekit-rs (loopback) + hound (WAV) |
-| STT + Classifier | Moonshine (FFI + CLI fallback) + heuristics/regex classifier (bilingual EN/ES, trap keywords for regret/failure) + batch transcription (Ch. A) + auto-provisioning (`stt/provisioning.rs` downloads dylibs + model on first launch) |
+| STT + Classifier | Moonshine (FFI + CLI fallback) + heuristics/regex classifier (bilingual EN/ES, trap keywords for regret/failure) + batch transcription (Ch. A) + auto-provisioning (`stt/provisioning.rs` downloads dylibs + model on first launch, progress events, `retry_moonshine_download` + `is_moonshine_provisioned` Tauri commands) |
 | Hint Engine | orchestrator module (HintScheduler + hint worker thread + PanicState) |
 | Embeddings | candle (HuggingFace Rust) + `snowflake-arctic-embed-s` |
 | Overlay Window | Tauri v2 multi-window (transparent, click-through, always-on-top, auto-show/hide on session events) |
@@ -185,18 +189,26 @@ npm run coverage:rust:full
 ```
 kue/
 ├── src/                     # Frontend React + TypeScript
-│   ├── App.tsx              # App router: renders MainApp (session control UI + post-call panel)
+│   ├── App.tsx              # App router: renders ProvisioningProgress on first launch,
+│   │                        #   MainApp (session control UI + post-call panel),
 │   │                        #   or Overlay by window label
 │   ├── Overlay.tsx          # Hint overlay component (listens for new-hint, session-started/stopped,
 │   │                        #   panic-mode events, 3s auto-dismiss)
+│   ├── ProvisioningProgress.tsx  # Moonshine download progress UI (progress bar, file counter,
+│   │                        #   error display, retry button), gates access to MainApp
 │   ├── main.tsx             # Entry point
-│   └── index.css            # Tailwind directives
+│   ├── index.css            # Tailwind directives
+│   └── __tests__/           # Frontend unit tests
+│       ├── setup.ts         # Vitest setup: Tauri API mocks (invoke, listen, webviewWindow)
+│       ├── PostCallPanel.test.tsx  # Post-call analysis panel gating tests
+│       └── ProvisioningProgress.test.tsx  # Provisioning UI state machine tests
 ├── src-tauri/               # Rust backend (Tauri)
 │   ├── src/
 │   │   ├── main.rs          # Entry point
 │   │   ├── lib.rs           # Tauri builder + setup (registers DB, AudioCapture, RAG,
 │   │   │                    #   overlay click-through, PanicState, BatchTracker,
-│   │   │                    #   cleans orphan temp dirs)
+│   │   │                    #   cleans orphan temp dirs, DYLD_LIBRARY_PATH setup,
+│   │   │                    #   spawns Moonshine provisioning background thread)
 │   │   ├── types.rs         # TranscriptLine, Speaker (STT → classifier contract, Copy derive)
 │   │   ├── db/
 │   │   │   └── mod.rs       # Schema, migrations, sqlite-vec, get_sessions/get_session_transcript, tests

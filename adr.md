@@ -306,18 +306,20 @@ Sprint 6 needed to eliminate this friction while ensuring:
 
 5. **Completion signalling:** Emits `moonshine-provisioned` on success or `moonshine-provision-error` on failure.
 
-6. **Retry command:** `retry_moonshine_download` Tauri command removes partial files and re-launches provisioning.
+ 6. **Status check command:** `is_moonshine_provisioned` Tauri command lets the frontend check whether provisioning is already complete (used by `ProvisioningProgress.tsx` on mount to skip the download UI if already provisioned).
+ 7. **Retry command:** `retry_moonshine_download` Tauri command removes partial files and re-launches provisioning.
 
-7. **Path resolution:** The global `MOONSHINE_BASE` static is set after successful provisioning. The FFI engine's `is_available()` and the `STTConfig::default_model_path()` both check this managed path first, then fall back to dev paths (`~/.local/share/moonshine/`, `~/moonshine-models/`, relative path), ensuring backward compatibility.
+ 8. **Path resolution:** The global `MOONSHINE_BASE` static is set after successful provisioning. The FFI engine's `is_available()` and the `STTConfig::default_model_path()` both check this managed path first, then fall back to dev paths (`~/.local/share/moonshine/`, `~/moonshine-models/`, relative path), ensuring backward compatibility.
 
-8. **DYLD_LIBRARY_PATH:** The managed lib dir is prepended to `DYLD_LIBRARY_PATH` during `setup()` so that `@rpath/libonnxruntime.*.dylib` is resolvable at load time. This is safe because no other threads have been spawned yet.
+ 9. **DYLD_LIBRARY_PATH:** The managed lib dir is prepended to `DYLD_LIBRARY_PATH` during `setup()` so that `@rpath/libonnxruntime.*.dylib` is resolvable at load time. This is safe because no other threads have been spawned yet.
 
 **Consequences:**
 - *(Positive)* First-launch friction is eliminated — the user doesn't need to manually download or configure anything.
 - *(Positive)* Integrity verification (SHA-256 + size checks) protects against corrupted downloads and CDN compromise (with the caveat that model hashes were pinned at build time from a one-time download — see the code comments).
 - *(Positive)* Idempotent — partial downloads are detected by size/hash and only the missing/corrupt files are re-downloaded.
 - *(Positive)* The background thread doesn't block Tauri setup or UI startup.
-- *(Negative)* The download is large (~482 MB total) and requires internet on first launch. Mitigated by the progress events (frontend should show a download bar — not yet implemented as of Sprint 6).
+- *(Positive)* The frontend `ProvisioningProgress` component (`src/ProvisioningProgress.tsx`) provides a polished download UX with a real progress bar, stage label, file counter, and retry button — the download no longer runs silently.
+- *(Negative)* The download is large (~482 MB total) and requires internet on first launch.
 - *(Negative)* PyPI wheel SHA-256 must be updated when the moonshine-voice version is bumped. The hash is a compile-time constant in `provisioning.rs`.
 - *(Negative)* The model hash pins are not vendor-published — they were computed at build time and protect against *future* CDN compromise but not against already-tampered files at the time of pinning. Documented as a trust caveat in the code.
 - *(Negative)* Functions requiring a concrete `tauri::AppHandle` (the download, progress emission, and retry logic) cannot be unit tested — only the pure helper functions (SHA-256, size validation, ZIP extraction dylib detection) have unit coverage (~30 tests). This is a known limitation of `tauri::test::mock_app` returning `AppHandle<MockRuntime>` which cannot substitute for the concrete runtime. Mitigated by having all testable helpers fully covered.

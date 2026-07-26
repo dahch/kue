@@ -189,7 +189,7 @@ graph TD
 ### 2.1 Frontend (`src/`)
 
 - **`main.tsx`** — Entry point React 18, mounts `<App />` on `#root`.
-- **`App.tsx`** — App router that detects the window label via `getCurrentWebviewWindow()`. If the label is `"overlay"`, renders the `<Overlay />` component; otherwise renders `<MainApp />` (session control UI).
+- **`App.tsx`** — App router that detects the window label via `getCurrentWebviewWindow()`. If the label is `"overlay"`, renders the `<Overlay />` component; if Moonshine is not yet provisioned, renders `<ProvisioningProgress />` (download progress UI); otherwise renders `<MainApp />` (session control UI).
 - **`MainApp`** (inside `App.tsx`) — Full session control UI with:
   - Mode selector (Practice/Shadow toggle)
   - Start/Stop session buttons connected via `invoke("start_session")` / `invoke("stop_session")`
@@ -198,6 +198,7 @@ graph TD
   - Session history list with selection
   - `PostCallPanel` for post-call BYOK analysis (provider/model selection, API key input, analyze button, result display with summary/weak_questions/forgotten_projects/star_improvements)
   - Listens for `new-transcript`, `new-hint`, `panic-mode`, and `post-call-transcript-ready` events
+- **`ProvisioningProgress.tsx`** — First-launch download progress UI. On mount, checks `is_moonshine_provisioned`; if not provisioned, shows a progress bar, stage label, file counter, error display, and retry button. Listens for `moonshine-download-progress`, `moonshine-provision-error`, and `moonshine-provisioned` events. Calls `onProvisioned` callback when download completes, which transitions `App.tsx` from provisioning view to `MainApp`.
 - **`Overlay.tsx`** — Hint display component rendered inside the overlay window. Listens for:
   - `new-hint` — shows hint with 3s auto-dismiss via `setTimeout`
   - `session-started` — auto-shows overlay window in Shadow mode
@@ -205,10 +206,14 @@ graph TD
   - `panic-mode` — shows a panic indicator (🔇) for the duration
   - Hint text displayed in a semi-transparent backdrop-blur container
 - **`index.css`** — Tailwind directives (`@tailwind base/components/utilities`).
+- **`__tests__/setup.ts`** — Vitest setup file that mocks `@tauri-apps/api/core` (invoke), `@tauri-apps/api/event` (listen), and `@tauri-apps/api/webviewWindow` (getCurrentWebviewWindow). All frontend tests import this setup.
+- **`__tests__/PostCallPanel.test.tsx`** — Tests for PostCallPanel gating: transcript readiness toggles button state, event filtering by session ID.
+- **`__tests__/ProvisioningProgress.test.tsx`** — Tests for ProvisioningProgress state machine: mount behavior, progress events, error/retry, done event, cleanup after unmount, percent edge cases.
+- **`vitest.config.ts`** — Vitest configuration with React plugin, jsdom environment, globals enabled, and setup file reference.
 
 ### 2.2 Tauri Shell (`lib.rs`)
 
-File `src-tauri/src/lib.rs` (~113 lines):
+File `src-tauri/src/lib.rs` (114 lines):
 
 ```rust
 mod analyze;         // Post-call BYOK analysis (Sprint 5)
@@ -309,6 +314,7 @@ run() {
             keys::save_key,
             keys::has_key,
             analyze::analyze_session,
+            stt::provisioning::is_moonshine_provisioned,
             stt::provisioning::retry_moonshine_download,
         ])
         .run(tauri::generate_context!())
@@ -321,7 +327,7 @@ run() {
 - **Overlay click-through:** In `setup()`, the overlay window is configured with `set_ignore_cursor_events(true)` so mouse events pass through to the video call underneath.
 - **`app.manage(database)`**, **`app.manage(AudioCapture)`**, **`app.manage(Arc<Mutex<EmbeddingModel>>)`** — Injects `Database`, `AudioCapture` and the embeddings model (wrapped in `Arc` for sharing with the hint worker) as Tauri state.
 - **`BatchTracker`** — `Arc<Mutex<HashSet<String>>>` registered as Tauri state, tracks which sessions have completed Channel A batch transcription. Checked by `is_transcript_ready` command and `analyze_session`.
-- **Moonshine provisioning setup:** Prepends the managed moonshine lib dir to `DYLD_LIBRARY_PATH` (so `@rpath/libonnxruntime.*.dylib` is found at load time), then spawns a background `kue-moonshine-provision` thread via `ensure_moonshine_installed()` that downloads dylibs from PyPI and model files (~482 MB total) on first launch. Progress is reported via `moonshine-download-progress` events (with stage, file index/count, and downloaded/total bytes, throttled to 250ms); success emits `moonshine-provisioned`, failure emits `moonshine-provision-error`. The `retry_moonshine_download` Tauri command allows retry on failure.
+- **Moonshine provisioning setup:** Prepends the managed moonshine lib dir to `DYLD_LIBRARY_PATH` (so `@rpath/libonnxruntime.*.dylib` is found at load time), then spawns a background `kue-moonshine-provision` thread via `ensure_moonshine_installed()` that downloads dylibs from PyPI and model files (~482 MB total) on first launch. Progress is reported via `moonshine-download-progress` events (with stage, file index/count, and downloaded/total bytes, throttled to 250ms); success emits `moonshine-provisioned`, failure emits `moonshine-provision-error`. The `is_moonshine_provisioned` command lets the frontend check whether provisioning is already complete; `retry_moonshine_download` allows retry on failure.
 - **Orchestrator setup:** `HintScheduler` (manages delayed hints in Shadow mode), `HintJobSender` (mpsc channel for dispatching hint jobs), and `start_hint_worker` (spawns `kue-hint-worker` thread that processes jobs and drains expired hints every 500ms).
 - **`PanicState`** — Registered via `app.manage(PanicState::new())`. Stores an optional `Instant` deadline; when set, `hint_silenced_by_panic()` in the orchestrator returns `true` for all hint operations until the deadline expires (10s), effectively muting all hints.
 - **`start_session`**, **`stop_session`**, **`panic_mode`** — Tauri commands replacing the old `toggle_audio_capture`. `start_session` creates a DB session, spawns the dual capture and STP pipeline. `stop_session` stops capture, triggers batch transcription for Channel A, and emits `session-stopped`. `panic_mode` activates `PanicState` for 10s and emits `panic-mode` event.
@@ -340,14 +346,14 @@ The substantial module of the app (~1185 lines, 34 tests). See §3 for schema de
 
 #### `audio/capture.rs`
 
-Substantial module (~1470+ lines, 51 tests) that implements dual audio capture:
+Substantial module (~1638 lines, 54 tests) that implements dual audio capture:
 
 - **Microphone (Channel A):** via `cpal`, supports i16 and f32 sample formats with automatic conversion to i16.
 - **Loopback (Channel B):** via `screencapturekit-rs` (ScreenCaptureKit), captures the system output audio (interviewer's voice). `excludes_current_process_audio: true` to avoid echo.
 - **WAV writer:** two background threads (`kue-wav-mic-A`, `kue-wav-loopback-B`) that write the channels to separate WAV files (16 kHz, mono, 16-bit) using `hound`.
 - **`AudioCapture` struct:** managed as Tauri state via `app.manage()`. Exposes `start(mode)`, `stop()`, `toggle(start, mode)`. Exposes `mic_vad_state()` returning `Arc<Mutex<MicVadState>>` for the orchestrator's shadow-mode hint cancellation.
 - **`start_session` / `stop_session` / `panic_mode` commands:** Three separate Tauri commands replacing the old `toggle_audio_capture`. `start_session(mode)` starts both captures and creates a DB session. `stop_session()` stops both captures and triggers batch transcription. `panic_mode()` activates `PanicState` (10s hint silence) and emits `panic-mode` event.
-- **51 tests:** cover f32→i16 conversion (edge cases: NaN, infinity, clamping, very small values), state serialization (4 combinations), directory creation, path format, invalid mode (multiple variants), toggle (4 paths), WAV writer (creation, multiple buffers, invalid path, empty buffer, cyclic lifecycle), consistency between mode validation and DB, batch transcription spawning, and `is_transcript_ready`.
+- **54 tests:** cover f32→i16 conversion (edge cases: NaN, infinity, clamping, very small values), state serialization (4 combinations), directory creation, path format, invalid mode (multiple variants), toggle (4 paths), WAV writer (creation, multiple buffers, invalid path, empty buffer, cyclic lifecycle), consistency between mode validation and DB, batch transcription spawning, and `is_transcript_ready`.
 
 #### `audio/mic_vad.rs`
 
@@ -361,7 +367,7 @@ Moderate module (~365 lines, 18 tests) that wraps `SimpleVAD` for Channel A (mic
 
 ### 2.5 STT + Classifier Module (`stt/`, `classifier/`)
 
-**STT Module (`stt/`, ~1400 non-test lines, ~153 tests)** — implements real-time transcription of Channel B and batch transcription of Channel A, integrated into the app lifecycle via `start_session`/`stop_session`:
+**STT Module (`stt/`, ~1400 non-test lines, ~138 tests)** — implements real-time transcription of Channel B and batch transcription of Channel A, integrated into the app lifecycle via `start_session`/`stop_session`:
 
 - **`stt/mod.rs`** — `STTEngine` trait with `load()` and `transcribe_audio_chunk()`, `STTConfig`, blanket impl for `Box<T>`. Also exposes `persist_transcript_line()` and `create_engine()` at module level (extracted from `pipeline.rs` and `ffi.rs`).
 - **`stt/ffi.rs`** — `MoonshineFFIEngine`: loads `libmoonshine.dylib` at runtime via `libloading`, declares FFI bindings with `#[repr(C)]` for `CTranscript`, `CTranscriptLine`, etc. Calls the Moonshine streaming API: `create_stream` → `start_stream` → `add_audio_to_stream` → `transcribe_stream`. Frees resources in `Drop`.
@@ -374,7 +380,7 @@ Moderate module (~365 lines, 18 tests) that wraps `SimpleVAD` for Channel A (mic
 
 **Auto-detection:** At runtime, tries FFI first (`libmoonshine.dylib` in `MOONSHINE_LIB_DIR` or standard paths), falls back to CLI if the library is not found. No Whisper — Moonshine is the only option.
 
-**~153 tests:** cover `parse_transcript` (null ptr, 0 lines, completed/incomplete, empty text, preferred line), `rms` (8 cases), VAD (24 cases: silence, speech, timeout, reset, minimum duration, empty, threshold, boundary, accumulation, reset during speech, etc.), temp WAV writing (3 cases: data, empty, unique names), FFI (11 cases: transcript parsing, multi-line, C wraparound), CLI (15 cases: subprocess, parse, edge cases), `STTPipeline` (engine selection, load delegation, start/end session, process chunk, flush segment, DB persistence, poisoned mutex, special characters, multiple lines, hint job dispatch), and batch transcription (6 cases: empty/corrupt/all-silence WAVs, user/interviewer speaker, multi-segment, silent engine, whitespace-only text, mixed segments, partial chunks, different sample rates, DB timestamp/session-id verification, chunk_size, sample_offset_to_ms, Send trait, trailing segment edge cases).
+**~138 tests:** cover `parse_transcript` (null ptr, 0 lines, completed/incomplete, empty text, preferred line), `rms` (8 cases), VAD (24 cases: silence, speech, timeout, reset, minimum duration, empty, threshold, boundary, accumulation, reset during speech, etc.), temp WAV writing (3 cases: data, empty, unique names), FFI (11 cases: transcript parsing, multi-line, C wraparound), CLI (15 cases: subprocess, parse, edge cases), `STTPipeline` (engine selection, load delegation, start/end session, process chunk, flush segment, DB persistence, poisoned mutex, special characters, multiple lines, hint job dispatch), batch transcription (27 cases: empty/corrupt/all-silence WAVs, user/interviewer speaker, multi-segment, silent engine, whitespace-only text, mixed segments, partial chunks, different sample rates, DB timestamp/session-id verification, chunk_size, sample_offset_to_ms, Send trait, trailing segment edge cases), and provisioning (17 cases: SHA-256 verification, size validation, ZIP extraction, dylib detection).
 
 **Classifier Module (`classifier/mod.rs`, 76 tests)** — heuristics-based question classifier, no LLM:
 
