@@ -247,4 +247,66 @@ mod tests {
         // Unicode words separated by whitespace
         assert_eq!(e.token_count("café résumé niño"), 3);
     }
+
+    // ── Additional edge cases ──
+
+    #[test]
+    fn embedder_handles_very_long_line() {
+        let e = TestEmbedder;
+        let text = "x ".repeat(100_000);
+        let emb = e.generate_embedding(&text).unwrap();
+        assert_eq!(emb.len(), EMBEDDING_DIM);
+    }
+
+    #[test]
+    fn embedder_handles_null_byte_in_string() {
+        let e = TestEmbedder;
+        let text = String::from("hello\0world");
+        let emb = e.generate_embedding(&text).unwrap();
+        assert_eq!(emb.len(), EMBEDDING_DIM);
+    }
+
+    #[test]
+    fn embedder_handles_repeated_same_word() {
+        let e = TestEmbedder;
+        let text = "word ".repeat(500);
+        let emb = e.generate_embedding(&text).unwrap();
+        assert_eq!(emb.len(), EMBEDDING_DIM);
+    }
+
+    #[test]
+    fn token_count_default_impl_very_long_string() {
+        let e = TestEmbedder;
+        let long = "word ".repeat(10_000);
+        assert_eq!(e.token_count(&long), 10_000);
+    }
+
+    #[test]
+    fn token_count_default_impl_numbers_and_symbols() {
+        let e = TestEmbedder;
+        assert_eq!(e.token_count("123 456 789"), 3);
+        assert_eq!(e.token_count("@#$ %^& *()"), 3);
+    }
+
+    #[test]
+    fn token_count_default_impl_mixed_whitespace() {
+        let e = TestEmbedder;
+        assert_eq!(e.token_count("hello\t\tworld\n\n\r\nfoo"), 3);
+    }
+
+    #[test]
+    fn embedder_trait_object_token_count() {
+        let e: Box<dyn Embedder> = Box::new(TestEmbedder);
+        assert_eq!(e.token_count("hello world"), 2);
+    }
+
+    // ── Embedder impl for Box<dyn Embedder> delegation ──
+
+    #[test]
+    fn embedder_via_box_dyn_token_count() {
+        let e: Box<dyn Embedder> = Box::new(TestEmbedder);
+        let emb = e.generate_embedding("test").unwrap();
+        assert_eq!(emb.len(), EMBEDDING_DIM);
+        assert_eq!(e.token_count("one two three"), 3);
+    }
 }
