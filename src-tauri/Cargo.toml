@@ -59,6 +59,14 @@ version = "0.8"
 version = "1"
 features = ["v4"]
 
+[dependencies.keyring]
+version = "2"
+features = ["default"]
+
+[dependencies.reqwest]
+version = "0.12"
+features = ["json"]
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
