@@ -89,6 +89,15 @@ const TRAP_KEYWORDS: &[&str] = &[
     "qué cambiarías", "what would you change",
     "por qué deberíamos contratarte", "why should we hire you",
     "por qué te fuiste", "why did you leave",
+    "arrepientes", "regret", "arrepentimiento",
+    "frustr", "frustration", "frustración",
+    "fracaso profesional", "professional failure",
+    "debilidad profesional", "professional weakness",
+    "punto débil", "weak point", "peor proyecto", "worst project",
+    "experiencia negativa", "negative experience",
+    "qué aprendiste de tus errores", "what did you learn from your mistakes",
+    "retroalimentación negativa", "negative feedback",
+    "situación incómoda", "awkward situation",
 ];
 
 pub fn classify(text: &str) -> QuestionType {
