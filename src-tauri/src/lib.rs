@@ -30,11 +30,17 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Initialize file logging before any other setup
             if let Ok(app_data) = app.path().app_data_dir() {
                 let _ = logging::Logger::init(&app_data);
             }
+
+            // Spawn background Moonshine provisioning (dylibs + model download
+            // on first launch, no-op otherwise). Progress is reported via
+            // `moonshine-download-progress` events.
+            stt::provisioning::ensure_moonshine_installed(app.handle().clone());
 
             // Configure overlay window for click-through behavior
             if let Some(overlay) = app.get_webview_window("overlay") {
@@ -89,11 +95,6 @@ pub fn run() {
                 };
                 std::env::set_var("DYLD_LIBRARY_PATH", &new);
             }
-
-            // Spawn background Moonshine provisioning (dylibs + model download
-            // on first launch, no-op otherwise). Progress is reported via
-            // `moonshine-download-progress` events.
-            stt::provisioning::ensure_moonshine_installed(app.handle().clone());
 
             Ok(())
         })
