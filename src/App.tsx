@@ -1,116 +1,168 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import Overlay from "./Overlay";
 
-interface IndexSummary {
-  folder: string;
-  files_indexed: number;
-  chunks_created: number;
-  error_count: number;
+interface TranscriptEvent {
+  session_id: string;
+  text: string;
+  speaker: string;
 }
 
-interface SearchResult {
-  id: number;
-  document_id: number;
+interface HintPayload {
   text: string;
-  chunk_index: number;
-  tag: string | null;
-  metric: string | null;
-  score: number;
+  type: string;
+  session_id: string;
 }
+
+interface PanicPayload {
+  until_secs: number;
+}
+
+type SessionMode = "practice" | "shadow";
 
 function MainApp() {
-  const [indexResult, setIndexResult] = useState<string>("");
-  const [query, setQuery] = useState("");
-  const [searchResults, setSearchResults] = useState<string>("");
+  const [mode, setMode] = useState<SessionMode>("practice");
+  const [running, setRunning] = useState(false);
+  const [lastTranscript, setLastTranscript] = useState("");
+  const [lastHint, setLastHint] = useState("");
+  const [panicking, setPanicking] = useState(false);
+  const panicTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const handleIndex = async () => {
-    setIndexResult("Indexando...");
-    try {
-      const path = prompt("Ruta de la carpeta a indexar:", "/tmp/kue-index-test");
-      if (!path) return;
-      const result = await invoke<IndexSummary>("index_folder_cmd", { path });
-      setIndexResult(
-        `OK: ${result.files_indexed} archivos, ${result.chunks_created} chunks`
-      );
-    } catch (e) {
-      setIndexResult(`Error: ${e}`);
-    }
-  };
+  useEffect(() => {
+    const unlistenTranscript = listen<TranscriptEvent>("new-transcript", (event) => {
+      setLastTranscript(event.payload.text);
+    });
 
-  const handleSearch = async () => {
-    if (!query.trim()) return;
-    setSearchResults("Buscando...");
+    const unlistenHint = listen<HintPayload>("new-hint", (event) => {
+      setLastHint(event.payload.text);
+    });
+
+    const unlistenPanic = listen<PanicPayload>("panic-mode", (event) => {
+      setPanicking(true);
+      if (panicTimerRef.current) clearTimeout(panicTimerRef.current);
+      const ms = event.payload.until_secs * 1000;
+      panicTimerRef.current = setTimeout(() => setPanicking(false), ms);
+    });
+
+    return () => {
+      unlistenTranscript.then((fn) => fn());
+      unlistenHint.then((fn) => fn());
+      unlistenPanic.then((fn) => fn());
+      if (panicTimerRef.current) clearTimeout(panicTimerRef.current);
+    };
+  }, []);
+
+  const handleStart = useCallback(async () => {
     try {
-      const results = await invoke<SearchResult[]>("search_context", {
-        query,
-        top_k: 5,
-      });
-      if (results.length === 0) {
-        setSearchResults("Sin resultados.");
-        return;
-      }
-      setSearchResults(
-        results
-          .map(
-            (r, i) =>
-              `#${i + 1} (score: ${r.score.toFixed(3)}): ${r.text.slice(0, 120)}...`
-          )
-          .join("\n")
-      );
+      await invoke("start_session", { mode });
+      setRunning(true);
     } catch (e) {
-      setSearchResults(`Error: ${e}`);
+      console.error("Failed to start session:", e);
     }
-  };
+  }, [mode]);
+
+  const handleStop = useCallback(async () => {
+    try {
+      await invoke("stop_session");
+      setRunning(false);
+    } catch (e) {
+      console.error("Failed to stop session:", e);
+    }
+  }, []);
+
+  const handlePanic = useCallback(async () => {
+    try {
+      await invoke("panic_mode");
+    } catch (e) {
+      console.error("Failed to activate panic mode:", e);
+    }
+  }, []);
 
   return (
     <div className="flex min-h-screen flex-col items-center justify-center bg-zinc-950 p-8 text-white">
-      <h1 className="mb-8 text-4xl font-bold">Bienvenido a Kue</h1>
+      <h1 className="mb-8 text-4xl font-bold">Kue</h1>
 
-      {/* Debug: Index Folder */}
+      {/* Mode selector */}
       <div className="mb-6 w-full max-w-lg rounded-xl border border-zinc-700 bg-zinc-900 p-6">
-        <h2 className="mb-3 text-lg font-semibold text-blue-400">
-          Debug: Indexar carpeta
-        </h2>
-        <button
-          className="rounded-lg bg-blue-600 px-6 py-2 font-medium transition-colors hover:bg-blue-500"
-          onClick={handleIndex}
-        >
-          Indexar carpeta
-        </button>
-        {indexResult && (
-          <pre className="mt-3 whitespace-pre-wrap text-sm text-zinc-300">
-            {indexResult}
-          </pre>
-        )}
-      </div>
-
-      {/* Debug: Search */}
-      <div className="mb-6 w-full max-w-lg rounded-xl border border-zinc-700 bg-zinc-900 p-6">
-        <h2 className="mb-3 text-lg font-semibold text-blue-400">
-          Debug: Buscar contexto
-        </h2>
-        <div className="flex gap-2">
-          <input
-            className="flex-1 rounded-lg border border-zinc-600 bg-zinc-800 px-3 py-2 text-sm text-white placeholder-zinc-500"
-            placeholder="término de búsqueda..."
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && handleSearch()}
-          />
+        <h2 className="mb-3 text-lg font-semibold text-blue-400">Modo</h2>
+        <div className="flex gap-3">
           <button
-            className="rounded-lg bg-emerald-600 px-4 py-2 font-medium transition-colors hover:bg-emerald-500"
-            onClick={handleSearch}
+            className={`flex-1 rounded-lg py-2 font-medium transition-colors ${
+              mode === "practice"
+                ? "bg-blue-600 text-white"
+                : "border border-zinc-600 text-zinc-400 hover:border-zinc-500"
+            }`}
+            onClick={() => setMode("practice")}
+            disabled={running}
           >
-            Buscar
+            Practice
+          </button>
+          <button
+            className={`flex-1 rounded-lg py-2 font-medium transition-colors ${
+              mode === "shadow"
+                ? "bg-blue-600 text-white"
+                : "border border-zinc-600 text-zinc-400 hover:border-zinc-500"
+            }`}
+            onClick={() => setMode("shadow")}
+            disabled={running}
+          >
+            Shadow
           </button>
         </div>
-        {searchResults && (
-          <pre className="mt-3 whitespace-pre-wrap text-sm text-zinc-300">
-            {searchResults}
-          </pre>
+      </div>
+
+      {/* Session controls */}
+      <div className="mb-6 flex w-full max-w-lg gap-3">
+        {!running ? (
+          <button
+            className="flex-1 rounded-lg bg-emerald-600 py-3 font-medium transition-colors hover:bg-emerald-500"
+            onClick={handleStart}
+          >
+            Iniciar Sesión
+          </button>
+        ) : (
+          <button
+            className="flex-1 rounded-lg bg-red-600 py-3 font-medium transition-colors hover:bg-red-500"
+            onClick={handleStop}
+          >
+            Detener Sesión
+          </button>
         )}
+
+        <button
+          className={`rounded-lg px-6 py-3 font-medium transition-colors ${
+            panicking
+              ? "bg-orange-500 text-white"
+              : "border border-zinc-600 text-zinc-400 hover:border-zinc-500"
+          }`}
+          onClick={handlePanic}
+          disabled={!running}
+        >
+          {panicking ? "🔇 10s" : "Pánico"}
+        </button>
+      </div>
+
+      {/* Log area */}
+      <div className="w-full max-w-lg space-y-3">
+        <div className="rounded-xl border border-zinc-700 bg-zinc-900 p-4">
+          <h3 className="mb-2 text-sm font-semibold text-zinc-500 uppercase tracking-wide">
+            Último transcript
+          </h3>
+          <p className="text-sm text-zinc-300 min-h-[1.25rem]">
+            {lastTranscript || "\u00a0"}
+          </p>
+        </div>
+
+        <div className="rounded-xl border border-zinc-700 bg-zinc-900 p-4">
+          <h3 className="mb-2 text-sm font-semibold text-zinc-500 uppercase tracking-wide">
+            Último hint
+          </h3>
+          <p className="text-sm text-zinc-300 min-h-[1.25rem]">
+            {lastHint || "\u00a0"}
+          </p>
+        </div>
       </div>
     </div>
   );
