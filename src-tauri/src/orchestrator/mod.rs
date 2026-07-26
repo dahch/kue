@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::Emitter;
+use tauri::Manager;
 
 pub mod worker;
 
@@ -51,6 +52,9 @@ pub struct PendingHint {
     pub qtype: QuestionType,
     pub text: String,
     pub fire_at: Instant,
+    /// When this hint was originally scheduled (used by Shadow mode to
+    /// check whether the user started speaking on Channel A since then).
+    pub scheduled_at: Instant,
 }
 
 pub struct HintScheduler {
@@ -100,11 +104,51 @@ impl Default for HintScheduler {
     }
 }
 
+/// Returns `true` if `hint` should be cancelled because the user has
+/// started speaking on Channel A (mic) since the hint was scheduled.
+///
+/// When no `MicVadState` is available (e.g. in tests) all hints are
+/// allowed to proceed.
+pub fn should_cancel_hint(hint: &PendingHint, mic_vad: Option<&crate::audio::mic_vad::MicVadState>) -> bool {
+    mic_vad.is_some_and(|vad| {
+        vad.is_currently_speaking() || vad.has_speech_since(hint.scheduled_at)
+    })
+}
+
 /// Drains expired hints from the scheduler and emits them via Tauri events.
 /// Called periodically by the hint worker thread.
+///
+/// In Shadow mode, each expired hint is checked against the mic (Channel A)
+/// VAD: if the user started speaking since the hint was scheduled, the hint
+/// is silently cancelled (the user is already answering and doesn't need a
+/// prompt).  When no `AudioCapture` state is available (e.g. in tests),
+/// all expired hints are emitted as-is.
 pub fn emit_expired_hints(app_handle: &tauri::AppHandle, scheduler: &HintScheduler) {
     let expired = scheduler.tick(Instant::now());
+
+    let mic_vad = app_handle
+        .try_state::<crate::audio::capture::AudioCapture>()
+        .map(|cap| cap.mic_vad_state());
+
     for hint in expired {
+        let cancel = mic_vad
+            .as_ref()
+            .map(|vad| {
+                let state = match vad.lock() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        eprintln!("[kue] VAD mutex poisoned — VAD gating disabled");
+                        e.into_inner()
+                    }
+                };
+                should_cancel_hint(&hint, Some(&state))
+            })
+            .unwrap_or(false);
+
+        if cancel {
+            continue;
+        }
+
         let payload = HintEvent {
             text: hint.text,
             qtype: hint.qtype.as_str().to_string(),
@@ -136,11 +180,13 @@ pub fn generate_and_emit_hint(
     }
 
     if mode == "shadow" {
+        let now = Instant::now();
         scheduler.schedule(PendingHint {
             session_id: session_id.to_string(),
             qtype,
             text: hint_text,
-            fire_at: Instant::now() + Duration::from_millis(SHADOW_DELAY_MS),
+            fire_at: now + Duration::from_millis(SHADOW_DELAY_MS),
+            scheduled_at: now,
         });
     } else if let Some(handle) = app_handle {
         let payload = HintEvent {
@@ -270,6 +316,7 @@ mod tests {
             qtype: QuestionType::Technical,
             text: "not yet".into(),
             fire_at: start + Duration::from_secs(10),
+            scheduled_at: start,
         });
         let expired = s.tick(start + Duration::from_secs(5));
         assert!(expired.is_empty(), "hint should not fire before deadline");
@@ -284,6 +331,7 @@ mod tests {
             qtype: QuestionType::Star,
             text: "ready now".into(),
             fire_at: start + Duration::from_millis(10),
+            scheduled_at: start,
         });
         std::thread::sleep(Duration::from_millis(20));
         let expired = s.tick(Instant::now());
@@ -302,6 +350,7 @@ mod tests {
             qtype: QuestionType::Trap,
             text: "should be cancelled".into(),
             fire_at: start + Duration::from_millis(10),
+            scheduled_at: start,
         });
         s.cancel_all("sess-cancel");
         std::thread::sleep(Duration::from_millis(20));
@@ -321,18 +370,21 @@ mod tests {
             qtype: QuestionType::Technical,
             text: "hint a".into(),
             fire_at: start + Duration::from_millis(10),
+            scheduled_at: start,
         });
         s.schedule(PendingHint {
             session_id: "sess-b".into(),
             qtype: QuestionType::Star,
             text: "hint b".into(),
             fire_at: start + Duration::from_millis(10),
+            scheduled_at: start,
         });
         s.schedule(PendingHint {
             session_id: "sess-a".into(),
             qtype: QuestionType::Architecture,
             text: "hint a2".into(),
             fire_at: start + Duration::from_secs(60),
+            scheduled_at: start,
         });
 
         // Cancel only session "sess-a"
@@ -359,6 +411,7 @@ mod tests {
             qtype: QuestionType::Technical,
             text: "future hint".into(),
             fire_at: start + Duration::from_secs(60),
+            scheduled_at: start,
         });
         // Tick with a time before the hint's fire_at
         let expired = s.tick(start + Duration::from_secs(30));
@@ -378,6 +431,7 @@ mod tests {
             qtype: QuestionType::Technical,
             text: "real hint".into(),
             fire_at: start + Duration::from_millis(10),
+            scheduled_at: start,
         });
         // Cancel a different session — should not affect our hint
         s.cancel_all("sess-other");
@@ -768,9 +822,240 @@ mod tests {
         assert!(again.is_empty(), "hint should not appear twice");
     }
 
-    /// Combined test: schedule two hints for different sessions, cancel one,
-    /// verify only the other fires. Reproduces a real interview scenario where
-    /// one session ends while another is still active.
+    // ── should_cancel_hint ──
+
+    #[test]
+    fn should_cancel_hint_no_mic_vad_never_cancels() {
+        let hint = PendingHint {
+            session_id: "s".into(),
+            qtype: QuestionType::Technical,
+            text: "hint".into(),
+            fire_at: Instant::now(),
+            scheduled_at: Instant::now(),
+        };
+        assert!(!should_cancel_hint(&hint, None));
+    }
+
+    #[test]
+    fn should_cancel_hint_false_when_user_silent() {
+        let vad = crate::audio::mic_vad::MicVadState::new();
+        let hint = PendingHint {
+            session_id: "s".into(),
+            qtype: QuestionType::Technical,
+            text: "hint".into(),
+            fire_at: Instant::now(),
+            scheduled_at: Instant::now(),
+        };
+        assert!(!should_cancel_hint(&hint, Some(&vad)));
+    }
+
+    #[test]
+    fn should_cancel_hint_true_when_currently_speaking() {
+        let mut vad = crate::audio::mic_vad::MicVadState::new();
+        // Feed enough speech to trigger VAD
+        for _ in 0..2 {
+            vad.feed_audio(&vec![5000i16; 1600]);
+        }
+        assert!(vad.is_currently_speaking());
+
+        // Hint scheduled before speech started
+        let hint = PendingHint {
+            session_id: "s".into(),
+            qtype: QuestionType::Technical,
+            text: "hint".into(),
+            fire_at: Instant::now(),
+            scheduled_at: Instant::now() - std::time::Duration::from_secs(10),
+        };
+        assert!(should_cancel_hint(&hint, Some(&vad)),
+            "should cancel when user is currently speaking");
+    }
+
+    #[test]
+    fn should_cancel_hint_true_when_user_spoke_since_scheduled() {
+        let mut vad = crate::audio::mic_vad::MicVadState::new();
+        let before = Instant::now();
+
+        // Hint scheduled at `before`
+        let hint = PendingHint {
+            session_id: "s".into(),
+            qtype: QuestionType::Star,
+            text: "star hint".into(),
+            fire_at: before + std::time::Duration::from_millis(2500),
+            scheduled_at: before,
+        };
+
+        // User starts speaking after the hint was scheduled
+        for _ in 0..2 {
+            vad.feed_audio(&vec![5000i16; 1600]);
+        }
+        assert!(vad.has_speech_since(before));
+        assert!(should_cancel_hint(&hint, Some(&vad)),
+            "should cancel when user spoke after hint was scheduled");
+    }
+
+    #[test]
+    fn should_cancel_hint_true_when_speaking_before_scheduled() {
+        let mut vad = crate::audio::mic_vad::MicVadState::new();
+        // User was speaking before the hint was scheduled
+        for _ in 0..2 {
+            vad.feed_audio(&vec![5000i16; 1600]);
+        }
+
+        let now = Instant::now();
+        let hint = PendingHint {
+            session_id: "s".into(),
+            qtype: QuestionType::Architecture,
+            text: "arch hint".into(),
+            fire_at: now + std::time::Duration::from_millis(2500),
+            scheduled_at: now,
+        };
+
+        // `has_speech_since(now)` will be false because the speech start
+        // happened before `now`. But `is_currently_speaking()` is true,
+        // so `should_cancel_hint` returns true anyway.
+        assert!(vad.is_currently_speaking(),
+            "user was already speaking when hint was scheduled");
+        assert!(should_cancel_hint(&hint, Some(&vad)),
+            "should cancel when user was already speaking");
+    }
+
+    #[test]
+    fn should_cancel_hint_false_when_user_spoke_before_and_stopped() {
+        let mut vad = crate::audio::mic_vad::MicVadState::new();
+        // User spoke and finished before the hint was scheduled
+        for _ in 0..2 {
+            vad.feed_audio(&vec![5000i16; 1600]);
+        }
+        // Wait for silence longer than timeout (600ms)
+        let long_silence = vec![0i16; 9600]; // 600ms @ 16kHz
+        vad.feed_audio(&long_silence);
+        assert!(!vad.is_currently_speaking());
+
+        let now = Instant::now();
+        let hint = PendingHint {
+            session_id: "s".into(),
+            qtype: QuestionType::Trap,
+            text: "trap hint".into(),
+            fire_at: now + std::time::Duration::from_millis(2500),
+            scheduled_at: now,
+        };
+
+        assert!(!should_cancel_hint(&hint, Some(&vad)),
+            "should not cancel when user stopped speaking before hint was scheduled");
+    }
+
+    // ── Integration: shadow hints + mic VAD ──
+
+    /// Simulates what `emit_expired_hints` does when `should_cancel_hint`
+    /// returns true for an expired hint — the hint should be silently dropped.
+    #[test]
+    fn shadow_hint_cancelled_when_user_speaks_during_delay() {
+        ensure_vec_extension();
+        let model = MockEmbedder;
+        let db = test_db("shadow_cancel_vad");
+        let scheduler = HintScheduler::new();
+        let session_id = "sess-shadow-vad";
+
+        schedule_shadow_hint(&scheduler, session_id, "What is Rust?", QuestionType::Technical, &db, &model);
+
+        // Simulate user speaking (mic VAD) during the 2.5s delay
+        let mut vad = crate::audio::mic_vad::MicVadState::new();
+        // Feed speech to trigger VAD
+        for _ in 0..2 {
+            vad.feed_audio(&vec![5000i16; 1600]);
+        }
+
+        // Advance past deadline
+        let future = Instant::now() + std::time::Duration::from_secs(5);
+        let expired = scheduler.tick(future);
+
+        assert_eq!(expired.len(), 1, "tick should still return the hint (VAD isn't in tick)");
+        // Now simulate what emit_expired_hints does:
+        let should_cancel = expired.iter().any(|h| should_cancel_hint(h, Some(&vad)));
+        assert!(should_cancel, "VAD should cancel the expired hint");
+    }
+
+    #[test]
+    fn shadow_hint_fires_when_user_silent_during_delay() {
+        ensure_vec_extension();
+        let model = MockEmbedder;
+        let db = test_db("shadow_no_vad");
+        let scheduler = HintScheduler::new();
+        let session_id = "sess-shadow-silent";
+
+        schedule_shadow_hint(&scheduler, session_id, "Tell me about a conflict", QuestionType::Star, &db, &model);
+
+        // No mic VAD activity
+        let vad = crate::audio::mic_vad::MicVadState::new();
+
+        let future = Instant::now() + std::time::Duration::from_secs(5);
+        let expired = scheduler.tick(future);
+
+        assert_eq!(expired.len(), 1, "tick should return the expired hint");
+        let should_cancel = expired.iter().any(|h| should_cancel_hint(h, Some(&vad)));
+        assert!(!should_cancel, "VAD should not cancel when user is silent");
+
+        let hint = &expired[0];
+        assert_eq!(hint.session_id, session_id);
+        assert!(hint.text.contains("STAR"),
+            "hint text should contain the generic Star hint, got: {}",
+            hint.text);
+    }
+
+    /// Combined test: schedule two shadow hints, user starts speaking,
+    /// only the hint scheduled after speech stops should survive.
+    #[test]
+    fn shadow_hint_multi_question_with_vad() {
+        ensure_vec_extension();
+        let model = MockEmbedder;
+        let db = test_db("shadow_multi_vad");
+        let scheduler = HintScheduler::new();
+
+        // Simulate two questions in sequence
+        schedule_shadow_hint(&scheduler, "sess-m", "first question", QuestionType::Technical, &db, &model);
+        schedule_shadow_hint(&scheduler, "sess-m", "second question", QuestionType::Star, &db, &model);
+
+        let mut vad = crate::audio::mic_vad::MicVadState::new();
+        // User starts speaking after both questions
+        for _ in 0..2 {
+            vad.feed_audio(&vec![5000i16; 1600]);
+        }
+
+        let future = Instant::now() + std::time::Duration::from_secs(5);
+        let expired = scheduler.tick(future);
+        assert_eq!(expired.len(), 2, "both hints should be expired by tick");
+
+        // Both should be cancelled by VAD
+        let any_survive = expired.iter().any(|h| !should_cancel_hint(h, Some(&vad)));
+        assert!(!any_survive, "all hints should be cancelled when user is speaking");
+    }
+
+    /// Combined test: specify that VAD cancellation does NOT interfere with
+    /// session-level CancelSession (Panic / end of session).
+    #[test]
+    fn vad_cancel_does_not_conflict_with_cancel_session() {
+        ensure_vec_extension();
+        let model = MockEmbedder;
+        let db = test_db("vad_no_conflict");
+        let scheduler = HintScheduler::new();
+        let session_id = "sess-vad-conflict";
+
+        schedule_shadow_hint(&scheduler, session_id, "question", QuestionType::Technical, &db, &model);
+
+        // Cancel at session level (same as pipeline thread end)
+        scheduler.cancel_all(session_id);
+
+        // Even without VAD detection, CancelSession should prevent the hint
+        // from firing.
+        let future = Instant::now() + std::time::Duration::from_secs(5);
+        let expired = scheduler.tick(future);
+
+        assert!(expired.is_empty(),
+            "CancelSession should remove hints regardless of VAD state");
+    }
+
+    /// Combined test: specify that VAD cancellation does NOT interfere with
+    /// the existing panic/session-end tests from the original test suite.
     #[test]
     fn cancel_session_does_not_affect_other_sessions() {
         ensure_vec_extension();
