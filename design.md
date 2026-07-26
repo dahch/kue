@@ -1,15 +1,15 @@
 # Kue — Technical Design
 
-> Estado actual: **Sprint 0 + RAG engine** (infraestructura base + captura de audio dual + embeddings + búsqueda vectorial). Este documento describe la arquitectura viva del proyecto, indicando qué partes están implementadas y cuáles son planeadas.
+> Current status: **Sprint 0–2 completed** (base infrastructure + dual audio capture + STT + RAG engine). This document describes the living architecture of the project, indicating which parts are implemented and which are planned.
 
 ---
 
-## 1. Arquitectura general
+## 1. General architecture
 
 ```mermaid
 graph TD
     subgraph "Frontend (React + TypeScript)"
-        A[App.tsx<br/>placeholder]
+        A[App.tsx<br/>debug RAG UI]
     end
 
     subgraph "Tauri Bridge (IPC)"
@@ -38,9 +38,9 @@ graph TD
         S_KEYS[settings]
     end
 
-    subgraph "Audio Capture (implementado)"
-        N[cpal - micrófono<br/>Canal A]
-        O[screencapturekit-rs - loopback<br/>Canal B]
+    subgraph "Audio Capture (implemented)"
+        N[cpal - microphone<br/>Channel A]
+        O[screencapturekit-rs - loopback<br/>Channel B]
         P[hound - WAV writer<br/>Background threads]
     end
 
@@ -48,13 +48,16 @@ graph TD
         TT[types::TranscriptLine<br/>types::Speaker]
     end
 
-    subgraph "RAG Engine (implementado)"
+    subgraph "RAG Engine (implemented)"
         S[rag::embeddings<br/>snowflake-arctic-embed-s + Metal]
         T[rag::indexer<br/>ingest / search / chunk / folder]
     end
 
-    subgraph "ML Pipeline (planeado)"
-        Q[Moonshine STT<br/>Aún sin dependencia]
+    subgraph "STT Module (implemented, not integrated in lifecycle)"
+        Q1[stt::MoonshineFFIEngine<br/>libmoonshine.dylib via libloading]
+        Q2[stt::MoonshineCLIEngine<br/>moonshine-voice CLI fallback]
+        Q3[stt::SimpleVAD<br/>energy-based]
+        Q4[stt::STTPipeline<br/>thread loopback→VAD→STT→events→DB]
     end
 
     A -->|invoke| B1
@@ -82,11 +85,10 @@ graph TD
     S --> T
     T --> G
 
-    style Q fill:#f0f0f0,stroke-dasharray: 5 5
     style A fill:#e1f5fe,stroke:#0288d1
 ```
 
-**Leyenda:** Trazo sólido = implementado. Trazo discontinuo = planeado/stub.
+**Legend:** Solid line = implemented. Dashed line = planned/stub. The STT module is implemented and tested but not integrated into the app lifecycle (setup/invoke_handler).
 
 ---
 
@@ -94,81 +96,97 @@ graph TD
 
 ### 2.1 Frontend (`src/`)
 
-- **`main.tsx`** — Entry point React 18, monta `<App />` en `#root`.
-- **`App.tsx`** — Componente placeholder con un contador. Sin lógica de dominio aún.
-- **`index.css`** — Directivas Tailwind (`@tailwind base/components/utilities`).
+- **`main.tsx`** — Entry point React 18, mounts `<App />` on `#root`.
+- **`App.tsx`** — Debug UI with controls to index folders (RAG) and search vector context. Buttons and text input connected via `invoke()` to the Tauri commands `index_folder_cmd` and `search_context`. No product domain logic yet (no overlay, hints, or sessions).
+- **`index.css`** — Tailwind directives (`@tailwind base/components/utilities`).
 
 ### 2.2 Tauri Shell (`lib.rs`)
 
-Archivo `src-tauri/src/lib.rs` (~37 líneas):
+File `src-tauri/src/lib.rs` (~37 lines):
 
 ```
 mod audio;
 mod db;
 mod rag;
+mod stt;      // STT module (Moonshine) — implemented and tested, pending integration into the setup lifecycle
 mod types;
 
 run() {
-    db::register_vec_extension();                     // Registra sqlite-vec antes que cualquier conexión
-    audio::capture::AudioCapture::cleanup_orphaned_temp_dirs();  // Limpia WAV huérfanos de crashes previos
+    db::register_vec_extension();                     // Registers sqlite-vec before any connection
+    audio::capture::AudioCapture::cleanup_orphaned_temp_dirs();  // Cleans orphan WAVs from previous crashes
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
-            let database = db::init_db(app);           // Crea ~/Library/.../kue.db + migra schema
+            let database = db::init_db(app)?;           // Creates ~/Library/.../kue.db + migrates schema
             app.manage(database);
 
             let recordings_dir = app.path().app_data_dir()?.join("recordings");
             app.manage(audio::capture::AudioCapture::new(recordings_dir));
 
-            let model = rag::embeddings::load_embedding_model()?;  // Descarga/carga BERT en Metal
-            app.manage(std::sync::Mutex::new(model));    // Mutex para acceso thread-safe
+            let model = rag::embeddings::load_embedding_model()?;  // Downloads/loads BERT on Metal
+            app.manage(std::sync::Mutex::new(model));    // Mutex for thread-safe access
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             db::get_db_status,
             audio::capture::toggle_audio_capture,
-            rag::indexer::index_folder_cmd,             // Indexa documentos para RAG
-            rag::indexer::search_context,               // Búsqueda vectorial
+            rag::indexer::index_folder_cmd,             // Indexes documents for RAG
+            rag::indexer::search_context,               // Vector search
         ])
         .run(tauri::generate_context!())
 }
 ```
 
-- **`mod audio`**, **`mod db`**, **`mod rag`**, **`mod types`** — Submódulos del backend.
-- **`cleanup_orphaned_temp_dirs()`** — Elimina directorios temporales `kue-session-*` dejados por sesiones crasheadas.
-- **`plugin(tauri_plugin_shell)`** — Necesario para invocar procesos externos (planeado para BYOK).
-- **`app.manage(database)`**, **`app.manage(AudioCapture)`**, **`app.manage(Mutex<EmbeddingModel>)`** — Inyecta `Database`, `AudioCapture` y el modelo de embeddings como estado Tauri.
-- **`index_folder_cmd`** y **`search_context`** — Comandos Tauri para el motor RAG.
+- **`mod audio`**, **`mod db`**, **`mod rag`**, **`mod stt`**, **`mod types`** — Backend submodules.
+- **`cleanup_orphaned_temp_dirs()`** — Removes temporary `kue-session-*` directories left by crashed sessions.
+- **`plugin(tauri_plugin_shell)`** — Necessary to invoke external processes (planned for BYOK).
+- **`app.manage(database)`**, **`app.manage(AudioCapture)`**, **`app.manage(Mutex<EmbeddingModel>)`** — Injects `Database`, `AudioCapture` and the embeddings model as Tauri state.
+- **`index_folder_cmd`** and **`search_context`** — Tauri commands for the RAG engine.
+- **Note:** STT (`mod stt`) is implemented and tested (STTPipeline, MoonshineFFIEngine, MoonshineCLIEngine, SimpleVAD) but is not yet integrated into `setup` — no pipeline thread is spawned nor Tauri commands registered for it. Full integration will require connecting the audio loopback to the STT pipeline, registering `start_session`/`stop_session` commands, and emitting `new-transcript` events to the frontend.
 
 ### 2.3 Database Module (`db/mod.rs`)
 
-El módulo sustancial de la app (837 líneas, 27 tests). Ver §3 para detalle del schema y §4 para tests.
+The substantial module of the app (~850 lines, 27 tests). See §3 for schema details and §4 for tests.
 
 ### 2.4 Audio Module (`audio/capture.rs`)
 
-Módulo sustancial (~1166 líneas, 50 tests) que implementa la captura de audio dual:
+Substantial module (~1230 lines, 50 tests) that implements dual audio capture:
 
-- **Micrófono (Canal A):** vía `cpal`, soporta formatos de sample i16 y f32 con conversión automática a i16.
-- **Loopback (Canal B):** vía `screencapturekit-rs` (ScreenCaptureKit), captura el audio de salida del sistema (voz del entrevistador). `excludes_current_process_audio: true` para evitar eco.
-- **WAV writer:** dos hilos background (`kue-wav-mic-A`, `kue-wav-loopback-B`) que escriben los canales a archivos WAV separados (16 kHz, mono, 16-bit) usando `hound`.
-- **`AudioCapture` struct:** gestionado como estado Tauri vía `app.manage()`. Expone `start(mode)`, `stop()`, `toggle(start, mode)`.
-- **`toggle_audio_capture` command:** comando Tauri que arranca/para ambas capturas, validando modo (`practice`|`shadow`) contra el CHECK constraint de la BD.
-- **51 tests:** cubren conversión f32→i16 (casos borde: NaN, infinito, clamping, valores muy pequeños), serialización de estados (4 combinaciones), creación de directorios, formato de paths, modo inválido (múltiples variantes), toggle (4 caminos), writer WAV (creación, buffers múltiples, path inválido, buffer vacío, vida cíclica), y consistencia entre validación de modos y DB.
+- **Microphone (Channel A):** via `cpal`, supports i16 and f32 sample formats with automatic conversion to i16.
+- **Loopback (Channel B):** via `screencapturekit-rs` (ScreenCaptureKit), captures the system output audio (interviewer's voice). `excludes_current_process_audio: true` to avoid echo.
+- **WAV writer:** two background threads (`kue-wav-mic-A`, `kue-wav-loopback-B`) that write the channels to separate WAV files (16 kHz, mono, 16-bit) using `hound`.
+- **`AudioCapture` struct:** managed as Tauri state via `app.manage()`. Exposes `start(mode)`, `stop()`, `toggle(start, mode)`.
+- **`toggle_audio_capture` command:** Tauri command that starts/stops both captures, validating mode (`practice`|`shadow`) against the DB CHECK constraint.
+- **51 tests:** cover f32→i16 conversion (edge cases: NaN, infinity, clamping, very small values), state serialization (4 combinations), directory creation, path format, invalid mode (multiple variants), toggle (4 paths), WAV writer (creation, multiple buffers, invalid path, empty buffer, cyclic lifecycle), and consistency between mode validation and DB.
 
-### 2.5 Configuración
+### 2.5 STT Module (`stt/`)
 
-- **`tauri.conf.json`** — Tauri v2, ventana de 800×600, bundle DMG (solo macOS), dev URL en puerto 1420.
-- **`vite.config.ts`** — Vite 6 con plugin React, HMR en puerto 1421, ignora cambios en `src-tauri/`.
-- **`capabilities/default.json`** — Permisos: `core:default` + `shell:allow-open`.
+Module (~630 lines, 81 tests) that implements real-time transcription of Channel B. The module code is complete and tested, but **is not integrated into the app lifecycle** — no STTPipeline is spawned in `setup()` nor are Tauri commands registered for STT sessions. Integration will require connecting the loopback audio to the pipeline, registering `start_session`/`stop_session` commands, and emitting `new-transcript` events:
+
+- **`stt/mod.rs`** — `STTEngine` trait with `load()` and `transcribe_audio_chunk()`, `STTConfig`, blanket impl for `Box<T>`.
+- **`stt/ffi.rs`** — `MoonshineFFIEngine`: loads `libmoonshine.dylib` at runtime via `libloading`, declares FFI bindings with `#[repr(C)]` for `CTranscript`, `CTranscriptLine`, etc. Calls the Moonshine streaming API: `create_stream` → `start_stream` → `add_audio_to_stream` → `transcribe_stream`. Frees resources in `Drop`.
+- **`stt/cli.rs`** — `MoonshineCLIEngine` (fallback): writes WAV segments to temp with UUID, invokes `moonshine-voice transcribe --wav-path <file>` as a subprocess, parses the last line of output.
+- **`stt/vad.rs`** — `SimpleVAD`: voice activity detection by RMS energy with configurable threshold, minimum speech duration, and silence timeout.
+- **`stt/pipeline.rs`** — `STTPipeline`: orchestrator that receives audio from loopback via `mpsc::Receiver`, runs VAD + segment buffer + STT engine + emits `new-transcript` event (with `types::TranscriptLine`) + persists in `transcript_lines`.
+
+**Auto-detection:** At runtime, tries FFI first (`libmoonshine.dylib` in `MOONSHINE_LIB_DIR` or standard paths), falls back to CLI if the library is not found. No Whisper — Moonshine is the only option.
+
+**81 tests:** cover `parse_transcript` (null ptr, 0 lines, completed/incomplete, empty text, preferred line), `rms` (8 cases), VAD (15+ cases: silence, speech, timeout, reset, minimum duration, empty, threshold, boundary, accumulation, reset during speech, etc.), temp WAV writing (3 cases: data, empty, unique names), `STTPipeline` (engine selection, load delegation, start/end session, process chunk, flush segment, DB persistence, poisoned mutex, special characters, multiple lines).
+
+### 2.6 Configuration
+
+- **`tauri.conf.json`** — Tauri v2, 800×600 window, DMG bundle (macOS only), dev URL on port 1420.
+- **`vite.config.ts`** — Vite 6 with React plugin, HMR on port 1421, ignores changes in `src-tauri/`.
+- **`capabilities/default.json`** — Permissions: `core:default` + `shell:allow-open`.
 
 ---
 
-## 3. Schema de base de datos
+## 3. Database schema
 
 ```sql
--- Sesiones de entrevista
+-- Interview sessions
 CREATE TABLE sessions (
     id TEXT PRIMARY KEY DEFAULT (hex(randomblob(16))),
     started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -178,7 +196,7 @@ CREATE TABLE sessions (
     mode TEXT CHECK(mode IN ('practice', 'shadow'))
 );
 
--- Líneas de transcripción por sesión
+-- Transcription lines per session
 CREATE TABLE transcript_lines (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -188,7 +206,7 @@ CREATE TABLE transcript_lines (
     ended_at_ms INTEGER NOT NULL
 );
 
--- Documentos subidos por el usuario (CV, proyectos)
+-- Documents uploaded by the user (CV, projects)
 CREATE TABLE documents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     filename TEXT NOT NULL,
@@ -196,103 +214,107 @@ CREATE TABLE documents (
     added_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- Chunks de documentos con metadatos (tag + métrica)
+-- Document chunks with metadata (tag + metric)
 CREATE TABLE chunks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     document_id INTEGER NOT NULL REFERENCES documents(id),
     text TEXT NOT NULL,
     chunk_index INTEGER NOT NULL,
-    tag TEXT,           -- ej. 'nestjs', 'redis', 'star'
-    metric TEXT         -- ej. '10k req/seg', '40% reducción'
+    tag TEXT,           -- e.g. 'nestjs', 'redis', 'star'
+    metric TEXT         -- e.g. '10k req/seg', '40% reducción'
 );
 
--- Índice vectorial (sqlite-vec)
+-- Vector index (sqlite-vec)
 CREATE VIRTUAL TABLE chunks_vec USING vec0(embedding float[384]);
 
--- Tabla clave-valor para settings (NO incluye API keys)
+-- Key-value table for settings (does NOT include API keys)
 CREATE TABLE settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 ```
 
-**Detalles de implementación:**
+**Implementation details:**
 
 - WAL mode + foreign keys ON + busy timeout 5000ms.
-- `chunks_vec` usa embedding de 384 dimensiones (`snowflake-arctic-embed-s`).
-- La extensión `sqlite-vec` se registra vía `sqlite3_auto_extension` antes de abrir cualquier conexión.
-- No hay ORM — consultas SQL directas vía `rusqlite`.
+- `chunks_vec` uses 384-dimensional embedding (`snowflake-arctic-embed-s`).
+- The `sqlite-vec` extension is registered via `sqlite3_auto_extension` before opening any connection.
+- No ORM — direct SQL queries via `rusqlite`.
 
 ---
 
-## 4. Datos de diseño
+## 4. Design data
 
-### 4.1 Conexiones concurrentes
+### 4.1 Concurrent connections
 
-`Database.conn` es `Mutex<Connection>` — un solo hilo accede a SQLite a la vez. La prueba `database_mutex_allows_concurrent_locks` verifica que dos threads pueden lockear secuencialmente y ver el mismo estado.
+`Database.conn` is `Mutex<Connection>` — a single thread accesses SQLite at a time. The `database_mutex_allows_concurrent_locks` test verifies that two threads can lock sequentially and see the same state.
 
-### 4.2 Manejo de errores
+### 4.2 Error handling
 
-- `open_and_migrate` retorna `Result<Database, Box<dyn std::error::Error>>`.
-- `get_db_status_inner` retorna `Result<DbStatus, String>` (errores planos para Tauri IPC).
-- El mutex envenenado se maneja como error capturable (test `get_db_status_handles_poisoned_mutex`).
+- `open_and_migrate` returns `Result<Database, Box<dyn std::error::Error>>`.
+- `get_db_status_inner` returns `Result<DbStatus, String>` (flat errors for Tauri IPC).
+- The poisoned mutex is handled as a catchable error (test `get_db_status_handles_poisoned_mutex`).
 
-### 4.3 Idempotencia
+### 4.3 Idempotency
 
-Todas las DDL usan `IF NOT EXISTS`. El test `open_and_migrate_is_idempotent` corre la migración dos veces y verifica que las tablas no cambien.
-
----
-
-## 5. Planeado vs implementado
-
-| Componente                | Estado           | Dependencia en Cargo.toml                                                             | Código                                |
-| ------------------------- | ---------------- | ------------------------------------------------------------------------------------- | ------------------------------------- |
-| DB schema + migraciones   | **Implementado** | `rusqlite`, `sqlite-vec`                                                              | `db/mod.rs`                           |
-| sqlite-vec register       | **Implementado** | `sqlite-vec`                                                                          | `db/mod.rs`                           |
-| Tauri setup + comandos    | **Implementado** | `tauri 2`                                                                             | `lib.rs`                              |
-| Frontend placeholder      | **Implementado** | React 18                                                                              | `App.tsx`                             |
-| Captura micrófono (cpal)  | **Implementado** | `cpal` (activo)                                                                       | `audio/capture.rs`                    |
-| Captura loopback (SCK)    | **Implementado** | `screencapturekit` (activo)                                                           | `audio/capture.rs`                    |
-| Escritura WAV (hound)     | **Implementado** | `hound` (activo)                                                                      | `audio/capture.rs`                    |
-| RAG embeddings + indexer  | **Implementado** | `candle-core`, `candle-nn`, `candle-transformers`, `hf-hub`, `tokenizers`, `bytemuck` | `rag/embeddings.rs`, `rag/indexer.rs` |
-| STT (Moonshine)           | **No iniciado**  | No declarada                                                                          | —                                     |
-| Clasificador de preguntas | **No iniciado**  | —                                                                                     | —                                     |
-| Generador de hints        | **No iniciado**  | —                                                                                     | —                                     |
-| Overlay / UI real         | **No iniciado**  | —                                                                                     | —                                     |
-| Post-call BYOK            | **No iniciado**  | `tauri-plugin-shell` presente                                                         | —                                     |
+All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the migration twice and verifies that the tables don't change.
 
 ---
 
-## 6. Patrones de diseño
+## 5. Planned vs implemented
 
-- **Command pattern (Tauri):** `#[tauri::command]` como entry point de funcionalidad (`get_db_status`, `toggle_audio_capture`, `index_folder_cmd`, `search_context`).
-- **State management via Tauri:** `app.manage()` inyecta dependencias accesibles por estado (Database, AudioCapture, Mutex<EmbeddingModel>).
-- **Inner function pattern:** Funciones internas (ej. `get_db_status_inner`, `ingest_documents`, `search`) separadas de wrappers Tauri para testabilidad.
-- **Trait pattern (Embedder):** Abstracción `Embedder` trait con implementaciones `EmbeddingModel` (real) y `MockEmbeddingModel`/`TestEmbedder` (tests), permitiendo testear el indexador sin GPU.
-- **Mutex-guarded model:** `EmbeddingModel` envuelto en `std::sync::Mutex` para acceso thread-safe desde múltiples comandos Tauri; el trait `Embedder` se implementa también para `Mutex<EmbeddingModel>`.
-- **Once pattern:** `std::sync::Once` para registrar sqlite-vec una sola vez en tests.
-- **Temporary directory isolation:** Cada test usa su propio directorio temporal (`TempDir` struct, con contador atómico).
-- **Transactional ingestion:** Cada archivo se procesa dentro de una transacción SQLite (`BEGIN...COMMIT`) para atomicidad; si falla el embedding se revierte todo el archivo.
-- **Safe Send wrappers:** `MicHandle` y `LoopbackHandle` implementan `Send` manualmente para `cpal::Stream` y `SCStream`, justificado con safety comments por invariante de ownership.
+| Component                | Status           | Dependency in Cargo.toml                                                             | Code                                |
+| ----------------------- | ---------------- | ------------------------------------------------------------------------------------- | ----------------------------------- |
+| DB schema + migrations  | **Implemented**  | `rusqlite`, `sqlite-vec`                                                              | `db/mod.rs`                         |
+| sqlite-vec register     | **Implemented**  | `sqlite-vec`                                                                          | `db/mod.rs`                         |
+| Tauri setup + commands  | **Implemented**  | `tauri 2`                                                                             | `lib.rs`                            |
+| Frontend (debug RAG UI) | **Implemented**  | React 18                                                                              | `App.tsx`                           |
+| Mic capture (cpal)      | **Implemented**  | `cpal` (active)                                                                       | `audio/capture.rs`                  |
+| Loopback capture (SCK)  | **Implemented**  | `screencapturekit` (active)                                                           | `audio/capture.rs`                  |
+| WAV writing (hound)     | **Implemented**  | `hound` (active)                                                                      | `audio/capture.rs`                  |
+| RAG embeddings + indexer | **Implemented**  | `candle-core`, `candle-nn`, `candle-transformers`, `hf-hub`, `tokenizers`, `bytemuck` | `rag/embeddings.rs`, `rag/indexer.rs` |
+| STT (Moonshine)         | **Implemented** (not integrated in lifecycle) | `libloading` (dynamically loaded `libmoonshine.dylib`), `uuid`                       | `stt/mod.rs`, `stt/ffi.rs`, `stt/cli.rs`, `stt/vad.rs`, `stt/pipeline.rs` |
+| Question classifier     | **Not started**  | —                                                                                     | —                                    |
+| Hint generator          | **Not started**  | —                                                                                     | —                                    |
+| Overlay / real UI       | **Not started**  | —                                                                                     | —                                    |
+| Post-call BYOK          | **Not started**  | `tauri-plugin-shell` present                                                          | —                                    |
 
 ---
 
-## 7. Dependencias externas
+## 6. Design patterns
 
-| Crate                  | Propósito                                        | Versión |
-| ---------------------- | ------------------------------------------------ | ------- |
-| `tauri`                | Shell de aplicación nativa                       | 2       |
-| `tauri-plugin-shell`   | Invocación de procesos externos (BYOK)           | 2       |
-| `rusqlite`             | Cliente SQLite con bundled                       | 0.33    |
-| `sqlite-vec`           | Índice vectorial dentro de SQLite                | 0.1.9   |
-| `cpal`                 | Captura de audio por micrófono                   | 0.15    |
-| `screencapturekit-rs`  | Captura de loopback de sistema                   | git     |
-| `hound`                | Encoding/decoding WAV                            | 3.5     |
-| `candle-core`          | Framework ML para embeddings                     | 0.8     |
-| `candle-nn`            | Primitivas de redes neuronales                   | 0.8     |
-| `candle-transformers`  | Modelos transformer (BERT)                       | 0.8     |
-| `hf-hub`               | Descarga de modelos de HuggingFace               | 0.4     |
-| `tokenizers`           | Tokenizador BERT para embeddings                 | 0.21    |
-| `bytemuck`             | Casting seguro de bytes para vectores sqlite-vec | 1       |
-| `serde` / `serde_json` | Serialización IPC                                | 1       |
-| `anyhow` / `thiserror` | Manejo de errores idiomático                     | 1 / 2   |
+- **Command pattern (Tauri):** `#[tauri::command]` as entry point for functionality (`get_db_status`, `toggle_audio_capture`, `index_folder_cmd`, `search_context`).
+- **State management via Tauri:** `app.manage()` injects dependencies accessible by state (Database, AudioCapture, Mutex<EmbeddingModel>).
+- **Inner function pattern:** Inner functions (e.g. `get_db_status_inner`, `ingest_documents`, `search`) separated from Tauri wrappers for testability.
+- **Trait pattern (Embedder):** `Embedder` trait abstraction with `EmbeddingModel` (real) and `MockEmbeddingModel`/`TestEmbedder` (tests) implementations, allowing the indexer to be tested without GPU.
+- **Mutex-guarded model:** `EmbeddingModel` wrapped in `std::sync::Mutex` for thread-safe access from multiple Tauri commands; the `Embedder` trait is also implemented for `Mutex<EmbeddingModel>`.
+- **Once pattern:** `std::sync::Once` to register sqlite-vec only once in tests.
+- **Temporary directory isolation:** Each test uses its own temporary directory (`TempDir` struct, with atomic counter).
+- **Transactional ingestion:** Each file is processed within a SQLite transaction (`BEGIN...COMMIT`) for atomicity; if the embedding fails, the entire file is rolled back.
+- **Session-scoped temp dirs:** Capture WAVs are written to `temp_dir()/kue-session-{timestamp}/`, streamed by Moonshine and deleted at session end. The `settings` table with `retain_audio` (opt-in, default `false`) controls persistence. `cleanup_orphaned_temp_dirs()` in `lib.rs` cleans orphan directories from crashed sessions.
+- **Safe Send wrappers:** `MicHandle` and `LoopbackHandle` manually implement `Send` for `cpal::Stream` and `SCStream`, justified with safety comments by ownership invariant.
+- **FFI auto-detection pattern:** `MoonshineFFIEngine::is_available()` checks for `libmoonshine.dylib` at runtime; if not available, falls back to `MoonshineCLIEngine` without user intervention.
+
+---
+
+## 7. External dependencies
+
+| Crate                  | Purpose                                           | Version |
+| ---------------------- | ------------------------------------------------- | ------- |
+| `tauri`                | Native application shell                          | 2       |
+| `tauri-plugin-shell`   | External process invocation (BYOK)                | 2       |
+| `rusqlite`             | SQLite client with bundled                        | 0.33    |
+| `sqlite-vec`           | Vector index within SQLite                        | 0.1.9   |
+| `cpal`                 | Microphone audio capture                          | 0.15    |
+| `screencapturekit-rs`  | System loopback capture                           | git     |
+| `hound`                | WAV encoding/decoding                             | 3.5     |
+| `candle-core`          | ML framework for embeddings                       | 0.8     |
+| `candle-nn`            | Neural network primitives                         | 0.8     |
+| `candle-transformers`  | Transformer models (BERT)                         | 0.8     |
+| `hf-hub`               | Model download from HuggingFace                   | 0.4     |
+| `tokenizers`           | BERT tokenizer for embeddings                     | 0.21    |
+| `bytemuck`             | Safe byte casting for sqlite-vec vectors          | 1       |
+| `serde` / `serde_json` | IPC serialization                                 | 1       |
+| `libloading`           | Dynamic loading of libmoonshine.dylib (STT FFI)    | 0.8     |
+| `uuid`                 | Session IDs and unique temp file names            | 1       |
+| `anyhow` / `thiserror` | Idiomatic error handling                          | 1 / 2   |

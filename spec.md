@@ -1,119 +1,119 @@
 # Kue — spec.md (v1)
 
-> Nombre en clave: **Kue**.
+> Codename: **Kue**.
 
-> **Estado de implementación:** Sprint 0 + RAG engine completados (infraestructura Tauri + SQLite + sqlite-vec + captura de audio dual + embeddings con candle + búsqueda vectorial). El schema de BD está implementado (22 tests), el módulo de captura de audio (mic + loopback, ~1000 líneas, 51 tests) y el motor de RAG (embeddings + indexador, ~600 líneas, 44 tests) también. Las secciones §3–§9 describen el producto completo planeado; consulta [`design.md`](./design.md) para lo que está realmente construido. 
+> **Implementation status:** Sprint 0–2 completed. The DB schema is implemented (27 tests), the audio capture module (mic + loopback, ~1230 lines, 50 tests), the RAG engine (embeddings + indexer, 14+57=71 tests) and the STT module (5 files, ~630 lines, 81 tests) as well. The STT module integrates Moonshine via FFI (libmoonshine.dylib) with CLI fallback (`moonshine-voice`), simple VAD, pipeline in its own thread, `new-transcript` events to the frontend and persistence in `transcript_lines`. STT is not yet integrated into the app lifecycle (the Tauri commands and pipeline thread spawn are pending). Sections §3–§9 describe the complete planned product; see [`design.md`](./design.md) for what is actually built.
 
-## 1. Objetivo
+## 1. Objective
 
-Aplicación de escritorio (macOS-only en v1) que funciona como "copiloto de memoria" para entrevistas técnicas y simulacros. No responde por el usuario: extrae información de su propio contexto (CV, proyectos, métricas) y muestra hints ultra-cortos (5-8 palabras) que ayudan a mantener fluidez y estructura bajo presión. Al finalizar, guarda el transcript completo para un análisis post-call bajo demanda.
+Desktop application (macOS-only in v1) that functions as a "memory copilot" for technical interviews and mock interviews. It doesn't answer for the user: it extracts information from their own context (CV, projects, metrics) and displays ultra-short hints (5-8 words) that help maintain fluency and structure under pressure. When finished, it saves the full transcript for on-demand post-call analysis.
 
-## 2. Visión general del producto
+## 2. Product overview
 
-**Mercado objetivo:** ingenieros de software, científicos de datos y perfiles técnicos preparándose para entrevistas, o que quieren un apoyo de memoria durante procesos de selección reales.
+**Target market:** software engineers, data scientists, and technical professionals preparing for interviews, or wanting memory support during real hiring processes.
 
-**Propuesta de valor:**
-- **Sin trampas:** no genera respuestas; solo recuerda tus propias métricas, proyectos y estructura.
-- **Privacidad total:** STT, RAG y clasificación corren 100% local. El único dato que sale de la máquina es el transcript post-call, y solo si el usuario decide enviarlo a un LLM externo (BYOK).
-- **Bajo estrés:** reduce la ansiedad escénica recordando puntos clave en el momento justo, no antes ni después.
+**Value proposition:**
+- **No cheating:** doesn't generate answers; only recalls your own metrics, projects, and structure.
+- **Total privacy:** STT, RAG, and classification run 100% locally. The only data that leaves the machine is the post-call transcript, and only if the user decides to send it to an external LLM (BYOK).
+- **Low stress:** reduces performance anxiety by recalling key points at the right moment, not before or after.
 
-## 3. Objetivos / no-objetivos (v1)
+## 3. Goals / non-goals (v1)
 
-**Sí:**
-- Transcripción en tiempo real con separación de hablante por canal de audio.
-- Modo **Practice** (simulacro, hints didácticos e inmediatos) y modo **Shadow** (entrevista real, hints solo si hay bloqueo >2.5s).
-- Ingesta de contexto propio (PDF/TXT/MD) indexado localmente vía RAG.
-- Transcript completo guardado por sesión.
-- Análisis post-call bajo demanda con BYOK.
+**Yes:**
+- Real-time transcription with speaker separation by audio channel.
+- **Practice** mode (mock interview, instructive and immediate hints) and **Shadow** mode (real interview, hints only if stuck >2.5s).
+- Own context ingestion (PDF/TXT/MD) indexed locally via RAG.
+- Full transcript saved per session.
+- On-demand post-call analysis with BYOK.
 
 **No (v1):**
-- Windows y Linux — **macOS-only por ahora**, evaluado para v2 según qué tan bien funcione este v1.
-- Respuestas completas generadas en vivo — fuera de alcance por diseño, no por plazo.
-- Sync multi-dispositivo o backend en la nube.
-- Clonación de voz / TTS en vivo.
+- Windows and Linux — **macOS-only for now**, evaluated for v2 based on how well this v1 works.
+- Full answers generated live — out of scope by design, not by deadline.
+- Multi-device sync or cloud backend.
+- Voice cloning / live TTS.
 
-## 4. Features principales
+## 4. Main features
 
-| Módulo | Descripción | Modo |
+| Module | Description | Mode |
 |---|---|---|
-| **Practice** | Entrevista simulada con feedback generoso; hints más didácticos, el clasificador explica la estructura. | Local |
-| **Shadow** | Entrevista real; hints escasos, solo aparecen si el usuario se bloquea (delay > 2.5s tras la pregunta). | Local |
-| **Post-Call** | Botón que analiza el transcript completo: resumen, preguntas débiles, proyectos olvidados, estructura STAR mejorable. | BYOK |
+| **Practice** | Mock interview with generous feedback; more instructive hints, the classifier explains the structure. | Local |
+| **Shadow** | Real interview; sparse hints, only appear if the user gets stuck (delay > 2.5s after the question). | Local |
+| **Post-Call** | Button that analyzes the full transcript: summary, weak questions, forgotten projects, improvable STAR structure. | BYOK |
 
-## 5. Stack tecnológico
+## 5. Technology stack
 
-| Capa | Tecnología | Justificación |
+| Layer | Technology | Justification |
 |---|---|---|
-| Frontend | React + TypeScript | UI dinámica, prototipado rápido. |
-| App Core | Rust (Tauri) | Acceso nativo a audio, ventanas transparentes (overlay), binario único. |
-| Captura de audio | `cpal` (mic) + `screencapturekit-rs` (loopback sistema) | ScreenCaptureKit (macOS 13+) captura audio de sistema sin drivers virtuales — evita depender de BlackHole. Requiere permiso de usuario en Ajustes → Privacidad → Screen & System Audio Recording (no hay entitlement de firma que lo evite). |
-| STT | Moonshine (Medium) | Local, streaming, <260ms de latencia, diarización nativa como respaldo. |
-| Embeddings (RAG) | candle (HuggingFace Rust) | Inferencia nativa en Rust. Decidido: `snowflake-arctic-embed-s` (384-d, mismo esquema que MiniLM, mejor desempeño en benchmarks MTEB/BEIR). |
-| Vector DB / Storage | SQLite + sqlite-vec | Búsqueda vectorial dentro del mismo archivo `.db` que transcripts/sesiones. |
-| Clasificador de preguntas | Rust, heurísticas + regex | Sin LLM externo — ver §7 para el detalle de reglas. |
-| Análisis post-call | BYOK (Anthropic/OpenAI/Gemini/OpenRouter/Ollama/OpenAI-compatible) | Sin presión de latencia, usuario controla costo y privacidad. |
-| Secretos (API keys) | Keychain nativo del OS vía `tauri-plugin-stronghold` o keyring | Nunca texto plano en la tabla `settings`. |
+| Frontend | React + TypeScript | Dynamic UI, rapid prototyping. |
+| App Core | Rust (Tauri) | Native audio access, transparent windows (overlay), single binary. |
+| Audio capture | `cpal` (mic) + `screencapturekit-rs` (system loopback) | ScreenCaptureKit (macOS 13+) captures system audio without virtual drivers — avoids depending on BlackHole. Requires user permission in Settings → Privacy → Screen & System Audio Recording (no signing entitlement can bypass it). |
+| STT | Moonshine (Medium) | Local, streaming, <260ms latency, native diarization as fallback. |
+| Embeddings (RAG) | candle (HuggingFace Rust) | Native inference in Rust. Decided: `snowflake-arctic-embed-s` (384-d, same scheme as MiniLM, better performance on MTEB/BEIR benchmarks). |
+| Vector DB / Storage | SQLite + sqlite-vec | Vector search within the same `.db` file as transcripts/sessions. |
+| Question classifier | Rust, heuristics + regex | Without external LLM — see §7 for rule details. |
+| Post-call analysis | BYOK (Anthropic/OpenAI/Gemini/OpenRouter/Ollama/OpenAI-compatible) | No latency pressure, user controls cost and privacy. |
+| Secrets (API keys) | Native OS keychain via `tauri-plugin-stronghold` or keyring | Never plain text in the `settings` table. |
 
-## 6. Arquitectura de módulos
+## 6. Module architecture
 
 ```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                        TAURI SHELL (Rust)                        │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │   Captura de Audio                                        │   │
-│  │   - Canal A: Micrófono (cpal) — tu voz                    │   │
-│  │   - Canal B: Loopback de sistema (ScreenCaptureKit)        │   │
-│  │             — entrevistador                                │   │
+│  │   Audio Capture                                           │   │
+│  │   - Channel A: Microphone (cpal) — your voice            │   │
+│  │   - Channel B: System Loopback (ScreenCaptureKit)         │   │
+│  │             — interviewer                                 │   │
 │  └──────────┬────────────────────────────────┬───────────────┘   │
 │             ▼                                ▼                   │
 │  ┌──────────────────────┐         ┌───────────────────────┐      │
-│  │ STT (Moonshine)      │         │ Buffer local (WAV)    │      │
-│  │ Solo canal B en      │         │ Canal A+B, para        │      │
-│  │ tiempo real           │         │ post-call               │      │
+│  │ STT (Moonshine)      │         │ Local buffer (WAV)    │      │
+│  │ Only channel B in    │         │ Channel A+B, for       │      │
+│  │ real time            │         │ post-call              │      │
 │  └──────┬───────────────┘         └───────────────────────┘      │
-│         ▼ texto streaming                                        │
+│         ▼ streaming text                                          │
 │  ┌──────────────────────────────────────────────────────────┐    │
-│  │  Clasificador de Preguntas (heurísticas + regex)          │    │
-│  │  - ¿Es pregunta? (interrogación + verbos imperativos      │    │
-│  │    tipo "cuéntame", "dime", "descríbeme")                  │    │
-│  │  - Tipo: Técnica / STAR / Arquitectura / Trampa            │    │
+│  │  Question Classifier (heuristics + regex)                  │    │
+│  │  - Is it a question? (question mark + imperative verbs     │    │
+│  │    like "cuéntame", "dime", "descríbeme")                  │    │
+│  │  - Type: Technical / STAR / Architecture / Trick           │    │
 │  └──────────┬──────────────────────────────────────────────┘     │
-│             ▼ si es pregunta                                     │
+│             ▼ if it's a question                                  │
 │  ┌─────────────────────────────────────────────────────────┐     │
 │  │  RAG (sqlite-vec + candle)                               │     │
-│  │  - Embedding de la pregunta                               │     │
-│  │  - vec_distance_cosine contra chunks_vec                  │     │
-│  │  - Recupera el chunk (proyecto/métrica) más cercano        │     │
+│  │  - Question embedding                                    │     │
+│  │  - vec_distance_cosine against chunks_vec                 │     │
+│  │  - Retrieves the closest chunk (project/metric)           │     │
 │  └──────────┬─────────────────────────────────────────────┘      │
-│             ▼ chunk recuperado                                   │
+│             ▼ retrieved chunk                                     │
 │  ┌─────────────────────────────────────────────────────────┐     │
-│  │  Generador de Hints (Rust puro)                          │     │
-│  │  - Formatea: "💡 {tag}: {metric}" (máx. 8 palabras)       │     │
-│  │  - En Shadow: solo dispara si delay > 2.5s                │     │
+│  │  Hint Generator (pure Rust)                              │     │
+│  │  - Formats: "💡 {tag}: {metric}" (max 8 words)            │     │
+│  │  - In Shadow: only triggers if delay > 2.5s               │     │
 │  └──────────┬─────────────────────────────────────────────┘      │
-│             ▼ evento Tauri                                       │
+│             ▼ Tauri event                                         │
 │  ┌─────────────────────────────────────────────────────────┐     │
-│  │  Overlay (ventana Tauri)                                  │     │
-│  │  - always_on_top, click-through, semi-transparente         │     │
-│  │  - posicionable, botón de Pánico (silencia hints)          │     │
+│  │  Overlay (Tauri window)                                  │     │
+│  │  - always_on_top, click-through, semi-transparent         │     │
+│  │  - positionable, Panic button (silences hints)            │     │
 │  └─────────────────────────────────────────────────────────┘     │
 │                                                                     │
 │  ┌─────────────────────────────────────────────────────────┐     │
-│  │  SQLite (fuente de verdad única)                          │     │
-│  │  transcripts · docs (vectores) · sessions · settings        │     │
+│  │  SQLite (single source of truth)                         │     │
+│  │  transcripts · docs (vectors) · sessions · settings       │     │
 │  └─────────────────────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## 7. Clasificador de preguntas — detalle
+## 7. Question classifier — details
 
-Reglas heurísticas, sin LLM:
-- Señal directa: signo de interrogación.
-- Señal por verbo imperativo al inicio de frase (sin "?"): "cuéntame", "dime", "descríbeme", "explícame", "camínenme por" — cubre preguntas conductuales típicas que en inglés/español no siempre llevan interrogación.
-- Clasificación de tipo (técnica / STAR / arquitectura / trampa) por palabras clave asociadas a cada categoría.
-- Falsos positivos esperables en small talk — mitigar con lista de exclusión de frases de cortesía ("¿cómo estás?", "¿me escuchas bien?").
+Heuristic rules, no LLM:
+- Direct signal: question mark.
+- Signal by imperative verb at sentence start (without "?"): "cuéntame", "dime", "descríbeme", "explícame", "camínenme por" — covers typical behavioral questions that in English/Spanish don't always carry a question mark.
+- Type classification (technical / STAR / architecture / trick) by keywords associated with each category.
+- Expected false positives in small talk — mitigate with an exclusion list of courtesy phrases ("¿cómo estás?", "¿me escuchas bien?").
 
-## 8. Modelo de datos
+## 8. Data model
 
 ```sql
 sessions(id, started_at, ended_at, company, role, mode)  -- mode: practice|shadow
@@ -121,30 +121,30 @@ transcript_lines(id, session_id, speaker, text, started_at_ms, ended_at_ms)
 documents(id, filename, type, added_at)
 chunks(id, document_id, text, chunk_index, tag, metric)
 chunks_vec(chunk_id, embedding)  -- vía sqlite-vec
-settings(key, value)  -- incluye retain_audio (bool, default false); NO incluye API keys (ver §5, Keychain)
+settings(key, value)  -- includes retain_audio (bool, default false); does NOT include API keys (see §5, Keychain)
 ```
 
-## 9. Flujo de usuario
+## 9. User flow
 
-1. **Setup inicial:** el usuario carga CV/proyectos, la app indexa (candle genera embeddings → sqlite-vec). Si quiere post-call, configura su API key (guardada en keychain, no en `settings`).
-2. **Durante la entrevista:** elige Practice o Shadow. Captura dual de audio arranca. Moonshine transcribe canal B. El clasificador detecta preguntas y dispara RAG. El overlay muestra el hint ~3s y desaparece (inmediato en Practice, tras 2.5s de bloqueo en Shadow).
-3. **Post-call:** se guarda transcript completo. Botón "Analizar" envía transcript + contexto relevante al LLM elegido (BYOK) → resumen, preguntas débiles, proyectos no mencionados, mejoras de estructura STAR.
+1. **Initial setup:** the user uploads CV/projects, the app indexes (candle generates embeddings → sqlite-vec). If they want post-call, they configure their API key (stored in keychain, not in `settings`).
+2. **During the interview:** chooses Practice or Shadow. Dual audio capture starts. Moonshine transcribes channel B. The classifier detects questions and triggers RAG. The overlay shows the hint for ~3s and disappears (immediate in Practice, after 2.5s of stalling in Shadow).
+3. **Post-call:** full transcript is saved. "Analyze" button sends transcript + relevant context to the chosen LLM (BYOK) → summary, weak questions, unmentioned projects, STAR structure improvements.
 
-## 10. Plan de desarrollo (MVP)
+## 10. Development plan (MVP)
 
-| Sprint | Objetivo | Entregables | Estado |
+| Sprint | Objective | Deliverables | Status |
 |---|---|---|---|---|
-| 0 | Infraestructura base | Proyecto Tauri + React. Dependencias Rust (`cpal`, `screencapturekit-rs`, `tauri`, `rusqlite`+`sqlite-vec`, `candle`). Schema SQLite completo (sessions, transcript_lines, documents, chunks, chunks_vec, settings) con migraciones. sqlite-vec registrado. Captura de audio dual (mic cpal + loopback SCK) con escritura WAV. `get_db_status` y `toggle_audio_capture` commands. 48+ tests. | ✅ **Completado** |
-| 1 | STT (Moonshine) | Integración de Moonshine en canal B. | ⬜ No iniciado |
-| 2 | Motor de RAG | Indexación de documentos locales. sqlite-vec + candle generando y buscando embeddings. Objetivo: query <20ms. | ✅ **Completado** |
-| 3 | Clasificador & hints | Reglas de §7 en Rust. Generación de hint de 5-8 palabras. Eventos Tauri al frontend. | ⬜ No iniciado |
-| 4 | Overlay & UI | Ventana transparente, always-on-top, click-through. Practice vs Shadow. Botón de Pánico. | ⬜ No iniciado |
-| 5 | Post-call & BYOK | Export/consulta de SQLite. Llamada a API externa. Guardado seguro de key en keychain. Guardado del análisis. | ⬜ No iniciado |
+| 0 | Base infrastructure | Tauri + React project. Rust dependencies (`cpal`, `screencapturekit-rs`, `tauri`, `rusqlite`+`sqlite-vec`, `candle`). Complete SQLite schema (sessions, transcript_lines, documents, chunks, chunks_vec, settings) with migrations. sqlite-vec registered. Dual audio capture (mic cpal + loopback SCK) with WAV writing. `get_db_status` and `toggle_audio_capture` commands. 48+ tests. | ✅ **Completed** |
+| 1 | STT (Moonshine) | Moonshine integration on channel B. STTEngine trait + FFI engine (`libmoonshine.dylib`) + CLI fallback (`moonshine-voice transcribe`). Simple VAD (energy-based). Pipeline thread that receives audio from loopback, segments by VAD, transcribes, emits `new-transcript` event and persists in `transcript_lines`. | ✅ **Completed** |
+| 2 | RAG Engine | Local document indexing. sqlite-vec + candle generating and searching embeddings. Goal: query <20ms. | ✅ **Completed** |
+| 3 | Classifier & hints | Rules from §7 in Rust. 5-8 word hint generation. Tauri events to frontend. | ⬜ Not started |
+| 4 | Overlay & UI | Transparent window, always-on-top, click-through. Practice vs Shadow. Panic button. | ⬜ Not started |
+| 5 | Post-call & BYOK | SQLite export/query. External API call. Secure key storage in keychain. Analysis saving. | ⬜ Not started |
 
-## 11. Open Questions / riesgos
+## 11. Open Questions / risks
 
-- **Legalidad de grabar sin consentimiento explícito de la otra parte** — revisar para España como mínimo antes de que esto sea un hábito regular. Mitigado parcialmente por ADR-011 (el audio no persiste por defecto), pero la pregunta legal de fondo sigue abierta para cuando el usuario active retención o para el transcript de texto en sí.
-- ~~Benchmark propio entre `all-MiniLM-L6-v2` y `snowflake-arctic-embed-s`~~ — Resuelto: se eligió snowflake-arctic-embed-s en base a benchmarks públicos de retrieval (MTEB/BEIR publicados por Snowflake), no una prueba propia sobre los documentos del usuario. Mismas 384 dims que MiniLM, sin impacto en el esquema.
-- ~~Tamaño de chunk / overlap para el RAG de contexto~~ — Resuelto: `CHUNK_SIZE=150` palabras, `CHUNK_OVERLAP=20` palabras, validado empíricamente contra el límite de 512 tokens de `snowflake-arctic-embed-s` (BERT WordPiece).
-- Estabilidad de ScreenCaptureKit en macOS <14 — hay reportes de segfaults intermitentes en versiones antiguas; validar el mínimo soportado antes de comprometerlo en el onboarding.
-- Umbral de 2.5s en Shadow — validar empíricamente que no se sienta ni muy ansioso ni muy tarde.
+- **Legality of recording without explicit consent from the other party** — review for Spain at minimum before this becomes a regular habit. Partially mitigated by ADR-011 (audio doesn't persist by default), but the underlying legal question remains open for when the user enables retention or for the text transcript itself.
+- ~~Own benchmark between `all-MiniLM-L6-v2` and `snowflake-arctic-embed-s`~~ — Resolved (ADR-012): chose snowflake-arctic-embed-s based on public retrieval benchmarks (MTEB/BEIR published by Snowflake), not an own test on the user's documents. Same 384 dims as MiniLM, no impact on the schema.
+- ~~Chunk size / overlap for context RAG~~ — Resolved (ADR-013): `CHUNK_SIZE=150` words, `CHUNK_OVERLAP=20` words, empirically validated against the 512-token limit of `snowflake-arctic-embed-s` (BERT WordPiece) — see `test_chunk_size_fits_in_model_context` in `rag/indexer.rs`.
+- ScreenCaptureKit stability on macOS <14 — there are reports of intermittent segfaults on older versions; validate the minimum supported version before committing to it in onboarding.
+- 2.5s threshold in Shadow — empirically validate that it doesn't feel too anxious nor too late.
