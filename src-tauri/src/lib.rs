@@ -101,6 +101,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             db::get_db_status,
+            db::get_setting,
+            db::set_setting,
             db::get_sessions,
             db::get_session_transcript,
             audio::capture::start_session,
