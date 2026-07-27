@@ -26,7 +26,21 @@ const IMPERATIVE_TRIGGERS: &[&str] = &[
     "cuéntame", "dime", "descríbeme", "explícame", "camínenme por",
     "háblame", "compárteme", "platícame", "nárrame",
     "tell me", "describe", "explain", "walk me through", "talk me through",
-    "share", "give me an example",
+    "share", "give me an example", "give me an example of", "give me an instance of",
+    "could you", "would you", "can you", "will you", "do you", "have you", "has you",
+    "are you able to", "podrías", "puedes", "puedas", "harías", "harias",
+    "me cuentas", "me describes", "me explicas", "me hablas", "me compartes",
+    "cuéntanos", "cuentanos", "dinos", "dinos", "explícanos", "explicanos",
+    "cuéntame de una vez", "cuéntame sobre", "dime sobre", "háblame de",
+    "walk us through", "run me through", "run us through", "paint me a picture",
+];
+
+const QUESTION_START_TRIGGERS: &[&str] = &[
+    "what", "which", "who", "where", "when", "why", "how", "are", "is", "can",
+    "could", "would", "will", "do", "does", "did", "have", "has", "should", "shall",
+    "qué", "cuál", "cuáles", "cuando", "cuándo", "dónde", "donde", "por qué",
+    "porque", "porqué", "quién", "quien", "cómo", "como", "es", "está", "esta",
+    "puede", "podría", "debería", "tiene", "ha", "hace", "será", "seria",
 ];
 
 const EXCLUSION_LIST: &[&str] = &[
@@ -115,7 +129,8 @@ pub fn classify(text: &str) -> QuestionType {
         }
     }
 
-    // Check if it's a question: question mark OR imperative verb at start
+    // Check if it's a question: question mark, imperative verb at start, or
+    // a clear question word / auxiliary at the beginning.
     let has_question_mark = lower.contains('?');
 
     // Compute body once — text after a potential leading filler word.
@@ -124,7 +139,12 @@ pub fn classify(text: &str) -> QuestionType {
         .iter()
         .any(|&trigger| lower.starts_with(trigger) || body.starts_with(trigger));
 
-    if !has_question_mark && !starts_with_imperative {
+    let first_word = lower.split_whitespace().next().unwrap_or("");
+    let starts_as_question = QUESTION_START_TRIGGERS
+        .iter()
+        .any(|&trigger| first_word == trigger);
+
+    if !has_question_mark && !starts_with_imperative && !starts_as_question {
         return QuestionType::None;
     }
 
