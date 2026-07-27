@@ -19,6 +19,7 @@ pub fn get_api_key(provider: &str) -> Result<String, String> {
 /// Delete an API key from the system keychain for a given provider.
 /// Succeeds even if the key doesn't exist (keyring returns an error which we
 /// ignore for idempotency).
+#[allow(dead_code)]
 pub fn delete_api_key(provider: &str) -> Result<(), String> {
     let entry = Entry::new(KEYRING_SERVICE, provider).map_err(|e| e.to_string())?;
     match entry.delete_password() {
