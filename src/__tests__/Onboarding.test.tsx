@@ -1,8 +1,11 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
-import Onboarding, { sanitizeError, isValidFolderPath } from "../Onboarding";
+import Onboarding from "../Onboarding";
+import { sanitizeError, isValidFolderPath } from "../validation";
+import type { IndexSummary } from "../types";
+import { setLanguage } from "../i18n";
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(() => Promise.resolve(vi.fn())),
@@ -11,6 +14,10 @@ vi.mock("@tauri-apps/api/event", () => ({
 vi.mock("@tauri-apps/api/webviewWindow", () => ({
   getCurrentWebviewWindow: vi.fn(() => ({ label: "main" })),
 }));
+
+afterAll(() => {
+  setLanguage("es");
+});
 
 describe("Onboarding — checking state", () => {
   beforeEach(() => {
@@ -248,7 +255,12 @@ describe("Onboarding — folder_selection step", () => {
     vi.mocked(invoke)
       .mockResolvedValueOnce(true)  // check_screen_recording_permission
       .mockResolvedValueOnce(true)  // is_embedding_model_loaded
-      .mockResolvedValueOnce(5);    // index_folder_cmd → 5 docs
+      .mockResolvedValueOnce({
+        folder: "/Users/test/Documents",
+        files_indexed: 5,
+        chunks_created: 12,
+        error_count: 0,
+      }); // index_folder_cmd → 5 docs
     const onComplete = vi.fn();
     render(<Onboarding onComplete={onComplete} />);
 
@@ -331,8 +343,8 @@ describe("Onboarding — folder_selection step", () => {
 });
 
 describe("sanitizeError", () => {
-  it("returns generic message for unknown errors", () => {
-    expect(sanitizeError("random unknown error")).toBe("Ocurrió un error inesperado. Intenta de nuevo.");
+  it("returns the original message for unknown errors", () => {
+    expect(sanitizeError("random unknown error")).toBe("random unknown error");
   });
 
   it("maps PERMISSION_DENIED to friendly message", () => {
@@ -408,7 +420,6 @@ describe("sanitizeError — additional branches", () => {
   });
 
   it("handles null/undefined gracefully", () => {
-    // @ts-expect-error — testing runtime robustness
     expect(sanitizeError(null)).toBe("Ocurrió un error inesperado. Intenta de nuevo.");
   });
 });
@@ -426,11 +437,11 @@ describe("Onboarding — error on mount", () => {
     expect(screen.getByText(/permiso denegado por el sistema/i)).toBeInTheDocument();
   });
 
-  it("calls sanitizeError with unknown error on mount reject", async () => {
+  it("shows the original backend message on mount reject", async () => {
     vi.mocked(invoke).mockRejectedValueOnce("DBus error: connection refused");
     render(<Onboarding onComplete={vi.fn()} />);
 
-    expect(await screen.findByText(/error inesperado/i)).toBeInTheDocument();
+    expect(await screen.findByText(/DBus error: connection refused/i)).toBeInTheDocument();
   });
 });
 
@@ -490,21 +501,14 @@ describe("Onboarding — embedding_model polling error paths", () => {
 });
 
 describe("Onboarding — folder_selection indexing state", () => {
-  function renderAtFolderStep() {
-    vi.mocked(invoke)
-      .mockResolvedValueOnce(true)  // check_screen_recording_permission
-      .mockResolvedValueOnce(true); // is_embedding_model_loaded
-    return render(<Onboarding onComplete={vi.fn()} />);
-  }
-
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
   it("shows Indexando... and disables button while indexing", async () => {
     // Keep the index_folder_cmd promise pending so we can observe intermediate state
-    let deferredResolve!: (value: number) => void;
-    const deferred = new Promise<number>((resolve) => {
+    let deferredResolve!: (value: IndexSummary) => void;
+    const deferred = new Promise<IndexSummary>((resolve) => {
       deferredResolve = resolve;
     });
     vi.mocked(invoke)
@@ -525,7 +529,12 @@ describe("Onboarding — folder_selection indexing state", () => {
     expect(screen.getByRole("button", { name: /indexando/i })).toBeDisabled();
 
     // Resolve the indexing
-    deferredResolve(3);
+    deferredResolve({
+      folder: "/Users/test/Documents",
+      files_indexed: 3,
+      chunks_created: 7,
+      error_count: 0,
+    });
     await vi.waitFor(() => {
       expect(screen.getByText(/indexados 3 documentos/i)).toBeInTheDocument();
     });

@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { t, useLanguage } from "./i18n";
+import type { IndexSummary } from "./types";
+import { formatIndexResult, isValidFolderPath, sanitizeError } from "./validation";
 
 type OnboardingStep =
   | "checking"
@@ -8,28 +11,8 @@ type OnboardingStep =
   | "folder_selection"
   | "done";
 
-export function sanitizeError(err: unknown): string {
-  const msg = `${err}`;
-  const known: Record<string, string> = {
-    PERMISSION_DENIED: "Permiso denegado por el sistema.",
-    DEVICE_NOT_FOUND: "No se encontró el dispositivo de audio.",
-    STREAM_ERROR: "Error al iniciar la captura de audio.",
-  };
-  for (const [key, friendly] of Object.entries(known)) {
-    if (msg.includes(key)) return friendly;
-  }
-  return "Ocurrió un error inesperado. Intenta de nuevo.";
-}
-
-export function isValidFolderPath(path: string): string | null {
-  if (!path.trim()) return "La ruta no puede estar vacía.";
-  if (path.includes("..")) return "La ruta no puede contener '..' (path traversal no permitido).";
-  if (/[<>"|?*]/.test(path)) return "La ruta contiene caracteres no válidos.";
-  if (!path.startsWith("/")) return "Debes introducir una ruta absoluta (que empiece con /).";
-  return null;
-}
-
 function Onboarding({ onComplete }: { onComplete: () => void }) {
+  const language = useLanguage();
   const [step, setStep] = useState<OnboardingStep>("checking");
   const [screenGranted, setScreenGranted] = useState(false);
   const [modelLoaded, setModelLoaded] = useState(false);
@@ -37,9 +20,8 @@ function Onboarding({ onComplete }: { onComplete: () => void }) {
   const [indexing, setIndexing] = useState(false);
   const [indexResult, setIndexResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const pathError = useMemo(() => isValidFolderPath(folderPath), [folderPath]);
+  const pathError = useMemo(() => isValidFolderPath(folderPath), [folderPath, language]);
 
-  // On mount, check current state
   useEffect(() => {
     let cancelled = false;
     const check = async () => {
@@ -75,7 +57,6 @@ function Onboarding({ onComplete }: { onComplete: () => void }) {
     return () => { cancelled = true; };
   }, []);
 
-  // Poll embedding model load status
   useEffect(() => {
     if (step !== "embedding_model" || modelLoaded) return;
     const interval = setInterval(async () => {
@@ -105,8 +86,7 @@ function Onboarding({ onComplete }: { onComplete: () => void }) {
         setStep(modelReady ? "folder_selection" : "embedding_model");
       } else {
         setError(
-          "Permiso denegado. Ve a System Settings → Privacy & Security → " +
-            "Screen & System Audio Recording y activa Kue. Luego haz clic en Reintentar.",
+          `${t("permissionDenied")} ${t("screenPermissionInstructions")}`,
         );
       }
     } catch (e) {
@@ -124,11 +104,12 @@ function Onboarding({ onComplete }: { onComplete: () => void }) {
     setIndexing(true);
     setError(null);
     try {
-      const count: number = await invoke("index_folder_cmd", {
+      const summary: IndexSummary = await invoke("index_folder_cmd", {
         path: trimmed,
       });
-      setIndexResult(`Indexados ${count} documentos.`);
+      setIndexResult(formatIndexResult(summary));
     } catch (e) {
+      console.error("index_folder_cmd failed:", e);
       setError(sanitizeError(e));
     } finally {
       setIndexing(false);
@@ -149,38 +130,33 @@ function Onboarding({ onComplete }: { onComplete: () => void }) {
   return (
     <div className="flex min-h-screen flex-col items-center justify-center bg-zinc-950 p-8 text-white">
       <div className="w-full max-w-lg rounded-xl border border-zinc-700 bg-zinc-900 p-8">
-        <h1 className="mb-2 text-2xl font-bold">Configuración inicial</h1>
+        <h1 className="mb-2 text-2xl font-bold">{t("onboardingTitle")}</h1>
         <p className="mb-6 text-sm text-zinc-400">
-          Vamos a preparar Kue para tu primera sesión.
+          {t("onboardingSubtitle")}
         </p>
 
-        {/* Screen recording permission */}
         {step === "screen_permission" && (
           <div className="space-y-4">
             <div className="rounded-lg border border-zinc-700 bg-zinc-800/50 p-4">
               <h2 className="mb-2 font-semibold text-blue-400">
-                1. Permiso de grabación de pantalla
+                {t("stepScreenPermission")}
               </h2>
               <p className="mb-3 text-sm text-zinc-300">
-                Kue necesita permiso para capturar el audio del entrevistador
-                a través de ScreenCaptureKit. Sin este permiso no podremos
-                transcribir las preguntas.
+                {t("screenPermissionDescription")}
               </p>
               <p className="mb-3 text-xs text-zinc-500">
-                Si el sistema no te ha pedido permiso aún, haz clic en el
-                botón. Se abrirá una ventana del sistema — concede el
-                permiso y luego haz clic en "Reintentar".
+                {t("screenPermissionInstructions")}
               </p>
               {screenGranted ? (
                 <p className="text-sm text-emerald-400">
-                  Permiso concedido ✓
+                  {t("permissionGranted")}
                 </p>
               ) : (
                 <button
                   className="w-full rounded-lg bg-blue-600 py-3 font-medium transition-colors hover:bg-blue-500"
                   onClick={handleGrantPermission}
                 >
-                  Conceder permiso
+                  {t("grantPermission")}
                 </button>
               )}
             </div>
@@ -192,43 +168,38 @@ function Onboarding({ onComplete }: { onComplete: () => void }) {
           </div>
         )}
 
-        {/* Embedding model loading */}
         {step === "embedding_model" && (
           <div className="space-y-4">
             <div className="rounded-lg border border-zinc-700 bg-zinc-800/50 p-4">
               <h2 className="mb-2 font-semibold text-blue-400">
-                2. Modelo de embeddings
+                {t("stepEmbeddingModel")}
               </h2>
               <div className="flex items-center gap-3 text-sm text-zinc-300">
                 <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-zinc-500 border-t-zinc-300" />
-                Cargando modelo (primera vez: descarga ~95 MB)...
+                {t("loadingModel")}
               </div>
               <p className="mt-3 text-xs text-zinc-500">
-                El modelo se descarga e indexa en segundo plano. Suele
-                tardar unos segundos.
+                {t("embeddingModelHint")}
               </p>
             </div>
           </div>
         )}
 
-        {/* Folder selection */}
         {step === "folder_selection" && (
           <div className="space-y-4">
             <div className="rounded-lg border border-zinc-700 bg-zinc-800/50 p-4">
               <h2 className="mb-2 font-semibold text-blue-400">
-                3. Indexar proyectos
+                {t("stepIndexProjects")}
               </h2>
               <p className="mb-3 text-sm text-zinc-300">
-                Selecciona la carpeta donde tienes tus CV, proyectos y
-                métricas. Kue indexará los archivos PDF, TXT y MD para
-                usarlos como contexto durante las entrevistas.
+                {t("indexProjectsDescription")}
               </p>
               <div className="flex gap-2">
                 <input
                   type="text"
                   value={folderPath}
                   onChange={(e) => setFolderPath(e.target.value)}
-                  placeholder="Ruta absoluta, ej. /Users/tu/Documents/proyectos"
+                  placeholder={t("folderPathPlaceholder")}
                   className="flex-1 rounded-lg border border-zinc-600 bg-zinc-800 px-3 py-2 text-sm text-white placeholder-zinc-500"
                 />
               </div>
@@ -242,8 +213,8 @@ function Onboarding({ onComplete }: { onComplete: () => void }) {
                   disabled={indexing || !!pathError}
                 >
                   {indexing
-                    ? "Indexando..."
-                    : "Indexar carpeta"}
+                    ? t("indexing")
+                    : t("indexFolder")}
                 </button>
               )}
             </div>
@@ -260,14 +231,14 @@ function Onboarding({ onComplete }: { onComplete: () => void }) {
                 className="flex-1 rounded-lg bg-zinc-700 py-3 font-medium transition-colors hover:bg-zinc-600"
                 onClick={handleSkipFolder}
               >
-                Saltar (puedes indexar luego)
+                {t("skipIndex")}
               </button>
               {indexResult && (
                 <button
                   className="flex-1 rounded-lg bg-emerald-600 py-3 font-medium transition-colors hover:bg-emerald-500"
                   onClick={handleComplete}
                 >
-                  Comenzar
+                  {t("start")}
                 </button>
               )}
             </div>

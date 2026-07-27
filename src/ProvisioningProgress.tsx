@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { t, useLanguage } from "./i18n";
 
 interface DownloadProgress {
   stage: string;
@@ -13,6 +14,8 @@ interface DownloadProgress {
 type ProvisionState = "checking" | "downloading" | "error" | "retrying";
 
 function ProvisioningProgress({ onProvisioned }: { onProvisioned: () => void }) {
+  useLanguage();
+
   const [state, setState] = useState<ProvisionState>("checking");
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -37,7 +40,6 @@ function ProvisioningProgress({ onProvisioned }: { onProvisioned: () => void }) 
       onProvisioned();
     });
 
-    // Check current status on mount — already provisioned?
     invoke<boolean>("is_moonshine_provisioned")
       .then((provisioned) => {
         if (cancelled) return;
@@ -75,15 +77,15 @@ function ProvisioningProgress({ onProvisioned }: { onProvisioned: () => void }) 
     : 0;
   const stageLabel =
     progress?.stage === "model"
-      ? "Descargando modelo..."
-      : "Descargando librerías...";
+      ? t("downloadingModel")
+      : t("downloadingLibs");
 
   return (
     <div className="flex min-h-screen flex-col items-center justify-center bg-zinc-950 p-8 text-white">
       <div className="w-full max-w-md rounded-xl border border-zinc-700 bg-zinc-900 p-8">
-        <h1 className="mb-2 text-2xl font-bold">Preparando Kue</h1>
+        <h1 className="mb-2 text-2xl font-bold">{t("preparingKue")}</h1>
         <p className="mb-6 text-sm text-zinc-400">
-          Primera configuración &mdash; descargando Moonshine (~482 MB)
+          {t("provisioningSubtitle")}
         </p>
 
         {state === "downloading" && progress && (
@@ -99,8 +101,11 @@ function ProvisioningProgress({ onProvisioned }: { onProvisioned: () => void }) 
               />
             </div>
             <p className="text-xs text-zinc-500">
-              Archivo {progress.file_index + 1} de {progress.file_count} &middot;{" "}
-              {stageLabel === "Descargando modelo..." ? "modelo" : "dylibs"}
+              {t("fileXOfY", {
+                fileIndex: progress.file_index + 1,
+                fileCount: progress.file_count,
+              })} &middot;{" "}
+              {progress?.stage === "model" ? t("modelLabel") : t("dylibsLabel")}
             </p>
           </div>
         )}
@@ -108,20 +113,20 @@ function ProvisioningProgress({ onProvisioned }: { onProvisioned: () => void }) 
         {state === "downloading" && !progress && (
           <div className="flex items-center gap-3 text-sm text-zinc-400">
             <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-zinc-500 border-t-zinc-300" />
-            Iniciando descarga...
+            {t("startingDownload")}
           </div>
         )}
 
         {state === "error" && (
           <div className="space-y-4">
             <div className="rounded-lg border border-red-800 bg-red-900/30 p-4">
-              <p className="text-sm text-red-400">{error || "Error de descarga"}</p>
+              <p className="text-sm text-red-400">{error || t("downloadError")}</p>
             </div>
             <button
               className="w-full rounded-lg bg-emerald-600 py-3 font-medium transition-colors hover:bg-emerald-500"
               onClick={handleRetry}
             >
-              Reintentar
+              {t("retry")}
             </button>
           </div>
         )}
@@ -129,7 +134,7 @@ function ProvisioningProgress({ onProvisioned }: { onProvisioned: () => void }) 
         {state === "retrying" && (
           <div className="flex items-center gap-3 text-sm text-zinc-400">
             <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-zinc-500 border-t-zinc-300" />
-            Reintentando...
+            {t("retrying")}
           </div>
         )}
       </div>
