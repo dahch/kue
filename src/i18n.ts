@@ -1,0 +1,296 @@
+import { useCallback, useSyncExternalStore } from "react";
+import { invoke } from "@tauri-apps/api/core";
+
+export type Language = "en" | "es";
+
+export const LANGUAGE_STORAGE_KEY = "kue-language";
+export const LANGUAGE_SETTING_KEY = "language";
+
+const translations = {
+  en: {
+    appTitle: "Kue",
+    tagline: "Interview copilot",
+    mode: "Mode",
+    practice: "Practice",
+    shadow: "Shadow",
+    company: "Company",
+    companyPlaceholder: "Acme Corp",
+    role: "Role",
+    rolePlaceholder: "Senior Engineer",
+    optional: "optional",
+    startSession: "Start session",
+    stopSession: "Stop session",
+    stopping: "Stopping...",
+    panic: "Panic",
+    panicActive: "Panic active",
+    panicBanner: "Hints muted for 10s",
+    transcript: "Transcript",
+    hint: "Latest hint",
+    noHint: "No hint yet",
+    sessions: "Sessions",
+    previousSessions: "Previous sessions",
+    reindexFolder: "Re-index folder",
+    indexFolder: "Index folder",
+    folderPathPlaceholder: "Absolute path, e.g. /Users/you/Documents/projects",
+    analyzing: "Analyzing...",
+    analyze: "Analyze",
+    processingTranscript: "Processing transcript...",
+    transcriptComplete: "Transcript complete",
+    summary: "Summary",
+    weakQuestions: "Weak questions",
+    forgottenProjects: "Unmentioned projects",
+    starImprovements: "STAR improvements",
+    language: "Language",
+    settings: "Settings",
+    save: "Save",
+    show: "show",
+    hide: "hide",
+    apiKey: "API Key",
+    apiKeySaved: "saved",
+    provider: "Provider",
+    model: "Model",
+    modelOptional: "optional",
+    error: "Error",
+    errors: "errors",
+    close: "Close",
+    listening: "Listening",
+    processing: "Processing",
+    lines: "lines",
+    line: "line",
+    unknown: "Unknown",
+    interviewer: "Interviewer",
+    user: "You",
+    documents: "documents",
+    chunks: "chunks",
+    indexedDocuments: "Indexed {{count}} documents",
+    onboardingTitle: "Initial setup",
+    onboardingSubtitle: "Let's get Kue ready for your first session.",
+    stepScreenPermission: "1. Screen recording permission",
+    screenPermissionDescription:
+      "Kue needs permission to capture interviewer audio via ScreenCaptureKit. Without it we can't transcribe questions.",
+    screenPermissionInstructions:
+      'If the system has not asked yet, click the button. A system window will open — grant the permission and then click "Retry".',
+    permissionGranted: "Permission granted ✓",
+    grantPermission: "Grant permission",
+    retry: "Retry",
+    stepEmbeddingModel: "2. Embedding model",
+    loadingModel: "Loading model (first time: downloading ~95 MB)...",
+    embeddingModelHint: "The model downloads and indexes in the background. Usually takes a few seconds.",
+    stepIndexProjects: "3. Index projects",
+    indexProjectsDescription:
+      "Select the folder with your CV, projects and metrics. Kue will recursively index PDF, TXT and MD files (including subfolders) to use as context during interviews.",
+    indexing: "Indexing...",
+    skipIndex: "Skip (you can index later)",
+    start: "Start",
+    preparingKue: "Preparing Kue",
+    provisioningSubtitle: "Initial setup — downloading Moonshine (~482 MB)",
+    downloadingModel: "Downloading model...",
+    downloadingLibs: "Downloading libraries...",
+    startingDownload: "Starting download...",
+    downloadError: "Download error",
+    retrying: "Retrying...",
+    fileXOfY: "File {{fileIndex}} of {{fileCount}}",
+    modelLabel: "model",
+    dylibsLabel: "dylibs",
+    permissionDenied: "Permission denied by the system.",
+    deviceNotFound: "Audio device not found.",
+    streamError: "Error starting audio capture.",
+    unexpectedError: "An unexpected error occurred. Please try again.",
+    pathRequired: "Path cannot be empty.",
+    pathTraversal: "Path cannot contain '..' (path traversal not allowed).",
+    invalidPathChars: "Path contains invalid characters.",
+    absolutePathRequired: "You must enter an absolute path (starting with /).",
+  },
+  es: {
+    appTitle: "Kue",
+    tagline: "Copiloto de entrevistas",
+    mode: "Modo",
+    practice: "Practice",
+    shadow: "Shadow",
+    company: "Empresa",
+    companyPlaceholder: "Acme Corp",
+    role: "Rol",
+    rolePlaceholder: "Senior Engineer",
+    optional: "opcional",
+    startSession: "Iniciar sesión",
+    stopSession: "Detener sesión",
+    stopping: "Deteniendo...",
+    panic: "Pánico",
+    panicActive: "Pánico activo",
+    panicBanner: "Hints silenciados 10s",
+    transcript: "Transcripción",
+    hint: "Último hint",
+    noHint: "Aún no hay hint",
+    sessions: "Sesiones",
+    previousSessions: "Sesiones anteriores",
+    reindexFolder: "Re-indexar carpeta",
+    indexFolder: "Indexar carpeta",
+    folderPathPlaceholder: "Ruta absoluta, ej. /Users/tu/Documents/proyectos",
+    analyzing: "Analizando...",
+    analyze: "Analizar",
+    processingTranscript: "Procesando transcripción...",
+    transcriptComplete: "Transcripción completa",
+    summary: "Resumen",
+    weakQuestions: "Preguntas débiles",
+    forgottenProjects: "Proyectos no mencionados",
+    starImprovements: "Mejoras STAR",
+    language: "Idioma",
+    settings: "Ajustes",
+    save: "Guardar",
+    show: "mostrar",
+    hide: "ocultar",
+    apiKey: "API Key",
+    apiKeySaved: "guardado",
+    provider: "Proveedor",
+    model: "Modelo",
+    modelOptional: "opcional",
+    error: "Error",
+    errors: "errores",
+    close: "Cerrar",
+    listening: "Escuchando",
+    processing: "Procesando",
+    lines: "líneas",
+    line: "línea",
+    unknown: "Desconocido",
+    interviewer: "Entrevistador",
+    user: "Tú",
+    documents: "documentos",
+    chunks: "fragmentos",
+    indexedDocuments: "Indexados {{count}} documentos",
+    onboardingTitle: "Configuración inicial",
+    onboardingSubtitle: "Vamos a preparar Kue para tu primera sesión.",
+    stepScreenPermission: "1. Permiso de grabación de pantalla",
+    screenPermissionDescription:
+      "Kue necesita permiso para capturar el audio del entrevistador a través de ScreenCaptureKit. Sin este permiso no podremos transcribir las preguntas.",
+    screenPermissionInstructions:
+      'Si el sistema no te ha pedido permiso aún, haz clic en el botón. Se abrirá una ventana del sistema — concede el permiso y luego haz clic en "Reintentar".',
+    permissionGranted: "Permiso concedido ✓",
+    grantPermission: "Conceder permiso",
+    retry: "Reintentar",
+    stepEmbeddingModel: "2. Modelo de embeddings",
+    loadingModel: "Cargando modelo (primera vez: descarga ~95 MB)...",
+    embeddingModelHint: "El modelo se descarga e indexa en segundo plano. Suele tardar unos segundos.",
+    stepIndexProjects: "3. Indexar proyectos",
+    indexProjectsDescription:
+      "Selecciona la carpeta donde tienes tus CV, proyectos y métricas. Kue indexará recursivamente los archivos PDF, TXT y MD (incluyendo subcarpetas) para usarlos como contexto durante las entrevistas.",
+    indexing: "Indexando...",
+    skipIndex: "Saltar (puedes indexar luego)",
+    start: "Comenzar",
+    preparingKue: "Preparando Kue",
+    provisioningSubtitle: "Primera configuración — descargando Moonshine (~482 MB)",
+    downloadingModel: "Descargando modelo...",
+    downloadingLibs: "Descargando librerías...",
+    startingDownload: "Iniciando descarga...",
+    downloadError: "Error de descarga",
+    retrying: "Reintentando...",
+    fileXOfY: "Archivo {{fileIndex}} de {{fileCount}}",
+    modelLabel: "modelo",
+    dylibsLabel: "dylibs",
+    permissionDenied: "Permiso denegado por el sistema.",
+    deviceNotFound: "No se encontró el dispositivo de audio.",
+    streamError: "Error al iniciar la captura de audio.",
+    unexpectedError: "Ocurrió un error inesperado. Intenta de nuevo.",
+    pathRequired: "La ruta no puede estar vacía.",
+    pathTraversal: "La ruta no puede contener '..' (path traversal no permitido).",
+    invalidPathChars: "La ruta contiene caracteres no válidos.",
+    absolutePathRequired: "Debes introducir una ruta absoluta (que empiece con /).",
+  },
+} as const;
+
+export type Translations = typeof translations.en;
+
+let currentLanguage: Language = "es";
+
+const languageListeners = new Set<() => void>();
+
+export function setLanguage(lang: Language) {
+  currentLanguage = lang;
+  for (const listener of languageListeners) {
+    listener();
+  }
+}
+
+export function getLanguage(): Language {
+  return currentLanguage;
+}
+
+function subscribeToLanguage(listener: () => void): () => void {
+  languageListeners.add(listener);
+  return () => { languageListeners.delete(listener); };
+}
+
+export function useLanguage(): Language {
+  const subscribe = useCallback((listener: () => void) => subscribeToLanguage(listener), []);
+  return useSyncExternalStore(subscribe, getLanguage, getLanguage);
+}
+
+export function t(key: keyof Translations, vars?: Record<string, string | number>): string {
+  let text: string = translations[currentLanguage][key];
+  if (vars) {
+    for (const [k, v] of Object.entries(vars)) {
+      text = text.replace(`{{${k}}}`, String(v));
+    }
+  }
+  return text;
+}
+
+export function formatLines(count: number): string {
+  return `${count} ${count === 1 ? t("line") : t("lines")}`;
+}
+
+export function speakerLabel(speaker: string): string {
+  if (speaker === "interviewer") return t("interviewer");
+  if (speaker === "user") return t("user");
+  return t("unknown");
+}
+
+function isLanguage(value: string): value is Language {
+  return value === "en" || value === "es";
+}
+
+/**
+ * Synchronously restore the language from localStorage. This avoids a
+ * flash of the default language on first render.
+ */
+export function initLanguage(): void {
+  if (typeof window === "undefined") return;
+  const stored = window.localStorage.getItem(LANGUAGE_STORAGE_KEY);
+  if (stored && isLanguage(stored)) {
+    setLanguage(stored);
+  }
+}
+
+/**
+ * Load the persisted language from the backend settings table and update
+ * both the in-memory language and localStorage cache.
+ */
+export async function loadLanguageFromBackend(): Promise<void> {
+  try {
+    const value = await invoke<string | null>("get_setting", {
+      key: LANGUAGE_SETTING_KEY,
+    });
+    if (value && isLanguage(value)) {
+      setLanguage(value);
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(LANGUAGE_STORAGE_KEY, value);
+      }
+    }
+  } catch (e) {
+    console.warn("Failed to load language from backend:", e);
+  }
+}
+
+/**
+ * Persist the language to localStorage and the backend settings table.
+ */
+export async function saveLanguage(lang: Language): Promise<void> {
+  setLanguage(lang);
+  if (typeof window !== "undefined") {
+    window.localStorage.setItem(LANGUAGE_STORAGE_KEY, lang);
+  }
+  try {
+    await invoke("set_setting", { key: LANGUAGE_SETTING_KEY, value: lang });
+  } catch (e) {
+    console.warn("Failed to save language to backend:", e);
+  }
+}
