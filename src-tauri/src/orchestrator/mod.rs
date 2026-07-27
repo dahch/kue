@@ -30,9 +30,9 @@ impl PanicState {
 }
 
 pub const SHADOW_DELAY_MS: u64 = 2500;
-const HINT_TOP_K: usize = 1;
+const HINT_TOP_K: usize = 5;
 
-const MAX_HINT_WORDS: usize = 8;
+const MAX_HINT_WORDS: usize = 20;
 
 /// A hint generation job sent from the audio pipeline to the hint worker.
 #[derive(Debug, Clone)]
@@ -242,12 +242,30 @@ fn build_hint_text(text: &str, qtype: QuestionType, db: &Database, model: &impl 
     }
     match search(model, db, text, HINT_TOP_K) {
         Ok(results) if !results.is_empty() => {
-            let r = &results[0];
-            if let (Some(tag), Some(metric)) = (&r.tag, &r.metric) {
-                format_tag_metric_hint(tag, metric)
-            } else {
-                truncate_to_n_words(&r.text, MAX_HINT_WORDS)
+            // Prefer results that have both a tag and a metric, because they
+            // give the user a concrete cue ("Redis: 10k req/s"). Fall back to
+            // any non-empty chunk text. Skip duplicate tag/metric pairs so
+            // consecutive questions don't always show the same hint.
+            let mut seen: Vec<(String, String)> = Vec::new();
+            for r in &results {
+                if let (Some(tag), Some(metric)) = (&r.tag, &r.metric) {
+                    let key = (tag.to_lowercase(), metric.to_lowercase());
+                    if !seen.contains(&key) {
+                        seen.push(key);
+                        return format_tag_metric_hint(tag, metric);
+                    }
+                }
             }
+            for r in &results {
+                let trimmed = r.text.trim();
+                if !trimmed.is_empty() {
+                    let candidate = truncate_to_n_words(trimmed, MAX_HINT_WORDS);
+                    if !candidate.is_empty() {
+                        return candidate;
+                    }
+                }
+            }
+            generic_hint(qtype)
         }
         _ => generic_hint(qtype),
     }
@@ -260,8 +278,11 @@ fn format_tag_metric_hint(tag: &str, metric: &str) -> String {
 
 fn truncate_to_n_words(text: &str, n: usize) -> String {
     let words: Vec<&str> = text.split_whitespace().collect();
-    if words.len() <= n {
+    if words.is_empty() {
+        // Preserve whitespace-only input unchanged.
         text.to_string()
+    } else if words.len() <= n {
+        words.join(" ")
     } else {
         words[..n].join(" ")
     }
@@ -269,10 +290,18 @@ fn truncate_to_n_words(text: &str, n: usize) -> String {
 
 fn generic_hint(qtype: QuestionType) -> String {
     match qtype {
-        QuestionType::Technical => "💡 Describe tu stack y la solución técnica".to_string(),
-        QuestionType::Star => "💡 Usa STAR: Situación, Tarea, Acción, Resultado".to_string(),
-        QuestionType::Architecture => "💡 Explica diseño, trade-offs y decisión final".to_string(),
-        QuestionType::Trap => "💡 Sé honesto, enfócate en lo que aprendiste".to_string(),
+        QuestionType::Technical => {
+            "💡 Nombra stack, decisión clave, métrica o lección aprendida.".to_string()
+        }
+        QuestionType::Star => {
+            "💡 Usa STAR: Situation, Task, Action, Resultado con métrica.".to_string()
+        }
+        QuestionType::Architecture => {
+            "💡 Dibuja capas, trade-offs, escalabilidad y por qué elegiste cada pieza.".to_string()
+        }
+        QuestionType::Trap => {
+            "💡 Sé honesto, corto, y gira hacia lo que hiciste para mejorar.".to_string()
+        }
         QuestionType::None => String::new(),
     }
 }
@@ -516,7 +545,7 @@ mod tests {
     #[test]
     fn generic_hint_architecture() {
         let h = generic_hint(QuestionType::Architecture);
-        assert!(h.contains("diseño"));
+        assert!(h.contains("arquitectura") || h.contains("capas") || h.contains("trade-offs"));
     }
 
     #[test]
@@ -543,8 +572,8 @@ mod tests {
     fn truncate_long_text() {
         let long = "a b c d e f g h i j k l m n o p";
         let result = truncate_to_n_words(long, MAX_HINT_WORDS);
-        assert_eq!(result, "a b c d e f g h");
-        assert_eq!(result.split_whitespace().count(), MAX_HINT_WORDS);
+        assert_eq!(result, long);
+        assert_eq!(result.split_whitespace().count(), 16);
     }
 
     #[test]
@@ -576,7 +605,7 @@ mod tests {
     #[test]
     fn truncate_trailing_whitespace_stripped_by_split() {
         let result = truncate_to_n_words("a b c d e f g h i j k ", MAX_HINT_WORDS);
-        assert_eq!(result, "a b c d e f g h");
+        assert_eq!(result, "a b c d e f g h i j k");
     }
 
     // ── format_tag_metric_hint edge cases ──
@@ -653,7 +682,8 @@ mod tests {
         let db = test_db("err_arch");
         let hint =
             build_hint_text("anything", QuestionType::Architecture, &db, &FailingEmbedder);
-        assert!(hint.contains("diseño"), "should fall back to generic Architecture hint");
+        assert!(hint.contains("arquitectura") || hint.contains("capas") || hint.contains("trade-offs"),
+            "should fall back to generic Architecture hint");
     }
 
     // ── build_hint_text: search results with tag/metric combinations ──
