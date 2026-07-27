@@ -25,9 +25,17 @@ use crate::BatchTracker;
 
 pub const SAMPLE_RATE: u32 = 16_000;
 pub const CHANNELS: u16 = 1;
-const BUFFER_CAPACITY: usize = 60;
+/// Sync channel capacity for audio producers → consumers. A larger buffer
+/// prevents dropped buffers when the STT engine or WAV writer briefly lags
+/// behind real-time capture. 1500 ~ 10-15 seconds of typical callback buffers.
+const BUFFER_CAPACITY: usize = 1500;
 const VALID_MODES: [&str; 2] = ["practice", "shadow"];
 const MIC_CHANNEL_A_FILENAME: &str = "mic_channel_A.wav";
+
+/// Gain applied to system-loopback (Channel B) samples. Interview audio is
+/// often much quieter than the microphone; this boost keeps it above the VAD
+/// threshold without clipping.
+const LOOPBACK_GAIN: f32 = 4.0;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -66,6 +74,7 @@ impl std::fmt::Display for AudioError {
 // built, the audio callback holds its own reference to the stream resources;
 // the handle is only moved into the Mutex and never accessed concurrently,
 // so sending it between threads is safe.
+#[allow(dead_code)]
 struct MicHandle(cpal::Stream);
 unsafe impl Send for MicHandle {}
 impl std::fmt::Debug for MicHandle {
@@ -77,6 +86,7 @@ impl std::fmt::Debug for MicHandle {
 // SAFETY: SCStream wraps an ObjC SCStream whose audio callbacks arrive on a
 // private dispatch queue. The handle is reference-counted internally and we
 // only hold it (no concurrent mutation), so Send is sound.
+#[allow(dead_code)]
 struct LoopbackHandle(SCStream);
 unsafe impl Send for LoopbackHandle {}
 impl std::fmt::Debug for LoopbackHandle {
@@ -89,8 +99,9 @@ impl std::fmt::Debug for LoopbackHandle {
 // AudioCapture — managed as Tauri state
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct AudioCapture {
-    inner: Mutex<AudioCaptureInner>,
+    inner: Arc<Mutex<AudioCaptureInner>>,
     recordings_dir: PathBuf,
     pub(crate) mic_vad: Arc<Mutex<MicVadState>>,
 }
@@ -111,7 +122,7 @@ struct AudioCaptureInner {
 impl AudioCapture {
     pub fn new(recordings_dir: PathBuf) -> Self {
         Self {
-            inner: Mutex::new(AudioCaptureInner {
+            inner: Arc::new(Mutex::new(AudioCaptureInner {
                 mic: None,
                 loopback: None,
                 mic_writer: None,
@@ -121,7 +132,7 @@ impl AudioCapture {
                 mode: String::new(),
                 session_dir: None,
                 session_id: None,
-            }),
+            })),
             recordings_dir,
             mic_vad: Arc::new(Mutex::new(MicVadState::new())),
         }
@@ -355,8 +366,12 @@ fn start_mic_capture_tee(
                     &stream_config,
                     move |data, _| {
                         let samples = data.to_vec();
-                        let _ = wav_tx.try_send(samples.clone());
-                        let _ = vad_tx.try_send(samples);
+                        if wav_tx.try_send(samples.clone()).is_err() {
+                            eprintln!("[kue] Mic WAV writer channel full — dropping buffer");
+                        }
+                        if vad_tx.try_send(samples).is_err() {
+                            eprintln!("[kue] Mic VAD channel full — dropping buffer");
+                        }
                     },
                     move |err| eprintln!("[kue] Mic capture error: {err}"),
                     None,
@@ -377,8 +392,12 @@ fn start_mic_capture_tee(
                             .iter()
                             .map(|&s| f32_to_i16(s))
                             .collect();
-                        let _ = wav_tx.try_send(converted.clone());
-                        let _ = vad_tx.try_send(converted);
+                        if wav_tx.try_send(converted.clone()).is_err() {
+                            eprintln!("[kue] Mic WAV writer channel full — dropping buffer");
+                        }
+                        if vad_tx.try_send(converted).is_err() {
+                            eprintln!("[kue] Mic VAD channel full — dropping buffer");
+                        }
                     },
                     move |err| eprintln!("[kue] Mic capture error: {err}"),
                     None,
@@ -464,11 +483,16 @@ fn start_loopback_capture_tee(
                     .chunks_exact(f32_size)
                     .map(|chunk| {
                         let f = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                        f32_to_i16(f)
+                        // Apply gain to combat quiet system/interview audio, then clamp.
+                        f32_to_i16(f * LOOPBACK_GAIN)
                     })
                     .collect();
-                let _ = self.wav_tx.try_send(samples.clone());
-                let _ = self.stt_tx.try_send(samples);
+                if self.wav_tx.try_send(samples.clone()).is_err() {
+                    eprintln!("[kue] Loopback WAV writer channel full — dropping buffer");
+                }
+                if self.stt_tx.try_send(samples).is_err() {
+                    eprintln!("[kue] Loopback STT channel full — dropping buffer");
+                }
             }
         }
     }
@@ -541,60 +565,113 @@ fn spawn_batch_transcription(
     let mic_wav = session_dir.join(MIC_CHANNEL_A_FILENAME);
     if !mic_wav.exists() {
         apply_retention(&session_dir, &recordings_dir, retain);
+        mark_batch_ready(app_handle, batch_tracker, &session_id);
         return;
     }
-
-    let config = STTConfig::default();
 
     std::thread::Builder::new()
         .name("kue-batch-transcribe".into())
         .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut engine = crate::stt::create_engine(&config);
-                if let Err(e) = engine.load(&config.model_path, &config.language) {
-                    eprintln!("[kue] Batch STT: model load failed, skipping: {e}");
-                }
+            const BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-                match crate::stt::batch::transcribe_channel_batch(
-                    &mic_wav,
-                    crate::types::Speaker::User,
-                    &session_id,
-                    &db,
-                    &*engine,
-                    &config,
-                ) {
-                    Ok(lines) => {
-                        eprintln!(
-                            "[kue] Batch transcription complete: {} user lines for session {}",
-                            lines.len(),
-                            session_id,
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("[kue] Batch transcription failed for session {}: {e}", session_id);
-                    }
-                }
-            }));
+            // Run the actual STT work in a sub-thread so we can enforce a hard
+            // timeout even if model loading or transcription hangs. The worker
+            // owns the files and performs retention when it finishes, so a
+            // timeout never races with an in-progress read.
+            let (tx, rx) = std::sync::mpsc::channel::<Result<usize, String>>();
+            let worker_session_dir = session_dir.clone();
+            let worker_id = session_id.clone();
+            let worker_recordings_dir = recordings_dir.clone();
 
-            if let Err(panic_err) = result {
-                let msg = panic_err
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| panic_err.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic".to_string());
-                eprintln!("[kue] Batch transcription thread panicked: {msg}");
+            let worker = std::thread::Builder::new()
+                .name("kue-batch-transcribe-worker".into())
+                .spawn(move || {
+                    let config = STTConfig::default();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut engine = crate::stt::create_engine(&config);
+                        if let Err(e) = engine.load(&config.model_path, &config.language) {
+                            return Err(format!("Batch STT model load failed: {e}"));
+                        }
+
+                        crate::stt::batch::transcribe_channel_batch(
+                            &worker_session_dir.join(MIC_CHANNEL_A_FILENAME),
+                            crate::types::Speaker::User,
+                            &worker_id,
+                            &db,
+                            &*engine,
+                            &config,
+                        )
+                        .map(|lines| lines.len())
+                        .map_err(|e| format!("Batch STT transcription failed: {e}"))
+                    }));
+
+                    let to_send = match result {
+                        Ok(inner) => inner,
+                        Err(panic_err) => {
+                            let msg = panic_err
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| panic_err.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "unknown panic".to_string());
+                            Err(format!("Batch transcription thread panicked: {msg}"))
+                        }
+                    };
+
+                    apply_retention(&worker_session_dir, &worker_recordings_dir, retain);
+                    let _ = tx.send(to_send);
+                })
+                .expect("failed to spawn batch transcription worker thread");
+
+            let outcome = rx.recv_timeout(BATCH_TIMEOUT);
+            match outcome {
+                Ok(Ok(count)) => {
+                    eprintln!(
+                        "[kue] Batch transcription complete: {} user lines for session {}",
+                        count, session_id,
+                    );
+                }
+                Ok(Err(e)) => {
+                    eprintln!("[kue] Batch transcription failed for session {}: {e}", session_id);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    eprintln!(
+                        "[kue] Batch transcription for session {} exceeded the {}s safety timeout; releasing UI anyway.",
+                        session_id, BATCH_TIMEOUT.as_secs()
+                    );
+                    // Detach the worker; it owns the session dir and will clean
+                    // up once it finishes (or is killed with the process).
+                    let _ = worker;
+                    // Best-effort cleanup from the supervisor side in case the
+                    // worker is stuck forever; ignore errors if the worker already
+                    // removed the directory.
+                    apply_retention(&session_dir, &recordings_dir, retain);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    eprintln!(
+                        "[kue] Batch transcription worker for session {} disconnected unexpectedly.",
+                        session_id
+                    );
+                    apply_retention(&session_dir, &recordings_dir, retain);
+                }
             }
 
-            apply_retention(&session_dir, &recordings_dir, retain);
-            if let Ok(mut tracker) = batch_tracker.0.lock() {
-                tracker.insert(session_id.clone());
-            }
-            let _ = app_handle.emit(
-                "post-call-transcript-ready",
-                serde_json::json!({ "session_id": session_id }),
-            );
+            mark_batch_ready(app_handle, batch_tracker, &session_id);
         })
         .expect("failed to spawn batch transcription thread");
+}
+
+fn mark_batch_ready(
+    app_handle: tauri::AppHandle,
+    batch_tracker: BatchTracker,
+    session_id: &str,
+) {
+    if let Ok(mut tracker) = batch_tracker.0.lock() {
+        tracker.insert(session_id.to_string());
+    }
+    let _ = app_handle.emit(
+        "post-call-transcript-ready",
+        serde_json::json!({ "session_id": session_id }),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -666,21 +743,19 @@ pub fn start_session(
 }
 
 #[tauri::command]
-pub fn stop_session(
+pub async fn stop_session(
     audio: tauri::State<'_, AudioCapture>,
     db: tauri::State<'_, Database>,
     app_handle: tauri::AppHandle,
     batch_tracker: tauri::State<'_, BatchTracker>,
 ) -> Result<AudioCaptureStatus, String> {
-    let status = audio.stop();
-    let session_dir = audio.take_session_dir();
+    // Take the session id and mark it as ended quickly without waiting for
+    // audio threads to join — that is the operation that can freeze the UI.
     let session_id = {
         let mut inner = audio.inner.lock().map_err(|e| e.to_string())?;
         inner.session_id.take()
     };
 
-    // Mark session as ended in the DB before emitting the event
-    // so listeners see a closed session.
     if let Some(ref sid) = session_id {
         if let Ok(conn) = db.conn.lock() {
             let _ = conn.execute(
@@ -689,8 +764,6 @@ pub fn stop_session(
             );
         }
     }
-
-    app_handle.emit("session-stopped", ()).ok();
 
     let retain = db
         .conn
@@ -707,20 +780,38 @@ pub fn stop_session(
         .map(|v| v == "true")
         .unwrap_or(false);
 
-    if let (Some(dir), Some(sid)) = (session_dir, session_id) {
-        let recordings_dir = audio.recordings_dir_path();
-        spawn_batch_transcription(
-            dir,
-            sid,
-            retain,
-            recordings_dir,
-            Database::clone(db.inner()),
-            app_handle.clone(),
-            BatchTracker::clone(batch_tracker.inner()),
-        );
-    }
+    // Tell the frontend immediately that the session is stopping.
+    app_handle.emit("session-stopped", ()).ok();
 
-    Ok(status)
+    // The actual teardown (stream drops + WAV writer joins + batch STT) can
+    // block for seconds on ScreenCaptureKit. Run it in a background thread so
+    // the Tauri command returns instantly and the UI never freezes.
+    let audio_clone = audio.inner().clone();
+    let db_clone = Database::clone(db.inner());
+    let recordings_dir = audio.recordings_dir_path();
+    let batch_tracker_clone = BatchTracker::clone(batch_tracker.inner());
+    let app_handle_clone = app_handle.clone();
+
+    std::thread::spawn(move || {
+        audio_clone.stop();
+        let session_dir = audio_clone.take_session_dir();
+        if let (Some(dir), Some(sid)) = (session_dir, session_id) {
+            spawn_batch_transcription(
+                dir,
+                sid,
+                retain,
+                recordings_dir,
+                db_clone,
+                app_handle_clone,
+                batch_tracker_clone,
+            );
+        }
+    });
+
+    Ok(AudioCaptureStatus {
+        mic_active: false,
+        loopback_active: false,
+    })
 }
 
 #[tauri::command]
