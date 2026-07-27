@@ -138,7 +138,7 @@ transcript_lines(id, session_id, speaker, text, started_at_ms, ended_at_ms)
 documents(id, filename, type, added_at)
 chunks(id, document_id, text, chunk_index, tag, metric)
 chunks_vec(chunk_id, embedding)  -- vía sqlite-vec
-settings(key, value)  -- includes retain_audio (bool, default false); does NOT include API keys (see §5, Keychain)
+settings(key, value)  -- includes retain_audio (bool, default false) and first_run (string, default 'pending'); does NOT include API keys (see §5, Keychain); read/written via `get_setting`/`set_setting` Tauri commands.
 ```
 
 ## 9. User flow

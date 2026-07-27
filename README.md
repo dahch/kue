@@ -97,10 +97,14 @@ npm run coverage:rust:full
 │  │            │ │    analysis, analyze_session)   │    │
 │  │            │ │  - keys (keychain API key       │    │
 │  │            │ │    storage, save_key/has_key)   │    │
-│  │            │ │  - stt::provisioning::retry_    │    │
-│  │            │ │    moonshine_download cmd       │    │
-│  │            │ │  - db::get_sessions             │    │
-│  │            │ │  - db::get_session_transcript   │    │
+│  │  │ │  - stt::provisioning::retry_    │    │
+│  │  │ │    moonshine_download cmd       │    │
+│  │  │ │  - stt::provisioning::is_       │    │
+│  │  │ │    moonshine_provisioned cmd     │    │
+│  │  │ │  - db::get_setting cmd          │    │
+│  │  │ │  - db::set_setting cmd          │    │
+│  │  │ │  - db::get_sessions             │    │
+│  │  │ │  - db::get_session_transcript   │    │
 │  └────────────┘ │  - cpal (mic capture)           │    │
 │                 │  - SCK (loopback)               │    │
 │                 │  - hound (WAV writer)           │    │
@@ -177,6 +181,9 @@ npm run coverage:rust:full
 | Mic VAD (Shadow gating) | `audio::mic_vad::MicVadState` wraps `SimpleVAD` for Channel A |
 | Panic/Mute | `PanicState` in Tauri state silences hints for 10s via `panic_mode` command + `panic-mode` event |
 | Post-call | BYOK (Anthropic/OpenAI/Gemini/OpenRouter/Ollama/etc.) via `analyze_session` command, API keys stored in OS Keychain via `keyring` crate |
+| Logging | `logging::Logger` — file logs with rotation (keeps last 5 files) to `{app_data_dir}/logs/` via `log` + `chrono` crates |
+| Onboarding | First-run wizard (`onboarding.rs` + `Onboarding.tsx`) — screen permission check, embedding model loading, folder indexing |
+| Auto-updater | `tauri-plugin-updater` — built-in Tauri v2 updater supporting signed DMG updates |
 
 ## Related documentation
 
@@ -215,7 +222,8 @@ kue/
 │   │   │                    #   provisioning background thread)
 │   │   ├── types.rs         # TranscriptLine, Speaker (STT → classifier contract, Copy derive)
 │   │   ├── db/
-│   │   │   └── mod.rs       # Schema, migrations, sqlite-vec, get_sessions/get_session_transcript, tests
+│   │   │   └── mod.rs       # Schema, migrations, sqlite-vec, get_setting/set_setting,
+│   │   │                    #   get_sessions/get_session_transcript, tests
 │   │   ├── audio/
 │   │   │   ├── mod.rs       # Re-exports capture and mic_vad modules
 │   │   │   ├── capture.rs   # Dual capture (cpal + SCK), WAV writer, start_session/stop_session/

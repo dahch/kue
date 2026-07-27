@@ -27,6 +27,8 @@ graph TD
         B9[tauri::command<br/>keys::save_key]
         B10[tauri::command<br/>keys::has_key]
         B11[tauri::command<br/>analyze::analyze_session]
+        B12[tauri::command<br/>db::get_setting]
+        B13[tauri::command<br/>db::set_setting]
     end
 
     subgraph "Rust Backend (lib.rs)"
@@ -117,6 +119,8 @@ graph TD
     A -->|invoke| B9
     A -->|invoke| B10
     A -->|invoke| B11
+    A -->|invoke| B12
+    A -->|invoke| B13
     B1 --> C
     B2 --> F
     B2B --> F
@@ -129,6 +133,8 @@ graph TD
     B9 --> KEYS
     B10 --> KEYS
     B11 --> AN
+    B12 --> G
+    B13 --> G
     C --> G
     D --> G
     E --> C
@@ -215,7 +221,7 @@ graph TD
 
 ### 2.2 Tauri Shell (`lib.rs`)
 
-File `src-tauri/src/lib.rs` (126 lines):
+File `src-tauri/src/lib.rs` (128 lines):
 
 ```rust
 use std::collections::HashSet;
@@ -320,6 +326,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             db::get_db_status,
+            db::get_setting,
+            db::set_setting,
             db::get_sessions,
             db::get_session_transcript,
             audio::capture::start_session,
@@ -360,6 +368,7 @@ pub fn run() {
 - **`start_session`**, **`stop_session`**, **`panic_mode`** — Tauri commands replacing the old `toggle_audio_capture`. `start_session(mode, company?, role?)` creates a DB session (persisting optional `company` and `role` metadata), spawns the dual capture and STP pipeline. `stop_session` stops capture, sets `ended_at = datetime('now')` in the sessions table, triggers batch transcription for Channel A, and emits `session-stopped`. `panic_mode` activates `PanicState` for 10s and emits `panic-mode` event.
 - **`index_folder_cmd`**, **`search_context`**, **`classify_text`**, and **`show_overlay`** — Tauri commands for RAG, classifier, and overlay window control.
 - **`get_sessions`**, **`get_session_transcript`** — Tauri commands in `db/mod.rs` for retrieving session history and full transcripts from the frontend (used by the post-call panel).
+- **`get_setting`**, **`set_setting`** — Generic key-value read/write in the `settings` table (`db/mod.rs`). Used by `onboarding.rs` for the `first_run` flag and available to the frontend for persistent user preferences (e.g., language, retain_audio).
 - **`is_transcript_ready`** — Tauri command in `audio/capture.rs` that checks `BatchTracker` to see if Channel A batch transcription has completed for a given session.
 - **`save_key`**, **`has_key`** — Tauri commands in `keys.rs` for storing/checking API keys in the OS keychain via the `keyring` crate.
 - **`is_moonshine_provisioned`**, **`retry_moonshine_download`** — Tauri commands in `stt/provisioning.rs` for checking Moonshine provisioning status and retrying failed downloads.
