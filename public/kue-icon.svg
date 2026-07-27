@@ -1,0 +1,52 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4338CA"/>
+      <stop offset="55%" stop-color="#6D28D9"/>
+      <stop offset="100%" stop-color="#7C3AED"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="45%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="spark" cx="35%" cy="30%" r="75%">
+      <stop offset="0%" stop-color="#FFE3A3"/>
+      <stop offset="55%" stop-color="#FBBF24"/>
+      <stop offset="100%" stop-color="#F59E0B"/>
+    </radialGradient>
+    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#1E1B4B" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Full-bleed square background — Tauri/macOS applies the squircle mask automatically, do not round here -->
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#sheen)"/>
+
+  <!-- K monogram, geometric, built from three strokes -->
+  <g filter="url(#softShadow)">
+    <!-- vertical stroke -->
+    <rect x="336" y="288" width="86" height="448" rx="43" fill="#FFFFFF"/>
+    <!-- upper diagonal -->
+    <path d="M 422 512
+             L 636 288
+             C 654 269, 683 268, 703 285
+             C 723 302, 725 331, 708 351
+             L 534 540
+             Z"
+          fill="#FFFFFF"/>
+    <!-- lower diagonal -->
+    <path d="M 422 512
+             L 636 736
+             C 654 755, 683 756, 703 739
+             C 723 722, 725 693, 708 673
+             L 534 484
+             Z"
+          fill="#FFFFFF"/>
+  </g>
+
+  <!-- Hint spark accent, echoes the 💡 hint marker in-product -->
+  <circle cx="722" cy="300" r="70" fill="url(#spark)" filter="url(#softShadow)"/>
+  <path d="M 722 258 L 734 292 L 768 300 L 734 308 L 722 342 L 710 308 L 676 300 L 710 292 Z"
+        fill="#FFFDF5" opacity="0.9"/>
+</svg>
