@@ -35,14 +35,14 @@ const MODEL_BASE: &str =
 ///   on the day the pins were recorded. A vendor-published signature
 ///   would be stronger — none exists today from Moonshine.
 const MODEL_FILES: &[(&str, u64, &str)] = &[
-    ("adapter.ort", 3_613_920, "16307442b7f4229f2f1511fc51b545cec9616e55872c588f3a297bbc6f4762ea"),
-    ("cross_kv.ort", 11_472_910, "354b9a955caeb768b528f447f0a36ce4b850ca7b4531900165df304d97904fba"),
-    ("decoder_kv.ort", 146_275_943, "fa67aa87521247f5bf44d3e44d4e4978e58c1f114249c3c6909c882624056715"),
-    ("decoder_kv_with_attention.ort", 146_212_397, "40919de95d08690da3a8ff6df14cf55b3220046f3b767b4a4b769e7b32aaf2d2"),
-    ("encoder.ort", 94_236_376, "a5f11167a62eef61787fe8410453257d6ddb8eba90af461a9604e5f2e93d5322"),
-    ("frontend.ort", 47_440_192, "378fe8a5d7090a1b9ab88bbb1fc95bde010cdd64ec23419350d2d23c675636e9"),
-    ("streaming_config.json", 2_125, "28e83b7a28e91472692a035e0dae3116422ae43aeb2bef5ed822c44ce89b88af"),
-    ("tokenizer.bin", 199_756, "6884b35fd6377d4c4d32336a0bc152f36b64d1e45b6503683cdc238250a8472d"),
+    ("adapter.ort", 3_647_712, "16307442b7f4229f2f1511fc51b545cec9616e55872c588f3a297bbc6f4762ea"),
+    ("cross_kv.ort", 11_544_952, "354b9a955caeb768b528f447f0a36ce4b850ca7b4531900165df304d97904fba"),
+    ("decoder_kv.ort", 146_216_448, "fa67aa87521247f5bf44d3e44d4e4978e58c1f114249c3c6909c882624056715"),
+    ("decoder_kv_with_attention.ort", 146_138_304, "40919de95d08690da3a8ff6df14cf55b3220046f3b767b4a4b769e7b32aaf2d2"),
+    ("encoder.ort", 94_202_872, "a5f11167a62eef61787fe8410453257d6ddb8eba90af461a9604e5f2e93d5322"),
+    ("frontend.ort", 47_467_256, "378fe8a5d7090a1b9ab88bbb1fc95bde010cdd64ec23419350d2d23c675636e9"),
+    ("streaming_config.json", 513, "28e83b7a28e91472692a035e0dae3116422ae43aeb2bef5ed822c44ce89b88af"),
+    ("tokenizer.bin", 249_974, "6884b35fd6377d4c4d32336a0bc152f36b64d1e45b6503683cdc238250a8472d"),
 ];
 
 /// Wheel-internal paths for the two dylib files.

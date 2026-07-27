@@ -663,14 +663,14 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let wav_path = dir.join("short.wav");
 
-        // 100ms of speech — below the default 200ms min_speech_duration
+        // 100ms of speech — below the default min_speech_duration
         let speech = make_speech_chunk(5000, 100);
         write_test_wav(&wav_path, &speech);
 
         let engine = MockEngine {
             result: Some("should not appear".into()),
         };
-        let config = STTConfig::default(); // min_speech_duration_ms = 200
+        let config = STTConfig::default();
         let db = create_test_db("sess-short");
         let result = transcribe_channel_batch(
             &wav_path,

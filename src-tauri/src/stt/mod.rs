@@ -101,8 +101,13 @@ impl Default for STTConfig {
         Self {
             model_path: Self::default_model_path(),
             language: "en".to_string(),
-            vad_threshold: 0.02,
+            // Very low threshold because the audio is already in i16 scale;
+            // combined with the loopback gain this catches quiet speech.
+            vad_threshold: 0.015,
+            // 200ms minimum avoids false starts from tiny noises.
             min_speech_duration_ms: 200,
+            // 600ms silence gap before ending a segment — enough for natural
+            // pauses inside a sentence without merging separate utterances.
             silence_timeout_ms: 600,
             sample_rate: 16_000,
             use_cli_fallback: true,
@@ -171,7 +176,7 @@ mod tests {
     #[test]
     fn stt_config_default_vad_threshold() {
         let config = STTConfig::default();
-        assert!((config.vad_threshold - 0.02).abs() < f32::EPSILON);
+        assert!((config.vad_threshold - 0.015).abs() < f32::EPSILON);
     }
 
     #[test]
