@@ -31,7 +31,14 @@ pub struct EmbeddingModel {
 
 impl EmbeddingModel {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
-        let device = Device::new_metal(0).unwrap_or(Device::Cpu);
+        // Use CPU with Accelerate framework on Apple Silicon.
+        // Candle's Metal backend is missing kernels for some BERT ops
+        // (e.g. layer-norm), causing runtime failures during embedding
+        // generation. The `accelerate` feature enables AMX-optimized
+        // matrix operations via Apple's Accelerate framework on M-series
+        // chips, providing near-GPU speed for the linear algebra parts
+        // while keeping the full op coverage of the CPU backend.
+        let device = Device::Cpu;
 
         let api = Api::new()?;
         let repo = api.model(MODEL_ID.to_string());
@@ -80,12 +87,20 @@ impl Embedder for EmbeddingModel {
             self.model
                 .forward(&input_ids, &token_type_ids, Some(&attention_mask_t))?;
 
-        let mask = attention_mask_t.unsqueeze(2)?;
-        let masked = (last_hidden * mask.to_dtype(DType::F32)?)?;
-        let denom = mask.sum(1)?.to_dtype(DType::F32)?;
-        let embedding = (masked.sum(1)? / denom)?;
+        // Mean pooling with attention mask, avoiding broadcast-multiplication
+        // shapes that Candle's CPU backend rejects (e.g. [1, seq, hidden] * [1, seq, 1]).
+        let mask = attention_mask_t
+            .unsqueeze(2)?
+            .to_dtype(DType::F32)?
+            .expand(last_hidden.shape())?;
+        let masked = (last_hidden * mask.clone())?;
+        let sum_masked = masked.sum(1)?;
+        let sum_mask = mask.sum(1)?;
+        let embedding = (sum_masked / sum_mask)?;
 
-        let normalized = embedding.broadcast_div(&embedding.sqr()?.sum(1)?.sqrt()?)?;
+        // L2 normalization across the hidden dimension.
+        let norm = embedding.sqr()?.sum(1)?.sqrt()?;
+        let normalized = embedding.broadcast_div(&norm)?;
 
         let data = normalized.flatten_all()?.to_vec1::<f32>()?;
 
