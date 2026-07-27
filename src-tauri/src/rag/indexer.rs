@@ -42,6 +42,7 @@ pub enum RagError {
     #[error("file too large ({0} bytes, max {MAX_FILE_SIZE})")]
     FileTooLarge(u64),
     #[error("no supported files in {0}")]
+    #[allow(dead_code)]
     NoSupportedFiles(String),
     #[error("{0}")]
     Other(String),
@@ -103,7 +104,11 @@ pub fn ingest_documents(
             .to_string_lossy()
             .to_string();
 
-        let content = std::fs::read_to_string(path)?;
+        let content = match ext.as_str() {
+            "pdf" => pdf_extract::extract_text(path)
+                .map_err(|e| RagError::Other(format!("failed to extract PDF {filename}: {e}")))?,
+            _ => std::fs::read_to_string(path)?,
+        };
 
         let chunks = chunk_text(&content, CHUNK_SIZE, CHUNK_OVERLAP);
 
@@ -147,11 +152,36 @@ pub fn ingest_documents(
     Ok(())
 }
 
-/// Indexes all supported files (.txt, .md, .pdf) in a directory (non-recursive).
+/// Recursively collects all supported files (.txt, .md, .pdf) under `dir`.
+fn collect_supported_files(dir: &std::path::Path) -> Result<Vec<String>, RagError> {
+    fn walk(current: &std::path::Path, out: &mut Vec<String>) -> Result<(), RagError> {
+        for entry in std::fs::read_dir(current)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out)?;
+            } else if ALLOWED_EXTENSIONS
+                .iter()
+                .any(|ext| path.extension().map_or(false, |e| e == *ext))
+            {
+                out.push(path.to_string_lossy().to_string());
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    walk(dir, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+/// Indexes all supported files (.txt, .md, .pdf) in a directory recursively.
 ///
 /// Path traversal is prevented via `canonicalize` — symbolic links and `../`
-/// sequences are resolved before any files are read. The directory is scanned
-/// in sorted order for deterministic behavior across runs.
+/// sequences are resolved before any files are read. Files are scanned
+/// recursively and sorted for deterministic behavior across runs.
+#[allow(dead_code)]
 pub fn index_folder(
     model: &impl Embedder,
     db: &Database,
@@ -159,23 +189,7 @@ pub fn index_folder(
 ) -> Result<(), RagError> {
     let canonical = std::fs::canonicalize(folder_path)?;
 
-    let mut files: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(&canonical)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            continue;
-        }
-
-        if ALLOWED_EXTENSIONS
-            .iter()
-            .any(|ext| path.extension().map_or(false, |e| e == *ext))
-        {
-            files.push(path.to_string_lossy().to_string());
-        }
-    }
-    files.sort();
+    let files = collect_supported_files(&canonical)?;
 
     if files.is_empty() {
         return Err(RagError::NoSupportedFiles(folder_path.to_string()));
@@ -252,43 +266,57 @@ pub fn index_folder_cmd(
     let db = db.inner();
     let model = model.inner().as_ref();
 
-    let canonical = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
+    let canonical = std::fs::canonicalize(&path).map_err(|e| {
+        let msg = format!("invalid folder path '{path}': {e}");
+        log::error!("{msg}");
+        msg
+    })?;
 
-    let mut files: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(&canonical).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let p = entry.path();
-        if p.is_dir() {
-            continue;
-        }
-        if ALLOWED_EXTENSIONS
-            .iter()
-            .any(|ext| p.extension().map_or(false, |e| e == *ext))
-        {
-            files.push(p.to_string_lossy().to_string());
-        }
-    }
-    files.sort();
+    let files = collect_supported_files(&canonical).map_err(|e| {
+        let msg = format!("cannot read directory '{}': {e}", canonical.display());
+        log::error!("{msg}");
+        msg
+    })?;
 
     if files.is_empty() {
-        return Err("no supported files found in folder".to_string());
+        return Err("no supported files found in folder (recursively)".to_string());
     }
 
     let files_count = files.len();
 
     // Count chunks before ingestion to compute delta
-    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let conn = db.conn.lock().map_err(|e| {
+        let msg = format!("database lock poisoned: {e}");
+        log::error!("{msg}");
+        msg
+    })?;
     let chunks_before: usize = conn
         .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let msg = format!("database query failed: {e}");
+            log::error!("{msg}");
+            msg
+        })?;
     drop(conn);
 
-    ingest_documents(model, db, &files).map_err(|e| e.to_string())?;
+    ingest_documents(model, db, &files).map_err(|e| {
+        let msg = format!("ingestion failed: {e}");
+        log::error!("{msg}");
+        msg
+    })?;
 
-    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let conn = db.conn.lock().map_err(|e| {
+        let msg = format!("database lock poisoned: {e}");
+        log::error!("{msg}");
+        msg
+    })?;
     let chunks_after: usize = conn
         .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let msg = format!("database query failed: {e}");
+            log::error!("{msg}");
+            msg
+        })?;
     drop(conn);
 
     Ok(IndexSummary {
@@ -966,13 +994,13 @@ mod tests {
     }
 
     #[test]
-    fn index_folder_skips_subdirectories() {
+    fn index_folder_includes_subdirectories_recursively() {
         ensure_vec_extension();
         let tmp = TempDir::new("index_subdir");
 
         // Supported file at root
         std::fs::write(tmp.path().join("root.txt"), "I am at the root.").unwrap();
-        // Subdirectory with a supported file (should be skipped)
+        // Subdirectory with a supported file (should now be indexed)
         std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
         std::fs::write(tmp.path().join("sub").join("nested.txt"), "I am nested.").unwrap();
 
@@ -981,18 +1009,25 @@ mod tests {
         let model = MockEmbeddingModel;
 
         index_folder(&model, &db, tmp.path().to_string_lossy().as_ref())
-            .expect("should succeed, skipping subdirectories");
+            .expect("should succeed indexing recursively");
 
         let conn = db.conn.lock().unwrap();
         let doc_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(doc_count, 1, "should only index root-level files, not subdirectory files");
+        assert_eq!(doc_count, 2, "should index both root and subdirectory files");
 
-        let name: String = conn
-            .query_row("SELECT filename FROM documents", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(name, "root.txt", "should only have root.txt, not nested.txt");
+        let mut names: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT filename FROM documents ORDER BY filename")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        names.sort();
+        assert_eq!(names, vec!["nested.txt", "root.txt"]);
     }
 
     #[test]
