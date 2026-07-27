@@ -1,0 +1,35 @@
+[package]
+name = "screencapturekit-sys"
+
+description = "Unsafe FFI bindings for Apple's ScreenCaptureKit"
+categories = [
+  "external-ffi-bindings",
+  "multimedia",
+  "multimedia::video",
+  "os::macos-apis",
+]
+repository = "https://github.com/svtlabs/screencapturekit-rs/tree/main/screencapturekit-sys"
+version = "0.2.8"
+authors = ["Per Johansson <mail@perjohansson.net>"]
+license = "MIT OR Apache-2.0"
+keywords = ["screencapture", "screencapturekit", "macos"]
+homepage = "https://doom.fish"
+edition = "2021"
+rust-version = "1.75"
+
+[lib]
+path = "./src/lib.rs"
+
+[features]
+ci = []
+
+[dependencies]
+objc = { version = "0.2", features = ["exception"] }
+objc_id = "0.1"
+objc-foundation = "0.1"
+block = "0.1"
+dispatch = "0.2"
+once_cell = "1"
+
+[[example]]
+name = "test_fps"

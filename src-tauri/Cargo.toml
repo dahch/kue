@@ -27,12 +27,11 @@ cpal = "0.15"
 hound = "3.5"
 
 [dependencies.screencapturekit]
-git = "https://github.com/Brendonovich/screencapturekit-rs"
-rev = "9a6b9f3"
+path = "vendor/screencapturekit-rs/screencapturekit"
 
 [dependencies.candle-core]
 version = "0.8"
-features = ["metal"]
+features = ["metal", "accelerate"]
 
 [dependencies.candle-nn]
 version = "0.8"
@@ -64,6 +63,9 @@ version = "0.8"
 [dependencies.uuid]
 version = "1"
 features = ["v4"]
+
+[dependencies.pdf-extract]
+version = "0.12"
 
 [dependencies.keyring]
 version = "2"

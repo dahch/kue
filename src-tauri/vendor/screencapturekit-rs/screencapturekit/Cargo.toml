@@ -1,0 +1,28 @@
+[package]
+name = "screencapturekit"
+description = "Safe wrapper for Apple's ScreenCaptureKit"
+categories = [
+  "api-bindings",
+  "multimedia",
+  "multimedia::video",
+  "os::macos-apis",
+]
+readme = "README.md"
+repository = "https://github.com/svtlabs/screencapturekit-rs/tree/main/screencapturekit"
+
+edition = "2021"
+version = "0.2.8"
+authors = ["Per Johansson <mail@perjohansson.net>"]
+license = "MIT OR Apache-2.0"
+keywords = ["screencapture", "screencapturekit", "macos"]
+homepage = "https://doom.fish"
+rust-version = "1.75"
+
+[features]
+ci = []
+
+[lib]
+path = "./src/lib.rs"
+
+[dependencies]
+screencapturekit-sys = { version = "0.2.8", path = "../screencapturekit-sys" }
