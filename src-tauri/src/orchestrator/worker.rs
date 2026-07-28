@@ -33,7 +33,7 @@ pub fn start_hint_worker(
     thread::Builder::new()
         .name("kue-hint-worker".into())
         .spawn(move || {
-            eprintln!("[kue] Hint worker thread started");
+            log::info!("Hint worker thread started");
 
             loop {
                 match rx.recv_timeout(Duration::from_millis(500)) {
@@ -59,7 +59,7 @@ pub fn start_hint_worker(
                 }
             }
 
-            eprintln!("[kue] Hint worker thread ended");
+            log::info!("Hint worker thread ended");
         })
         .expect("failed to spawn hint worker thread")
 }

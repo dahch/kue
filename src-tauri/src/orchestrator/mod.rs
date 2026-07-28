@@ -167,7 +167,7 @@ pub fn emit_expired_hints(app_handle: &tauri::AppHandle, scheduler: &HintSchedul
                 let state = match vad.lock() {
                     Ok(g) => g,
                     Err(e) => {
-                        eprintln!("[kue] VAD mutex poisoned — VAD gating disabled");
+                        log::warn!("VAD mutex poisoned — VAD gating disabled");
                         e.into_inner()
                     }
                 };
@@ -185,7 +185,7 @@ pub fn emit_expired_hints(app_handle: &tauri::AppHandle, scheduler: &HintSchedul
             session_id: hint.session_id,
         };
         if let Err(e) = app_handle.emit("new-hint", &payload) {
-            eprintln!("[kue] Failed to emit expired hint: {e}");
+                log::warn!("Failed to emit expired hint: {e}");
         }
     }
 }
@@ -210,7 +210,15 @@ pub fn generate_and_emit_hint(
         }
     }
 
-    let hint_text = build_hint_text(text, qtype, db, model);
+    let mut hint_text = build_hint_text(text, qtype, db, model);
+
+    // Attempt LLM-enhanced hint if a provider is configured with an API key.
+    if let Some(handle) = app_handle {
+        if let Some(llm_hint) = try_llm_hint(handle, text, db, model) {
+            hint_text = llm_hint;
+        }
+    }
+
     if hint_text.is_empty() {
         return;
     }
@@ -231,9 +239,110 @@ pub fn generate_and_emit_hint(
             session_id: session_id.to_string(),
         };
         if let Err(e) = handle.emit("new-hint", &payload) {
-            eprintln!("[kue] Failed to emit new-hint: {e}");
+            log::warn!("Failed to emit new-hint: {e}");
         }
     }
+}
+
+/// Attempts to generate a hint using the configured LLM provider.
+/// Returns `None` if no key is configured or the LLM call fails/times out,
+/// so the caller falls back to the RAG-only hint.
+fn try_llm_hint(
+    app_handle: &tauri::AppHandle,
+    question: &str,
+    db: &Database,
+    model: &impl Embedder,
+) -> Option<String> {
+    // Try providers in order: hint_provider → analysis provider → any with a key
+    const CANDIDATES: &[&str] = &["openai", "anthropic", "gemini", "openrouter", "deepseek", "ollama"];
+
+    let configured = get_setting_or(app_handle, "hint_provider", "openai");
+    let analysis_provider = get_setting_or(app_handle, "provider", "openai");
+
+    // Build a priority list: configured hint provider first, then analysis
+    // provider if different, then all other candidates.
+    let mut order: Vec<&str> = vec![configured.as_str()];
+    if analysis_provider != configured {
+        order.push(analysis_provider.as_str());
+    }
+    for c in CANDIDATES {
+        if !order.contains(c) {
+            order.push(c);
+        }
+    }
+
+    let hint_model = get_setting_or(app_handle, "hint_model", "gpt-4o-mini");
+
+    // Find the first provider with a saved API key
+    let (provider, api_key) = order.iter().find_map(|p| {
+        crate::keys::get_api_key(p).ok().map(|k| (p.to_string(), k))
+    })?;
+
+    // Build RAG context: concatenate top-k chunk texts
+    let rag_context = match search(model, db, question, HINT_TOP_K) {
+        Ok(results) if !results.is_empty() => {
+            let chunks: Vec<String> = results.iter()
+                .map(|r| {
+                    if let (Some(tag), Some(metric)) = (&r.tag, &r.metric) {
+                        format!("[{}] {} — {}", tag, r.text, metric)
+                    } else {
+                        r.text.clone()
+                    }
+                })
+                .collect();
+            chunks.join("\n---\n")
+        }
+        _ => String::from("(No relevant documents available)"),
+    };
+
+    // Clone strings for the spawned thread
+    let q = question.to_string();
+    let rag = rag_context;
+    let model_name = hint_model;
+
+    // Call the LLM via Tauri's async runtime with a 4-second timeout
+    // enforced through a channel from a helper thread.
+    let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    std::thread::spawn(move || {
+        let result = tauri::async_runtime::block_on(
+            crate::llm::generate_hint(&q, &rag, &provider, &model_name, &api_key)
+        );
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(4)) {
+        Ok(Ok(hint)) if !hint.trim().is_empty() => Some(hint.trim().to_string()),
+        Ok(Err(e)) => {
+            log::warn!("LLM hint generation failed, falling back to RAG: {e}");
+            None
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            log::warn!("LLM hint generation timed out after 4s");
+            None
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            log::warn!("LLM hint generation thread disconnected unexpectedly");
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Reads a setting value from the database. Returns `default_val` if the
+/// setting does not exist or the DB cannot be accessed.
+fn get_setting_or(app_handle: &tauri::AppHandle, key: &str, default_val: &str) -> String {
+    app_handle
+        .try_state::<Database>()
+        .and_then(|db| {
+            let conn = db.conn.lock().ok()?;
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                [key],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        })
+        .unwrap_or_else(|| default_val.to_string())
 }
 
 fn build_hint_text(text: &str, qtype: QuestionType, db: &Database, model: &impl Embedder) -> String {
@@ -291,16 +400,16 @@ fn truncate_to_n_words(text: &str, n: usize) -> String {
 fn generic_hint(qtype: QuestionType) -> String {
     match qtype {
         QuestionType::Technical => {
-            "💡 Nombra stack, decisión clave, métrica o lección aprendida.".to_string()
+            "💡 Name your stack, key decision, metric, or lesson learned.".to_string()
         }
         QuestionType::Star => {
-            "💡 Usa STAR: Situation, Task, Action, Resultado con métrica.".to_string()
+            "💡 Use STAR: Situation, Task, Action, Result — with a metric.".to_string()
         }
         QuestionType::Architecture => {
-            "💡 Dibuja capas, trade-offs, escalabilidad y por qué elegiste cada pieza.".to_string()
+            "💡 Outline layers, trade-offs, scalability reasons for each choice.".to_string()
         }
         QuestionType::Trap => {
-            "💡 Sé honesto, corto, y gira hacia lo que hiciste para mejorar.".to_string()
+            "💡 Be honest, brief, and pivot to what you did to improve.".to_string()
         }
         QuestionType::None => String::new(),
     }
@@ -545,13 +654,13 @@ mod tests {
     #[test]
     fn generic_hint_architecture() {
         let h = generic_hint(QuestionType::Architecture);
-        assert!(h.contains("arquitectura") || h.contains("capas") || h.contains("trade-offs"));
+        assert!(h.contains("trade-offs"));
     }
 
     #[test]
     fn generic_hint_trap() {
         let h = generic_hint(QuestionType::Trap);
-        assert!(h.contains("honesto"));
+        assert!(h.contains("honest"));
     }
 
     #[test]
