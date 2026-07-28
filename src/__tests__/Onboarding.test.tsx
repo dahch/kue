@@ -51,17 +51,17 @@ describe("Onboarding — screen_permission step", () => {
       .mockResolvedValueOnce(false); // is_embedding_model_loaded
     render(<Onboarding onComplete={vi.fn()} />);
 
-    expect(await screen.findByText(/permiso de grabación/i)).toBeInTheDocument();
+    expect(await screen.findByText(/permisos de audio/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /conceder permiso/i })).toBeInTheDocument();
   });
 
-  it("transitions to folder_selection when permission granted and model loaded", async () => {
+  it("transitions to api_key when permission granted and model loaded", async () => {
     vi.mocked(invoke)
       .mockResolvedValueOnce(true)  // check_screen_recording_permission
       .mockResolvedValueOnce(true); // is_embedding_model_loaded
     render(<Onboarding onComplete={vi.fn()} />);
 
-    expect(await screen.findByText(/indexar proyectos/i)).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /api key/i })).toBeInTheDocument();
   });
 
   it("transitions to embedding_model when permission granted but model not loaded", async () => {
@@ -100,11 +100,11 @@ describe("Onboarding — handleGrantPermission", () => {
     const onComplete = vi.fn();
     render(<Onboarding onComplete={onComplete} />);
 
-    await screen.findByText(/permiso de grabación/i);
+    await screen.findByText(/permisos de audio/i);
     const btn = screen.getByRole("button", { name: /conceder permiso/i });
     await userEvent.click(btn);
 
-    expect(await screen.findByText(/indexar proyectos/i)).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /api key/i })).toBeInTheDocument();
   });
 
   it("shows error message when grant still denied", async () => {
@@ -114,7 +114,7 @@ describe("Onboarding — handleGrantPermission", () => {
       .mockResolvedValueOnce(false); // grant: still denied
     render(<Onboarding onComplete={vi.fn()} />);
 
-    await screen.findByText(/permiso de grabación/i);
+    await screen.findByText(/permisos de audio/i);
     const btn = screen.getByRole("button", { name: /conceder permiso/i });
     await userEvent.click(btn);
 
@@ -128,7 +128,7 @@ describe("Onboarding — handleGrantPermission", () => {
       .mockRejectedValueOnce(new Error("PERMISSION_DENIED: some internal detail")); // grant
     render(<Onboarding onComplete={vi.fn()} />);
 
-    await screen.findByText(/permiso de grabación/i);
+    await screen.findByText(/permisos de audio/i);
     const btn = screen.getByRole("button", { name: /conceder permiso/i });
     await userEvent.click(btn);
 
@@ -152,7 +152,7 @@ describe("Onboarding — embedding_model step", () => {
     expect(screen.getByText(/cargando modelo/i)).toBeInTheDocument();
   });
 
-  it("transitions to folder_selection when model finishes loading via poll", async () => {
+  it("transitions to api_key when model finishes loading via poll", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.mocked(invoke)
       .mockResolvedValueOnce(true)  // check_screen_recording_permission
@@ -165,7 +165,7 @@ describe("Onboarding — embedding_model step", () => {
 
     vi.advanceTimersByTimeAsync(1000);
     await vi.waitFor(() => {
-      expect(screen.getByText(/indexar proyectos/i)).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: /api key/i })).toBeInTheDocument();
     });
 
     vi.useRealTimers();
@@ -184,7 +184,7 @@ describe("Onboarding — embedding_model step", () => {
     const invokeCountBefore = vi.mocked(invoke).mock.calls.length;
 
     vi.advanceTimersByTimeAsync(1000);
-    await screen.findByText(/indexar proyectos/i);
+    await screen.findByRole("heading", { name: /api key/i });
     vi.advanceTimersByTimeAsync(3000);
 
     expect(vi.mocked(invoke).mock.calls.length).toBe(invokeCountBefore + 1);
@@ -194,11 +194,21 @@ describe("Onboarding — embedding_model step", () => {
 });
 
 describe("Onboarding — folder_selection step", () => {
-  function renderAtFolderStep(onComplete = vi.fn()) {
+  /// Renders the component, waits for the api_key step, and clicks
+  /// "Configurar después" to reach the folder_selection step.
+  async function navigateToFolderStep(onComplete = vi.fn()) {
     vi.mocked(invoke)
-      .mockResolvedValueOnce(true)  // check_screen_recording_permission
-      .mockResolvedValueOnce(true); // is_embedding_model_loaded
-    return render(<Onboarding onComplete={onComplete} />);
+      .mockResolvedValueOnce(true)   // check_screen_recording_permission
+      .mockResolvedValueOnce(true)   // is_embedding_model_loaded
+      .mockResolvedValueOnce(undefined); // set_setting (hint_provider)
+    const result = render(<Onboarding onComplete={onComplete} />);
+
+    await screen.findByRole("heading", { name: /api key/i });
+    const skipBtn = screen.getByText(/configurar después/i).closest("button")!;
+    await userEvent.click(skipBtn);
+
+    await screen.findByText(/indexar proyectos/i);
+    return result;
   }
 
   beforeEach(() => {
@@ -206,17 +216,15 @@ describe("Onboarding — folder_selection step", () => {
   });
 
   it("shows folder selection input and skip button", async () => {
-    renderAtFolderStep();
+    await navigateToFolderStep();
 
-    expect(await screen.findByText(/indexar proyectos/i)).toBeInTheDocument();
     expect(screen.getByPlaceholderText(/ruta absoluta/i)).toBeInTheDocument();
     expect(screen.getByText(/saltar/i)).toBeInTheDocument();
   });
 
   it("disables index button when path contains ..", async () => {
-    renderAtFolderStep();
+    await navigateToFolderStep();
 
-    await screen.findByText(/indexar proyectos/i);
     const input = screen.getByPlaceholderText(/ruta absoluta/i);
     await userEvent.type(input, "/Users/test/../../etc");
 
@@ -226,9 +234,8 @@ describe("Onboarding — folder_selection step", () => {
   });
 
   it("disables index button when path is not absolute", async () => {
-    renderAtFolderStep();
+    await navigateToFolderStep();
 
-    await screen.findByText(/indexar proyectos/i);
     const input = screen.getByPlaceholderText(/ruta absoluta/i);
     await userEvent.type(input, "relative/path");
 
@@ -238,9 +245,8 @@ describe("Onboarding — folder_selection step", () => {
   });
 
   it("shows error and does not invoke when path validation fails on click", async () => {
-    renderAtFolderStep();
+    await navigateToFolderStep();
 
-    await screen.findByText(/indexar proyectos/i);
     const input = screen.getByPlaceholderText(/ruta absoluta/i);
     await userEvent.type(input, "/valid/path/../../escape");
 
@@ -253,18 +259,17 @@ describe("Onboarding — folder_selection step", () => {
 
   it("calls index_folder_cmd with valid path", async () => {
     vi.mocked(invoke)
-      .mockResolvedValueOnce(true)  // check_screen_recording_permission
-      .mockResolvedValueOnce(true)  // is_embedding_model_loaded
-      .mockResolvedValueOnce({
-        folder: "/Users/test/Documents",
-        files_indexed: 5,
-        chunks_created: 12,
-        error_count: 0,
-      }); // index_folder_cmd → 5 docs
+      .mockResolvedValueOnce(true)   // check_screen_recording_permission
+      .mockResolvedValueOnce(true)   // is_embedding_model_loaded
+      .mockResolvedValueOnce(undefined) // set_setting (hint_provider)
+      .mockResolvedValueOnce({ folder: "/Users/test/Documents", files_indexed: 5, chunks_created: 12, error_count: 0 }); // index_folder_cmd
     const onComplete = vi.fn();
     render(<Onboarding onComplete={onComplete} />);
 
+    await screen.findByRole("heading", { name: /api key/i });
+    await userEvent.click(screen.getByText(/configurar después/i).closest("button")!);
     await screen.findByText(/indexar proyectos/i);
+
     const input = screen.getByPlaceholderText(/ruta absoluta/i);
     await userEvent.type(input, "/Users/test/Documents");
 
@@ -281,12 +286,16 @@ describe("Onboarding — folder_selection step", () => {
 
   it("shows friendly error when index_folder_cmd fails", async () => {
     vi.mocked(invoke)
-      .mockResolvedValueOnce(true)  // check_screen_recording_permission
-      .mockResolvedValueOnce(true)  // is_embedding_model_loaded
+      .mockResolvedValueOnce(true)   // check_screen_recording_permission
+      .mockResolvedValueOnce(true)   // is_embedding_model_loaded
+      .mockResolvedValueOnce(undefined) // set_setting (hint_provider)
       .mockRejectedValueOnce(new Error("STREAM_ERROR: something broke")); // index_folder_cmd
     render(<Onboarding onComplete={vi.fn()} />);
 
+    await screen.findByRole("heading", { name: /api key/i });
+    await userEvent.click(screen.getByText(/configurar después/i).closest("button")!);
     await screen.findByText(/indexar proyectos/i);
+
     const input = screen.getByPlaceholderText(/ruta absoluta/i);
     await userEvent.type(input, "/Users/test/Documents");
 
@@ -298,13 +307,17 @@ describe("Onboarding — folder_selection step", () => {
 
   it("calls mark_onboarding_done on skip", async () => {
     vi.mocked(invoke)
-      .mockResolvedValueOnce(true)  // check_screen_recording_permission
-      .mockResolvedValueOnce(true)  // is_embedding_model_loaded
+      .mockResolvedValueOnce(true)   // check_screen_recording_permission
+      .mockResolvedValueOnce(true)   // is_embedding_model_loaded
+      .mockResolvedValueOnce(undefined) // set_setting (hint_provider)
       .mockResolvedValueOnce(undefined); // mark_onboarding_done
     const onComplete = vi.fn();
     render(<Onboarding onComplete={onComplete} />);
 
+    await screen.findByRole("heading", { name: /api key/i });
+    await userEvent.click(screen.getByText(/configurar después/i).closest("button")!);
     await screen.findByText(/indexar proyectos/i);
+
     const skipBtn = screen.getByText(/saltar/i).closest("button")!;
     await userEvent.click(skipBtn);
 
@@ -316,14 +329,18 @@ describe("Onboarding — folder_selection step", () => {
 
   it("shows Comenzar button and calls onComplete after indexing", async () => {
     vi.mocked(invoke)
-      .mockResolvedValueOnce(true)  // check_screen_recording_permission
-      .mockResolvedValueOnce(true)  // is_embedding_model_loaded
-      .mockResolvedValueOnce(3)     // index_folder_cmd
+      .mockResolvedValueOnce(true)   // check_screen_recording_permission
+      .mockResolvedValueOnce(true)   // is_embedding_model_loaded
+      .mockResolvedValueOnce(undefined) // set_setting (hint_provider)
+      .mockResolvedValueOnce({ files_indexed: 3, chunks_created: 7, error_count: 0, folder: "/test" }) // index_folder_cmd
       .mockResolvedValueOnce(undefined); // mark_onboarding_done
     const onComplete = vi.fn();
     render(<Onboarding onComplete={onComplete} />);
 
+    await screen.findByRole("heading", { name: /api key/i });
+    await userEvent.click(screen.getByText(/configurar después/i).closest("button")!);
     await screen.findByText(/indexar proyectos/i);
+
     const input = screen.getByPlaceholderText(/ruta absoluta/i);
     await userEvent.type(input, "/Users/test/Documents");
 
@@ -433,7 +450,7 @@ describe("Onboarding — error on mount", () => {
     vi.mocked(invoke).mockRejectedValueOnce(new Error("PERMISSION_DENIED: system denied"));
     render(<Onboarding onComplete={vi.fn()} />);
 
-    expect(await screen.findByText(/permiso de grabación/i)).toBeInTheDocument();
+    expect(await screen.findByText(/permisos de audio/i)).toBeInTheDocument();
     expect(screen.getByText(/permiso denegado por el sistema/i)).toBeInTheDocument();
   });
 
@@ -493,7 +510,7 @@ describe("Onboarding — embedding_model polling error paths", () => {
     // Second poll tick — invoke succeeds
     await vi.advanceTimersByTimeAsync(1000);
     await vi.waitFor(() => {
-      expect(screen.getByText(/indexar proyectos/i)).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: /api key/i })).toBeInTheDocument();
     });
 
     vi.useRealTimers();
@@ -514,9 +531,14 @@ describe("Onboarding — folder_selection indexing state", () => {
     vi.mocked(invoke)
       .mockResolvedValueOnce(true)  // check_screen_recording_permission
       .mockResolvedValueOnce(true)  // is_embedding_model_loaded
+      .mockResolvedValueOnce(undefined) // set_setting (hint_provider)
       .mockReturnValueOnce(deferred); // index_folder_cmd stays pending
 
     render(<Onboarding onComplete={vi.fn()} />);
+
+    await screen.findByRole("heading", { name: /api key/i });
+    const skipApiBtn = screen.getByText(/configurar después/i).closest("button")!;
+    await userEvent.click(skipApiBtn);
 
     await screen.findByText(/indexar proyectos/i);
     const input = screen.getByPlaceholderText(/ruta absoluta/i);

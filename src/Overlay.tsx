@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { listen } from "@tauri-apps/api/event";
+import { Icon } from "./Icon";
 
 interface HintPayload {
   text: string;
@@ -75,15 +76,28 @@ function Overlay() {
   // Top-center: transparent floating 400×100 window, unobtrusive above main content
   return (
     <div
-      className="fixed inset-0 flex items-start justify-center pt-8 transition-opacity duration-500"
-      style={{ opacity: visible ? 1 : 0 }}
+      aria-live="polite"
+      className="fixed inset-0 flex items-start justify-center pt-7 transition-all duration-500"
+      style={{
+        opacity: visible ? 1 : 0,
+        transform: visible ? "translateY(0)" : "translateY(-8px)",
+      }}
     >
       <div
-        className={`rounded-xl px-8 py-5 text-center text-xl font-medium leading-relaxed text-white shadow-2xl backdrop-blur-md ${
-          panicking ? "bg-orange-700/70" : "bg-black/60"
+        className={`flex max-w-full items-center gap-3 rounded-2xl px-6 py-4 shadow-pop backdrop-blur-xl ring-1 ${
+          panicking
+            ? "bg-signal-amber/85 text-ink-950 ring-signal-amber/50"
+            : "bg-ink-950/75 text-white ring-white/10"
         }`}
       >
-        {panicking ? "🔇" : hint?.text ?? ""}
+        {panicking ? (
+          <Icon name="mute" className="h-5 w-5" />
+        ) : (
+          <span aria-hidden="true" className="h-2 w-2 shrink-0 rounded-full bg-volt-400 shadow-[0_0_12px_2px_rgba(201,242,75,0.7)]" />
+        )}
+        <p className="text-lg font-medium leading-snug">
+          {panicking ? "" : hint?.text ?? ""}
+        </p>
       </div>
     </div>
   );

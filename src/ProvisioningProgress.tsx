@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { t, useLanguage } from "./i18n";
+import { Icon } from "./Icon";
+import { Spinner } from "./ui";
 
 interface DownloadProgress {
   stage: string;
@@ -81,26 +83,45 @@ function ProvisioningProgress({ onProvisioned }: { onProvisioned: () => void }) 
       : t("downloadingLibs");
 
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center bg-zinc-950 p-8 text-white">
-      <div className="w-full max-w-md rounded-xl border border-zinc-700 bg-zinc-900 p-8">
-        <h1 className="mb-2 text-2xl font-bold">{t("preparingKue")}</h1>
-        <p className="mb-6 text-sm text-zinc-400">
+    <div className="flex min-h-screen flex-col items-center justify-center p-8 text-white">
+      <div className="mb-8 flex flex-col items-center gap-4 animate-fade-up">
+        <div className="relative">
+          <span aria-hidden="true" className="absolute inset-0 rounded-3xl bg-volt-400/20 blur-xl animate-pulse" />
+          <img
+            src="/kue-icon.svg"
+            alt=""
+            className="relative h-16 w-16 rounded-3xl shadow-card ring-1 ring-white/10"
+          />
+        </div>
+      </div>
+
+      <div className="w-full max-w-md rounded-2xl border border-white/5 bg-ink-900 p-8 shadow-card animate-fade-up" style={{ animationDelay: "60ms" }}>
+        <h1 className="mb-1.5 text-2xl font-bold tracking-tight">{t("preparingKue")}</h1>
+        <p className="mb-7 text-sm leading-relaxed text-zinc-400">
           {t("provisioningSubtitle")}
         </p>
 
         {state === "downloading" && progress && (
-          <div className="space-y-3">
-            <div className="flex justify-between text-sm text-zinc-300">
-              <span>{stageLabel}</span>
-              <span>{percent}%</span>
+          <div className="space-y-3 animate-fade-in">
+            <div className="flex items-baseline justify-between text-sm">
+              <span className="text-zinc-300">{stageLabel}</span>
+              <span className="font-mono text-lg font-semibold tabular-nums text-volt-400">{percent}%</span>
             </div>
-            <div className="h-3 w-full overflow-hidden rounded-full bg-zinc-700">
+            <div
+              role="progressbar"
+              aria-valuenow={percent}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              className="h-2.5 w-full overflow-hidden rounded-full bg-ink-700"
+            >
               <div
-                className="h-full rounded-full bg-emerald-500 transition-all duration-300"
+                className="relative h-full overflow-hidden rounded-full bg-volt-400 transition-all duration-300"
                 style={{ width: `${percent}%` }}
-              />
+              >
+                <span aria-hidden="true" className="absolute inset-y-0 w-1/3 animate-shimmer bg-white/30 blur-[2px]" />
+              </div>
             </div>
-            <p className="text-xs text-zinc-500">
+            <p className="font-mono text-[11px] uppercase tracking-wider text-zinc-500">
               {t("fileXOfY", {
                 fileIndex: progress.file_index + 1,
                 fileCount: progress.file_count,
@@ -112,20 +133,24 @@ function ProvisioningProgress({ onProvisioned }: { onProvisioned: () => void }) 
 
         {state === "downloading" && !progress && (
           <div className="flex items-center gap-3 text-sm text-zinc-400">
-            <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-zinc-500 border-t-zinc-300" />
+            <Spinner />
             {t("startingDownload")}
           </div>
         )}
 
         {state === "error" && (
-          <div className="space-y-4">
-            <div className="rounded-lg border border-red-800 bg-red-900/30 p-4">
-              <p className="text-sm text-red-400">{error || t("downloadError")}</p>
+          <div className="space-y-4 animate-fade-in">
+            <div className="rounded-xl border border-signal-red/30 bg-signal-red/[0.07] p-4" role="alert">
+              <p className="flex items-start gap-2 text-sm text-signal-red">
+                <Icon name="alert" className="mt-0.5 h-4 w-4" />
+                {error || t("downloadError")}
+              </p>
             </div>
             <button
-              className="w-full rounded-lg bg-emerald-600 py-3 font-medium transition-colors hover:bg-emerald-500"
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-volt-400 py-3 font-semibold text-ink-950 transition-all hover:bg-volt-300 active:scale-[0.99]"
               onClick={handleRetry}
             >
+              <Icon name="refresh" className="h-4 w-4" />
               {t("retry")}
             </button>
           </div>
@@ -133,7 +158,7 @@ function ProvisioningProgress({ onProvisioned }: { onProvisioned: () => void }) 
 
         {state === "retrying" && (
           <div className="flex items-center gap-3 text-sm text-zinc-400">
-            <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-zinc-500 border-t-zinc-300" />
+            <Spinner />
             {t("retrying")}
           </div>
         )}
