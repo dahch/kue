@@ -25,6 +25,7 @@ thiserror = "2"
 rusqlite = { version = "0.33", features = ["bundled"] }
 cpal = "0.15"
 hound = "3.5"
+rubato = "0.15"
 
 [dependencies.screencapturekit]
 path = "vendor/screencapturekit-rs/screencapturekit"
@@ -77,6 +78,10 @@ version = "2"
 [dependencies.reqwest]
 version = "0.12"
 features = ["json", "blocking"]
+
+[dependencies.tokio]
+version = "1"
+features = ["time"]
 
 [dependencies.log]
 version = "0.4"
