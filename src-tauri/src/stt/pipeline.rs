@@ -78,6 +78,9 @@ impl STTPipeline {
             self.config.silence_timeout_ms,
         );
 
+        let max_segment_samples =
+            (self.config.sample_rate as u64 * self.config.max_segment_duration_ms / 1000) as usize;
+
         let mut speech_buffer: Vec<i16> = Vec::new();
         let mut segment_start_ms: u64 = 0;
         let mut in_segment = false;
@@ -86,7 +89,7 @@ impl STTPipeline {
         thread::Builder::new()
             .name("kue-stt-pipeline".into())
             .spawn(move || {
-                eprintln!("[kue] STT pipeline thread started");
+                log::info!("STT pipeline thread started");
 
                 loop {
                     let samples = {
@@ -107,7 +110,7 @@ impl STTPipeline {
                                 continue;
                             }
                             Err(RecvTimeoutError::Disconnected) => {
-                                eprintln!("[kue] STT pipeline: audio source disconnected");
+                                log::info!("STT pipeline: audio source disconnected");
                                 if in_segment && !speech_buffer.is_empty() {
                                     self.flush_segment(
                                         &mut speech_buffer,
@@ -132,6 +135,23 @@ impl STTPipeline {
                             speech_buffer.clear();
                         }
                         speech_buffer.extend_from_slice(&samples);
+
+                        // Hard cap: if the buffer exceeds max_segment_duration_ms
+                        // worth of samples, flush it now without waiting for silence.
+                        // Keep in_segment=true so the next speech samples start a
+                        // fresh sub-segment (the speaker is still talking).
+                        if speech_buffer.len() >= max_segment_samples {
+                            self.flush_segment_keep_speaking(
+                                &mut speech_buffer,
+                                &mut segment_start_ms,
+                                &session_start,
+                                &db,
+                            );
+                            // Start a new sub-segment from the current time.
+                            // The VAD still considers us in_speech, so the next
+                            // speaking chunk will continue accumulating from here.
+                            segment_start_ms = now;
+                        }
                     } else if in_segment && !speech_buffer.is_empty() {
                         self.flush_segment(
                             &mut speech_buffer,
@@ -148,7 +168,7 @@ impl STTPipeline {
                 if let Some(ref tx) = self.hint_job_tx {
                     let _ = tx.send(HintCommand::CancelSession(self.session_id.clone()));
                 }
-                eprintln!("[kue] STT pipeline thread ended");
+                log::info!("STT pipeline thread ended");
             })
             .expect("failed to spawn STT pipeline thread")
     }
@@ -175,7 +195,7 @@ impl STTPipeline {
                 return;
             }
 
-            eprintln!("[kue] STT: \"{transcribed}\"");
+            log::info!("STT: \"{transcribed}\"");
 
             if !self.session_id.is_empty() {
                 persist_transcript_line(
@@ -193,7 +213,7 @@ impl STTPipeline {
                     ended_at_ms,
                 };
                 if let Err(e) = handle.emit("new-transcript", line) {
-                    eprintln!("[kue] Failed to emit new-transcript event: {e}");
+                    log::warn!("Failed to emit new-transcript event: {e}");
                 }
 
                 if qtype != QuestionType::None {
@@ -202,7 +222,7 @@ impl STTPipeline {
                         "type": qtype.as_str(),
                         "session_id": self.session_id,
                     })) {
-                        eprintln!("[kue] Failed to emit question-detected event: {e}");
+                        log::warn!("Failed to emit question-detected event: {e}");
                     }
 
                     if let Some(ref tx) = self.hint_job_tx {
@@ -218,6 +238,74 @@ impl STTPipeline {
         }
 
         *in_segment = false;
+        buffer.clear();
+    }
+
+    /// Like `flush_segment` but for mid-speech hard-cap flushes.
+    /// Transcribes the current buffer WITHOUT marking the speaker as
+    /// silent — the next speech samples will start a fresh sub-segment.
+    fn flush_segment_keep_speaking(
+        &self,
+        buffer: &mut Vec<i16>,
+        segment_start_ms: &mut u64,
+        session_start: &Instant,
+        db: &crate::db::Database,
+    ) {
+        if buffer.is_empty() {
+            return;
+        }
+
+        let ended_at_ms = session_start.elapsed().as_millis() as u64;
+        let text = self.engine.transcribe_audio_chunk(buffer);
+
+        if let Some(transcribed) = text {
+            if transcribed.trim().is_empty() {
+                buffer.clear();
+                return;
+            }
+
+            log::info!("STT (mid-segment): \"{transcribed}\"");
+
+            if !self.session_id.is_empty() {
+                persist_transcript_line(
+                    db, &self.session_id, &transcribed, &Speaker::Interviewer, *segment_start_ms, ended_at_ms,
+                );
+            }
+
+            if let Some(ref handle) = self.app_handle {
+                let qtype = classify(&transcribed);
+
+                let line = TranscriptLine {
+                    speaker: Speaker::Interviewer,
+                    text: transcribed.clone(),
+                    started_at_ms: *segment_start_ms,
+                    ended_at_ms,
+                };
+                if let Err(e) = handle.emit("new-transcript", line) {
+                    log::warn!("Failed to emit new-transcript event: {e}");
+                }
+
+                if qtype != QuestionType::None {
+                    if let Err(e) = handle.emit("question-detected", serde_json::json!({
+                        "text": &transcribed,
+                        "type": qtype.as_str(),
+                        "session_id": self.session_id,
+                    })) {
+                        log::warn!("Failed to emit question-detected event: {e}");
+                    }
+
+                    if let Some(ref tx) = self.hint_job_tx {
+                        let _ = tx.send(HintCommand::Process(HintJob {
+                            session_id: self.session_id.clone(),
+                            text: transcribed.clone(),
+                            qtype,
+                            mode: self.mode.clone(),
+                        }));
+                    }
+                }
+            }
+        }
+
         buffer.clear();
     }
 }

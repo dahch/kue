@@ -51,6 +51,8 @@ impl STTEngine for MoonshineCLIEngine {
 }
 
 impl MoonshineCLIEngine {
+    const CLI_TIMEOUT_SECS: u64 = 20;
+
     fn transcribe_file(&self, wav_path: &std::path::Path) -> Option<String> {
         let mut cmd = Command::new(Self::cli_path());
         cmd.arg("transcribe")
@@ -64,19 +66,41 @@ impl MoonshineCLIEngine {
             cmd.arg("--model-path").arg(mp);
         }
 
-        let output = cmd.output().ok()?;
+        let child = cmd.spawn().ok()?;
 
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
-        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<std::process::Output>>();
+        std::thread::spawn(move || {
+            let result = child.wait_with_output();
+            let _ = tx.send(result);
+        });
 
-        let all = format!("{}{}", stderr_str, stdout_str);
-        let line = all
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .last()?;
+        match rx.recv_timeout(std::time::Duration::from_secs(Self::CLI_TIMEOUT_SECS)) {
+            Ok(Ok(output)) => {
+                let stderr_str = String::from_utf8_lossy(&output.stderr);
+                let stdout_str = String::from_utf8_lossy(&output.stdout);
 
-        Some(line.to_string())
+                let all = format!("{}{}", stderr_str, stdout_str);
+                let line = all
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .last()?;
+
+                Some(line.to_string())
+            }
+            Ok(Err(e)) => {
+                log::warn!("CLI: wait for process failed: {e}");
+                None
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                log::warn!("CLI: {}-second timeout exceeded for transcribe_file", Self::CLI_TIMEOUT_SECS);
+                None
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                log::warn!("CLI: transcribe worker disconnected unexpectedly");
+                None
+            }
+        }
     }
 }
 

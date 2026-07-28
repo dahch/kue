@@ -41,6 +41,9 @@ pub fn transcribe_channel_batch(
         config.silence_timeout_ms,
     );
 
+    let max_segment_samples =
+        (config.sample_rate as u64 * config.max_segment_duration_ms / 1000) as usize;
+
     let mut transcript_lines: Vec<TranscriptLine> = Vec::new();
     let mut speech_buffer: Vec<i16> = Vec::new();
     let mut segment_start_sample: usize = 0;
@@ -62,6 +65,38 @@ pub fn transcribe_channel_batch(
                 speech_buffer.clear();
             }
             speech_buffer.extend_from_slice(chunk);
+
+            // Hard cap: if the buffer exceeds max_segment_duration_ms worth
+            // of samples, flush it now without waiting for silence. Keep
+            // in_segment=true and start a fresh sub-segment.
+            if speech_buffer.len() >= max_segment_samples {
+                let started_at_ms = sample_offset_to_ms(segment_start_sample, config.sample_rate);
+                let ended_at_ms = sample_offset_to_ms(pos + chunk.len(), config.sample_rate);
+
+                if let Some(text) = engine.transcribe_audio_chunk(&speech_buffer) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        persist_transcript_line(
+                            db,
+                            session_id,
+                            trimmed,
+                            &speaker,
+                            started_at_ms,
+                            ended_at_ms,
+                        );
+                        transcript_lines.push(TranscriptLine {
+                            speaker,
+                            text: trimmed.to_string(),
+                            started_at_ms,
+                            ended_at_ms,
+                        });
+                    }
+                }
+
+                speech_buffer.clear();
+                // Start a new sub-segment from the current position.
+                segment_start_sample = pos + chunk.len();
+            }
         } else if in_segment && !speech_buffer.is_empty() {
             let started_at_ms = sample_offset_to_ms(segment_start_sample, config.sample_rate);
             let ended_at_ms = sample_offset_to_ms(pos, config.sample_rate);
@@ -111,8 +146,8 @@ pub fn transcribe_channel_batch(
         }
     }
 
-    eprintln!(
-        "[kue] Batch transcription ({}): {} lines",
+    log::info!(
+        "Batch transcription ({}): {} lines",
         speaker.as_db_str(),
         transcript_lines.len()
     );
@@ -848,6 +883,81 @@ mod tests {
             .unwrap()
         };
         assert_eq!(db_session_id, "sess-target-id");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Max segment duration: long speech without silence ──
+
+    #[test]
+    fn batch_long_continuous_speech_splits_into_multiple_segments() {
+        let dir = std::env::temp_dir().join("kue-batch-test-long");
+        let _ = std::fs::create_dir_all(&dir);
+        let wav_path = dir.join("long.wav");
+
+        // 20s of continuous speech (all above VAD threshold, no silence gaps)
+        let speech = make_speech_chunk(5000, 20_000);
+        write_test_wav(&wav_path, &speech);
+
+        let engine = MockEngine {
+            result: Some("long segment text".into()),
+        };
+        let mut config = STTConfig::default();
+        config.max_segment_duration_ms = 12_000; // explicit
+        let db = create_test_db("sess-long");
+        let result = transcribe_channel_batch(
+            &wav_path,
+            Speaker::User,
+            "sess-long",
+            &db,
+            &engine,
+            &config,
+        )
+        .unwrap();
+
+        assert!(
+            result.len() >= 2,
+            "20s of continuous speech should produce at least 2 segments (max 12s each), got {}",
+            result.len()
+        );
+        // Verify DB has the same count
+        let conn = db.conn.lock().unwrap();
+        let db_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transcript_lines", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(db_count as usize, result.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_short_speech_below_max_duration_stays_single_segment() {
+        let dir = std::env::temp_dir().join("kue-batch-test-short-ok");
+        let _ = std::fs::create_dir_all(&dir);
+        let wav_path = dir.join("short_ok.wav");
+
+        // 5s of speech (well below 12s max)
+        let speech = make_speech_chunk(5000, 5_000);
+        write_test_wav(&wav_path, &speech);
+
+        let engine = MockEngine {
+            result: Some("short answer".into()),
+        };
+        let config = STTConfig::default();
+        let db = create_test_db("sess-short-ok");
+        let result = transcribe_channel_batch(
+            &wav_path,
+            Speaker::User,
+            "sess-short-ok",
+            &db,
+            &engine,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.len(),
+            1,
+            "5s of speech (below 12s max) should remain a single segment"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

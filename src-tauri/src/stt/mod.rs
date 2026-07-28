@@ -43,7 +43,7 @@ pub(crate) fn persist_transcript_line(
     let conn = match db.conn.lock() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[kue] STT: failed to lock DB: {e}");
+            log::error!("Failed to lock DB: {e}");
             return;
         }
     };
@@ -53,20 +53,20 @@ pub(crate) fn persist_transcript_line(
          VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![session_id, speaker.as_db_str(), text, started_at_ms, ended_at_ms],
     ) {
-        eprintln!("[kue] STT: failed to persist transcript line: {e}");
+        log::error!("Failed to persist transcript line: {e}");
     }
 }
 
 /// Create an STT engine: FFI if available, otherwise CLI fallback.
 pub fn create_engine(config: &STTConfig) -> Box<dyn STTEngine> {
     if ffi::MoonshineFFIEngine::is_available() {
-        eprintln!("[kue] STT: using Moonshine FFI engine");
+        log::info!("Using Moonshine FFI engine");
         Box::new(ffi::MoonshineFFIEngine::new())
     } else if config.use_cli_fallback {
-        eprintln!("[kue] STT: Moonshine lib not found, falling back to CLI engine");
+        log::warn!("Moonshine lib not found, falling back to CLI engine");
         Box::new(cli::MoonshineCLIEngine::new())
     } else {
-        eprintln!("[kue] STT: No Moonshine lib and CLI fallback disabled");
+        log::warn!("No Moonshine lib and CLI fallback disabled");
         Box::new(cli::MoonshineCLIEngine::new())
     }
 }
@@ -94,6 +94,11 @@ pub struct STTConfig {
     pub silence_timeout_ms: u64,
     pub sample_rate: u32,
     pub use_cli_fallback: bool,
+    /// Hard cap on segment duration (ms) to avoid unbounded buffers
+    /// when the speaker talks continuously without pauses. The pipeline
+    /// will flush the current segment at this boundary even if VAD has
+    /// not detected silence.
+    pub max_segment_duration_ms: u64,
 }
 
 impl Default for STTConfig {
@@ -111,6 +116,10 @@ impl Default for STTConfig {
             silence_timeout_ms: 600,
             sample_rate: 16_000,
             use_cli_fallback: true,
+            // Force-flush after 12s of continuous speech even without silence;
+            // prevents the engine from receiving a buffer that is too large
+            // for the streaming model and blocks the pipeline indefinitely.
+            max_segment_duration_ms: 12_000,
         }
     }
 }
@@ -201,6 +210,12 @@ mod tests {
     fn stt_config_default_use_cli_fallback() {
         let config = STTConfig::default();
         assert!(config.use_cli_fallback);
+    }
+
+    #[test]
+    fn stt_config_default_max_segment_duration() {
+        let config = STTConfig::default();
+        assert_eq!(config.max_segment_duration_ms, 12_000);
     }
 
     // -----------------------------------------------------------------------

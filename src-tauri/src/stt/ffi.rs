@@ -154,11 +154,11 @@ impl MoonshineFFIEngine {
             if candidate.exists() {
                 match unsafe { Library::new(candidate) } {
                     Ok(lib) => {
-                        eprintln!("[kue] Loaded Moonshine library from {:?}", candidate);
+                        log::info!("Loaded Moonshine library from {:?}", candidate);
                         return Some(lib);
                     }
                     Err(e) => {
-                        eprintln!("[kue] Failed to load Moonshine lib from {:?}: {e}", candidate);
+                        log::warn!("Failed to load Moonshine lib from {:?}: {e}", candidate);
                     }
                 }
             }
