@@ -61,7 +61,9 @@ const SCHEMA_DDL: &str = "
         ended_at DATETIME,
         company TEXT,
         role TEXT,
-        mode TEXT CHECK(mode IN ('practice', 'shadow'))
+        mode TEXT CHECK(mode IN ('practice', 'shadow')),
+        interview_plan TEXT,
+        current_question_index INTEGER DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS transcript_lines (
@@ -112,6 +114,10 @@ pub fn open_and_migrate(db_path: &Path) -> Result<Database, Box<dyn std::error::
          PRAGMA busy_timeout=5000;",
     )?;
     conn.execute_batch(SCHEMA_DDL)?;
+    conn.execute_batch(
+        "ALTER TABLE sessions ADD COLUMN interview_plan TEXT;\n         ALTER TABLE sessions ADD COLUMN current_question_index INTEGER DEFAULT 0;",
+    )
+    .ok(); // Ignore errors on existing columns — idempotent migration
     conn.execute_batch(&vec0_ddl())?;
 
     // Seed default settings

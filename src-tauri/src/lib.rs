@@ -7,13 +7,17 @@ mod analyze;
 mod audio;
 mod classifier;
 mod db;
+mod interview_plan;
+mod interview_runner;
 mod keys;
+mod llm;
 mod logging;
 mod onboarding;
 mod orchestrator;
 mod overlay;
 mod rag;
 mod stt;
+mod tts;
 mod types;
 
 /// Shared state tracking which sessions have completed Channel A batch
@@ -49,6 +53,7 @@ pub fn run() {
             }
 
             let database = db::init_db(app)?;
+            let db_clone = db::Database::clone(&database);
             app.manage(database);
 
             let recordings_dir = app.path().app_data_dir()?.join("recordings");
@@ -82,6 +87,15 @@ pub fn run() {
             let batch_tracker = BatchTracker(Arc::new(Mutex::new(HashSet::new())));
             app.manage(batch_tracker);
 
+            // Register interview runner state
+            let interview_runner = std::sync::Mutex::new(
+                interview_runner::InterviewRunner::new(
+                    app.handle().clone(),
+                    db_clone,
+                ),
+            );
+            app.manage(interview_runner);
+
             // Prepend the managed moonshine lib dir to DYLD_LIBRARY_PATH so
             // that @rpath/libonnxruntime.*.dylib is found alongside
             // libmoonshine.dylib when loaded by the FFI engine. Safe here:
@@ -109,6 +123,7 @@ pub fn run() {
             audio::capture::stop_session,
             audio::capture::panic_mode,
             audio::capture::is_transcript_ready,
+            audio::capture::get_log_dir_path,
             rag::indexer::index_folder_cmd,
             rag::indexer::search_context,
             classifier::classify_text,
@@ -122,6 +137,10 @@ pub fn run() {
             onboarding::mark_onboarding_done,
             onboarding::check_screen_recording_permission,
             onboarding::is_embedding_model_loaded,
+            interview_plan::generate_interview_plan,
+            interview_runner::start_ai_interview,
+            interview_runner::skip_ai_question,
+            interview_runner::stop_ai_interview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
