@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{SampleFormat, WavSpec, WavWriter};
+use rubato::{FastFixedOut, PolynomialDegree, Resampler};
 use screencapturekit::cm_sample_buffer::CMSampleBuffer;
 use screencapturekit::sc_content_filter::{self, SCContentFilter};
 use screencapturekit::sc_error_handler::StreamErrorHandler;
@@ -31,6 +32,7 @@ pub const CHANNELS: u16 = 1;
 const BUFFER_CAPACITY: usize = 1500;
 const VALID_MODES: [&str; 2] = ["practice", "shadow"];
 const MIC_CHANNEL_A_FILENAME: &str = "mic_channel_A.wav";
+const LOOPBACK_CHANNEL_B_FILENAME: &str = "loopback_channel_B.wav";
 
 /// Gain applied to system-loopback (Channel B) samples. Interview audio is
 /// often much quieter than the microphone; this boost keeps it above the VAD
@@ -45,6 +47,7 @@ const LOOPBACK_GAIN: f32 = 4.0;
 pub struct AudioCaptureStatus {
     pub mic_active: bool,
     pub loopback_active: bool,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -215,7 +218,7 @@ impl AudioCapture {
             let _ = fs::remove_dir_all(&session_dir);
             e
         })?;
-        let loopback_path = session_dir.join("loopback_channel_B.wav");
+        let loopback_path = session_dir.join(LOOPBACK_CHANNEL_B_FILENAME);
         let loopback_writer = spawn_wav_writer("loopback-B", loopback_rx, loopback_path)?;
 
         inner.loopback = Some(LoopbackHandle(loopback));
@@ -227,6 +230,7 @@ impl AudioCapture {
             AudioCaptureStatus {
                 mic_active: true,
                 loopback_active: true,
+                session_id: None,
             },
             stt_rx,
         ))
@@ -234,8 +238,6 @@ impl AudioCapture {
 
     pub fn stop(&self) -> AudioCaptureStatus {
         let mut inner = self.inner.lock().unwrap();
-        // Drop streams first (stops capture, closes senders → receivers
-        // disconnect → writer threads exit).
         inner.mic = None;
         inner.loopback = None;
 
@@ -246,8 +248,12 @@ impl AudioCapture {
         // Join VAD monitor thread
         inner.mic_vad_handle.take().map(|h| h.join().ok());
 
-        // Join STT thread (it will disconnect when the audio receiver drops)
-        inner.stt_thread.take().map(|h| h.join().ok());
+        // Detach (don't join) the STT thread — it may be stuck in a
+        // long-running CLI transcription and joining it here would block
+        // the entire teardown, preventing batch transcription from ever
+        // being spawned. The STT thread will exit on its own when the
+        // audio receiver disconnects.
+        drop(inner.stt_thread.take());
 
         inner.mode = String::new();
         // session_dir stays for batch transcription to handle cleanup
@@ -255,6 +261,7 @@ impl AudioCapture {
         AudioCaptureStatus {
             mic_active: false,
             loopback_active: false,
+            session_id: inner.session_id.clone(),
         }
     }
 
@@ -313,26 +320,26 @@ fn spawn_wav_writer(
             let mut writer = match WavWriter::create(&path, spec) {
                 Ok(w) => w,
                 Err(e) => {
-                    eprintln!("[kue] Failed to create WAV file {path:?}: {e}");
+                    log::error!("Failed to create WAV file {path:?}: {e}");
                     return;
                 }
             };
 
-            println!("[kue] WAV writer '{label}' started → {path:?}");
+            log::info!("WAV writer '{label}' started → {path:?}");
 
             for samples in &rx {
                 for &s in &samples {
                     if let Err(e) = writer.write_sample(s) {
-                        eprintln!("[kue] WAV writer '{label}' write error: {e}");
+                        log::error!("WAV writer '{label}' write error: {e}");
                     }
                 }
             }
 
             // Channel closed — flush and finalize.
             if let Err(e) = writer.finalize() {
-                eprintln!("[kue] WAV writer '{label}' finalize error: {e}");
+                log::error!("WAV writer '{label}' finalize error: {e}");
             }
-            println!("[kue] WAV writer '{label}' finished → {path:?}");
+            log::info!("WAV writer '{label}' finished → {path:?}");
         })
         .map_err(|e| AudioError::StreamError(format!("Failed to spawn WAV writer thread: {e}")))
 }
@@ -340,6 +347,70 @@ fn spawn_wav_writer(
 // ---------------------------------------------------------------------------
 // Mic capture (Canal A) – cpal, with tee for VAD
 // ---------------------------------------------------------------------------
+
+/// Small stateful helper that converts microphone input to mono f32 and
+/// resamples it to `SAMPLE_RATE` (16 kHz) before it reaches the WAV writer,
+/// VAD and STT pipelines.
+///
+/// cpal exposes the device's native sample rate and channel count, but the
+/// rest of the system expects 16 kHz mono. Without resampling the WAV header
+/// would claim 16 kHz while the payload was recorded at e.g. 48 kHz, which
+/// makes the file sound much longer than the session and often silent/corrupt.
+struct MicResampler {
+    resampler: FastFixedOut<f32>,
+    input_buffer: Vec<f32>,
+}
+
+impl MicResampler {
+    fn new(input_rate: f64) -> Result<Self, AudioError> {
+        let ratio = SAMPLE_RATE as f64 / input_rate;
+        // 1024 output frames @ 16 kHz ≈ 64 ms of audio. Large enough to be
+        // efficient, small enough to keep latency low.
+        let resampler = FastFixedOut::new(
+            ratio,
+            2.0,
+            PolynomialDegree::Linear,
+            1024,
+            1,
+        )
+        .map_err(|e| AudioError::StreamError(format!("Failed to create mic resampler: {e}")))?;
+        Ok(Self {
+            resampler,
+            input_buffer: Vec::new(),
+        })
+    }
+
+    fn push(&mut self, mono_f32: &[f32], wav_tx: &SyncSender<Vec<i16>>, vad_tx: &SyncSender<Vec<i16>>) {
+        self.input_buffer.extend_from_slice(mono_f32);
+        while self.input_buffer.len() >= self.resampler.input_frames_next() {
+            let needed = self.resampler.input_frames_next();
+            let input = vec![self.input_buffer[..needed].to_vec()];
+            match self.resampler.process(&input, None) {
+                Ok(output) => {
+                    let samples: Vec<i16> = output[0]
+                        .iter()
+                        .map(|&s| f32_to_i16(s))
+                        .collect();
+                    send_mic_samples(&samples, wav_tx, vad_tx);
+                }
+                Err(e) => {
+                    log::error!("Mic resampling error: {e}");
+                }
+            }
+            self.input_buffer.drain(..needed);
+        }
+    }
+}
+
+fn send_mic_samples(samples: &[i16], wav_tx: &SyncSender<Vec<i16>>, vad_tx: &SyncSender<Vec<i16>>) {
+    let buf = samples.to_vec();
+    if wav_tx.try_send(buf.clone()).is_err() {
+        log::error!("Mic WAV writer channel full — dropping buffer");
+    }
+    if vad_tx.try_send(buf).is_err() {
+        log::error!("Mic VAD channel full — dropping buffer");
+    }
+}
 
 fn start_mic_capture_tee(
     wav_tx: SyncSender<Vec<i16>>,
@@ -358,55 +429,95 @@ fn start_mic_capture_tee(
 
     let sample_format = config.sample_format();
     let stream_config: cpal::StreamConfig = config.into();
+    let input_channels = stream_config.channels as usize;
+    let input_rate = stream_config.sample_rate.0 as f64;
+    let needs_resampling =
+        (input_rate - SAMPLE_RATE as f64).abs() > 1.0 || input_channels != 1;
 
     match sample_format {
         cpal::SampleFormat::I16 => {
+            let mut resampler = if needs_resampling {
+                Some(MicResampler::new(input_rate)?)
+            } else {
+                None
+            };
             let stream = device
                 .build_input_stream::<i16, _, _>(
                     &stream_config,
                     move |data, _| {
-                        let samples = data.to_vec();
-                        if wav_tx.try_send(samples.clone()).is_err() {
-                            eprintln!("[kue] Mic WAV writer channel full — dropping buffer");
-                        }
-                        if vad_tx.try_send(samples).is_err() {
-                            eprintln!("[kue] Mic VAD channel full — dropping buffer");
+                        let mono_f32: Vec<f32> = if input_channels == 1 {
+                            data.iter()
+                                .map(|&s| s as f32 / i16::MAX as f32)
+                                .collect()
+                        } else {
+                            data.chunks_exact(input_channels)
+                                .map(|chunk| {
+                                    let sum: f32 = chunk.iter().map(|&s| s as f32).sum();
+                                    sum / (input_channels as f32 * i16::MAX as f32)
+                                })
+                                .collect()
+                        };
+                        if let Some(r) = &mut resampler {
+                            r.push(&mono_f32, &wav_tx, &vad_tx);
+                        } else {
+                            let samples: Vec<i16> = mono_f32
+                                .iter()
+                                .map(|&s| f32_to_i16(s))
+                                .collect();
+                            send_mic_samples(&samples, &wav_tx, &vad_tx);
                         }
                     },
-                    move |err| eprintln!("[kue] Mic capture error: {err}"),
+                    move |err| log::error!("Mic capture error: {err}"),
                     None,
                 )
                 .map_err(|e| AudioError::StreamError(format!("Failed to build mic stream: {e}")))?;
             stream
                 .play()
                 .map_err(|e| AudioError::StreamError(format!("Failed to start mic stream: {e}")))?;
-            println!("[kue] Mic capture (Canal A) started — 16 kHz, mono, i16");
+            log::info!(
+                "Mic capture (Canal A) started — {input_rate} Hz, {input_channels} ch → {} Hz, mono, i16",
+                SAMPLE_RATE
+            );
             Ok(stream)
         }
         cpal::SampleFormat::F32 => {
+            let mut resampler = if needs_resampling {
+                Some(MicResampler::new(input_rate)?)
+            } else {
+                None
+            };
             let stream = device
                 .build_input_stream::<f32, _, _>(
                     &stream_config,
                     move |data, _| {
-                        let converted: Vec<i16> = data
-                            .iter()
-                            .map(|&s| f32_to_i16(s))
-                            .collect();
-                        if wav_tx.try_send(converted.clone()).is_err() {
-                            eprintln!("[kue] Mic WAV writer channel full — dropping buffer");
-                        }
-                        if vad_tx.try_send(converted).is_err() {
-                            eprintln!("[kue] Mic VAD channel full — dropping buffer");
+                        let mono_f32: Vec<f32> = if input_channels == 1 {
+                            data.to_vec()
+                        } else {
+                            data.chunks_exact(input_channels)
+                                .map(|chunk| chunk.iter().sum::<f32>() / input_channels as f32)
+                                .collect()
+                        };
+                        if let Some(r) = &mut resampler {
+                            r.push(&mono_f32, &wav_tx, &vad_tx);
+                        } else {
+                            let samples: Vec<i16> = mono_f32
+                                .iter()
+                                .map(|&s| f32_to_i16(s))
+                                .collect();
+                            send_mic_samples(&samples, &wav_tx, &vad_tx);
                         }
                     },
-                    move |err| eprintln!("[kue] Mic capture error: {err}"),
+                    move |err| log::error!("Mic capture error: {err}"),
                     None,
                 )
                 .map_err(|e| AudioError::StreamError(format!("Failed to build mic stream: {e}")))?;
             stream
                 .play()
                 .map_err(|e| AudioError::StreamError(format!("Failed to start mic stream: {e}")))?;
-            println!("[kue] Mic capture (Canal A) started — 16 kHz, mono, f32 → i16");
+            log::info!(
+                "Mic capture (Canal A) started — {input_rate} Hz, {input_channels} ch → {} Hz, mono, f32",
+                SAMPLE_RATE
+            );
             Ok(stream)
         }
         other => Err(AudioError::StreamError(format!(
@@ -454,7 +565,7 @@ fn start_loopback_capture_tee(
     struct AudioErrorHandler;
     impl StreamErrorHandler for AudioErrorHandler {
         fn on_error(&self) {
-            eprintln!("[kue] Loopback capture stream error");
+            log::error!("Loopback capture stream error");
         }
     }
 
@@ -488,10 +599,10 @@ fn start_loopback_capture_tee(
                     })
                     .collect();
                 if self.wav_tx.try_send(samples.clone()).is_err() {
-                    eprintln!("[kue] Loopback WAV writer channel full — dropping buffer");
+                    log::error!("Loopback WAV writer channel full — dropping buffer");
                 }
                 if self.stt_tx.try_send(samples).is_err() {
-                    eprintln!("[kue] Loopback STT channel full — dropping buffer");
+                    log::error!("Loopback STT channel full — dropping buffer");
                 }
             }
         }
@@ -505,7 +616,7 @@ fn start_loopback_capture_tee(
         .start_capture()
         .map_err(|e| AudioError::StreamError(format!("Failed to start loopback capture: {e}")))?;
 
-    println!("[kue] Loopback capture (Canal B) with STT tee started — 16 kHz, mono via ScreenCaptureKit");
+    log::info!("Loopback capture (Canal B) with STT tee started — 16 kHz, mono via ScreenCaptureKit");
     Ok(stream)
 }
 
@@ -538,7 +649,7 @@ fn spawn_mic_vad_monitor(
 fn apply_retention(session_dir: &std::path::Path, recordings_dir: &std::path::Path, retain: bool) {
     if retain {
         if let Err(e) = fs::create_dir_all(recordings_dir) {
-            eprintln!("[kue] Failed to create recordings dir {dir:?}: {e}", dir = recordings_dir);
+            log::error!("Failed to create recordings dir {dir:?}: {e}", dir = recordings_dir);
         } else if let Some(name) = session_dir.file_name() {
             let target = recordings_dir.join(name);
             let _ = fs::create_dir_all(&target);
@@ -553,6 +664,20 @@ fn apply_retention(session_dir: &std::path::Path, recordings_dir: &std::path::Pa
     let _ = fs::remove_dir_all(session_dir);
 }
 
+/// Quick check: does the WAV exist and contain at least one sample?
+fn wav_has_samples(path: &std::path::Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    match hound::WavReader::open(path) {
+        Ok(reader) => reader.len() > 0,
+        Err(e) => {
+            log::warn!("Could not read WAV {:?} for sample count: {e}", path);
+            false
+        }
+    }
+}
+
 fn spawn_batch_transcription(
     session_dir: std::path::PathBuf,
     session_id: String,
@@ -563,27 +688,36 @@ fn spawn_batch_transcription(
     batch_tracker: BatchTracker,
 ) {
     let mic_wav = session_dir.join(MIC_CHANNEL_A_FILENAME);
-    if !mic_wav.exists() {
+    let loopback_wav = session_dir.join(LOOPBACK_CHANNEL_B_FILENAME);
+
+    if !mic_wav.exists() && !loopback_wav.exists() {
         apply_retention(&session_dir, &recordings_dir, retain);
         mark_batch_ready(app_handle, batch_tracker, &session_id);
         return;
     }
 
-    std::thread::Builder::new()
+    // Clone copies needed for the error fallback path (outside the closure).
+    let sid_fallback = session_id.clone();
+    let session_dir_fallback = session_dir.clone();
+    let recordings_dir_fallback = recordings_dir.clone();
+    let app_handle_fallback = app_handle.clone();
+    let batch_tracker_fallback = BatchTracker::clone(&batch_tracker);
+
+    let thread_result = std::thread::Builder::new()
         .name("kue-batch-transcribe".into())
         .spawn(move || {
-            const BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+            // Lowered from 120s: loading a local model + two short WAVs should
+            // finish well within 60s on modern hardware. This prevents the UI
+            // from being stuck forever if the worker hangs.
+            const BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-            // Run the actual STT work in a sub-thread so we can enforce a hard
-            // timeout even if model loading or transcription hangs. The worker
-            // owns the files and performs retention when it finishes, so a
-            // timeout never races with an in-progress read.
             let (tx, rx) = std::sync::mpsc::channel::<Result<usize, String>>();
             let worker_session_dir = session_dir.clone();
             let worker_id = session_id.clone();
             let worker_recordings_dir = recordings_dir.clone();
+            let worker_app_handle = app_handle.clone();
 
-            let worker = std::thread::Builder::new()
+            let worker_result = std::thread::Builder::new()
                 .name("kue-batch-transcribe-worker".into())
                 .spawn(move || {
                     let config = STTConfig::default();
@@ -593,16 +727,68 @@ fn spawn_batch_transcription(
                             return Err(format!("Batch STT model load failed: {e}"));
                         }
 
-                        crate::stt::batch::transcribe_channel_batch(
-                            &worker_session_dir.join(MIC_CHANNEL_A_FILENAME),
-                            crate::types::Speaker::User,
-                            &worker_id,
-                            &db,
-                            &*engine,
-                            &config,
-                        )
-                        .map(|lines| lines.len())
-                        .map_err(|e| format!("Batch STT transcription failed: {e}"))
+                        let mut total_lines = 0usize;
+                        let mut errors: Vec<String> = Vec::new();
+
+                        // Channel A — microphone (User speaker)
+                        let mic_path = worker_session_dir.join(MIC_CHANNEL_A_FILENAME);
+                        if mic_path.exists() {
+                            if !wav_has_samples(&mic_path) {
+                                errors.push(
+                                    "Microphone channel (mic_channel_A.wav) has no audio samples. \
+                                     Check that microphone permission is granted and the mic is not muted."
+                                        .to_string(),
+                                );
+                            } else {
+                                match crate::stt::batch::transcribe_channel_batch(
+                                    &mic_path,
+                                    crate::types::Speaker::User,
+                                    &worker_id,
+                                    &db,
+                                    &*engine,
+                                    &config,
+                                ) {
+                                    Ok(lines) => total_lines += lines.len(),
+                                    Err(e) => {
+                                        log::warn!("Batch transcription for mic channel A failed: {e}");
+                                        errors.push(format!("Microphone transcription failed: {e}"));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Channel B — system loopback (Interviewer speaker, includes TTS)
+                        let loopback_path = worker_session_dir.join(LOOPBACK_CHANNEL_B_FILENAME);
+                        if loopback_path.exists() {
+                            if !wav_has_samples(&loopback_path) {
+                                errors.push(
+                                    "System audio channel (loopback_channel_B.wav) has no audio samples. \
+                                     Check that Screen & System Audio Recording permission is granted."
+                                        .to_string(),
+                                );
+                            } else {
+                                match crate::stt::batch::transcribe_channel_batch(
+                                    &loopback_path,
+                                    crate::types::Speaker::Interviewer,
+                                    &worker_id,
+                                    &db,
+                                    &*engine,
+                                    &config,
+                                ) {
+                                    Ok(lines) => total_lines += lines.len(),
+                                    Err(e) => {
+                                        log::warn!("Batch transcription for loopback channel B failed: {e}");
+                                        errors.push(format!("System audio transcription failed: {e}"));
+                                    }
+                                }
+                            }
+                        }
+
+                        if total_lines == 0 && !errors.is_empty() {
+                            Err(errors.join("\n"))
+                        } else {
+                            Ok(total_lines)
+                        }
                     }));
 
                     let to_send = match result {
@@ -617,47 +803,91 @@ fn spawn_batch_transcription(
                         }
                     };
 
+                    if let Err(ref e) = to_send {
+                        log::error!("Batch transcription worker error for session {}: {e}", worker_id);
+                        let _ = worker_app_handle.emit("post-call-transcript-error", serde_json::json!({
+                            "session_id": &worker_id,
+                            "message": format!("Batch transcription failed: {e}"),
+                        }));
+                    }
+
                     apply_retention(&worker_session_dir, &worker_recordings_dir, retain);
                     let _ = tx.send(to_send);
-                })
-                .expect("failed to spawn batch transcription worker thread");
+                });
 
-            let outcome = rx.recv_timeout(BATCH_TIMEOUT);
-            match outcome {
-                Ok(Ok(count)) => {
-                    eprintln!(
-                        "[kue] Batch transcription complete: {} user lines for session {}",
-                        count, session_id,
-                    );
-                }
-                Ok(Err(e)) => {
-                    eprintln!("[kue] Batch transcription failed for session {}: {e}", session_id);
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    eprintln!(
-                        "[kue] Batch transcription for session {} exceeded the {}s safety timeout; releasing UI anyway.",
-                        session_id, BATCH_TIMEOUT.as_secs()
-                    );
-                    // Detach the worker; it owns the session dir and will clean
-                    // up once it finishes (or is killed with the process).
-                    let _ = worker;
-                    // Best-effort cleanup from the supervisor side in case the
-                    // worker is stuck forever; ignore errors if the worker already
-                    // removed the directory.
-                    apply_retention(&session_dir, &recordings_dir, retain);
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    eprintln!(
-                        "[kue] Batch transcription worker for session {} disconnected unexpectedly.",
+            let worker = match worker_result {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    log::error!(
+                        "Failed to spawn batch transcription worker thread for session {}: {e}",
                         session_id
                     );
+                    let _ = app_handle.emit("post-call-transcript-error", serde_json::json!({
+                        "session_id": &session_id,
+                        "message": format!("Failed to spawn batch worker thread: {e}"),
+                    }));
                     apply_retention(&session_dir, &recordings_dir, retain);
+                    None // fall through to mark_batch_ready below
+                }
+            };
+
+            if let Some(worker) = worker {
+                let outcome = rx.recv_timeout(BATCH_TIMEOUT);
+                match outcome {
+                    Ok(Ok(count)) => {
+                        log::info!(
+                            "Batch transcription complete: {} total lines for session {}",
+                            count, session_id,
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        log::error!("Batch transcription failed for session {}: {e}", session_id);
+                        let _ = app_handle.emit("post-call-transcript-error", serde_json::json!({
+                            "session_id": &session_id,
+                            "message": format!("Batch transcription failed: {e}"),
+                        }));
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        log::warn!(
+                            "Batch transcription for session {} exceeded the {}s safety timeout; releasing UI anyway.",
+                            session_id, BATCH_TIMEOUT.as_secs()
+                        );
+                        let _ = app_handle.emit("post-call-transcript-error", serde_json::json!({
+                            "session_id": &session_id,
+                            "message": format!("Batch transcription timed out after {}s", BATCH_TIMEOUT.as_secs()),
+                        }));
+                        let _ = worker;
+                        apply_retention(&session_dir, &recordings_dir, retain);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        log::error!(
+                            "Batch transcription worker for session {} disconnected unexpectedly.",
+                            session_id
+                        );
+                        let _ = app_handle.emit("post-call-transcript-error", serde_json::json!({
+                            "session_id": &session_id,
+                            "message": "Batch transcription worker disconnected unexpectedly",
+                        }));
+                        apply_retention(&session_dir, &recordings_dir, retain);
+                    }
                 }
             }
 
             mark_batch_ready(app_handle, batch_tracker, &session_id);
-        })
-        .expect("failed to spawn batch transcription thread");
+        });
+
+    if let Err(e) = thread_result {
+        log::error!(
+            "Failed to spawn batch transcription thread for session {}: {e}",
+            sid_fallback
+        );
+        let _ = app_handle_fallback.emit("post-call-transcript-error", serde_json::json!({
+            "session_id": &sid_fallback,
+            "message": format!("Failed to spawn batch thread: {e}"),
+        }));
+        apply_retention(&session_dir_fallback, &recordings_dir_fallback, retain);
+        mark_batch_ready(app_handle_fallback, batch_tracker_fallback, &sid_fallback);
+    }
 }
 
 fn mark_batch_ready(
@@ -723,7 +953,7 @@ pub fn start_session(
         .with_mode(&mode)
         .with_hint_job_tx(hint_job_tx);
     if let Err(e) = pipeline.load_model() {
-        eprintln!("[kue] STT model load failed (best-effort): {e}");
+        log::error!("STT model load failed (best-effort): {e}");
     }
     pipeline.start_session(&session_id);
 
@@ -736,10 +966,14 @@ pub fn start_session(
     inner.session_id = Some(session_id.clone());
 
     app_handle
-        .emit("session-started", serde_json::json!({"mode": mode, "session_id": session_id}))
+        .emit("session-started", serde_json::json!({"mode": mode, "session_id": &session_id}))
         .ok();
 
-    Ok(status)
+    Ok(AudioCaptureStatus {
+        mic_active: status.mic_active,
+        loopback_active: status.loopback_active,
+        session_id: Some(session_id),
+    })
 }
 
 #[tauri::command]
@@ -793,7 +1027,7 @@ pub async fn stop_session(
     let app_handle_clone = app_handle.clone();
 
     std::thread::spawn(move || {
-        audio_clone.stop();
+        let _ = audio_clone.stop();
         let session_dir = audio_clone.take_session_dir();
         if let (Some(dir), Some(sid)) = (session_dir, session_id) {
             spawn_batch_transcription(
@@ -811,16 +1045,52 @@ pub async fn stop_session(
     Ok(AudioCaptureStatus {
         mic_active: false,
         loopback_active: false,
+        session_id: None,
     })
+}
+
+#[tauri::command]
+pub fn get_log_dir_path(app_handle: tauri::AppHandle) -> Result<String, String> {
+    let app_data = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?;
+    Ok(app_data.join("logs").to_string_lossy().to_string())
 }
 
 #[tauri::command]
 pub fn is_transcript_ready(
     session_id: String,
     batch_tracker: tauri::State<'_, BatchTracker>,
+    db: tauri::State<'_, Database>,
 ) -> Result<bool, String> {
-    let tracker = batch_tracker.0.lock().map_err(|e| e.to_string())?;
-    Ok(tracker.contains(&session_id))
+    // Fast path: check in-memory tracker (set within the same process lifetime).
+    if let Ok(tracker) = batch_tracker.0.lock() {
+        if tracker.contains(&session_id) {
+            return Ok(true);
+        }
+    }
+    // Fall back to the database: a session whose `ended_at` is set was
+    // properly stopped, which means `spawn_batch_transcription` was triggered.
+    // Even if it produced 0 transcript lines (all-silence recording), the UI
+    // should not remain stuck "Processing..." forever — analysis will show a
+    // clear "No transcript lines" error instead.
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let has_ended: bool = conn
+        .query_row(
+            "SELECT ended_at IS NOT NULL FROM sessions WHERE id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if has_ended {
+        // Re-insert into in-memory tracker so subsequent calls hit the fast path.
+        if let Ok(mut tracker) = batch_tracker.0.lock() {
+            tracker.insert(session_id.clone());
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 #[tauri::command]
@@ -991,9 +1261,10 @@ mod tests {
         let status = AudioCaptureStatus {
             mic_active: false,
             loopback_active: false,
+            session_id: None,
         };
         let json = serde_json::to_string(&status).unwrap();
-        assert_eq!(json, r#"{"mic_active":false,"loopback_active":false}"#);
+        assert_eq!(json, r#"{"mic_active":false,"loopback_active":false,"session_id":null}"#);
     }
 
     #[test]
@@ -1001,9 +1272,10 @@ mod tests {
         let status = AudioCaptureStatus {
             mic_active: true,
             loopback_active: true,
+            session_id: Some("abc".into()),
         };
         let json = serde_json::to_string(&status).unwrap();
-        assert_eq!(json, r#"{"mic_active":true,"loopback_active":true}"#);
+        assert_eq!(json, r#"{"mic_active":true,"loopback_active":true,"session_id":"abc"}"#);
     }
 
     #[test]
@@ -1011,9 +1283,10 @@ mod tests {
         let status = AudioCaptureStatus {
             mic_active: true,
             loopback_active: false,
+            session_id: None,
         };
         let json = serde_json::to_string(&status).unwrap();
-        assert_eq!(json, r#"{"mic_active":true,"loopback_active":false}"#);
+        assert_eq!(json, r#"{"mic_active":true,"loopback_active":false,"session_id":null}"#);
     }
 
     #[test]
@@ -1021,9 +1294,10 @@ mod tests {
         let status = AudioCaptureStatus {
             mic_active: false,
             loopback_active: true,
+            session_id: None,
         };
         let json = serde_json::to_string(&status).unwrap();
-        assert_eq!(json, r#"{"mic_active":false,"loopback_active":true}"#);
+        assert_eq!(json, r#"{"mic_active":false,"loopback_active":true,"session_id":null}"#);
     }
 
     // -----------------------------------------------------------------------
@@ -1259,8 +1533,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel::<Vec<i16>>();
         let handle = spawn_wav_writer("fail", rx, path.clone()).unwrap();
 
-        // Send data and close — the writer should fail to create the file and exit.
-        tx.send(vec![1, 2, 3]).unwrap();
+        // The writer may exit immediately when the path is invalid, closing the
+        // receiver and causing this send to fail. That's fine — what matters is
+        // that the thread does not panic and the file is not created.
+        let _ = tx.send(vec![1, 2, 3]);
         drop(tx);
 
         // Thread should not panic; it should print an error and return.
