@@ -1,6 +1,6 @@
 # Kue — Technical Design
 
-> Current status: **Sprint 0–6 completed** (base infrastructure + dual audio capture + STT + RAG engine + classifier + orchestrator + overlay window + hint display + mic VAD gating + Panic button + mode selection UI + post-call BYOK analysis + Moonshine auto-provisioning). All v1 features implemented and tested. This document describes the living architecture of the project.
+> Current status: **All v1 features implemented and tested** (base infrastructure + dual audio capture + STT + RAG engine + classifier + orchestrator + overlay window + hint display + mic VAD gating + Panic button + mode selection UI + post-call BYOK analysis + Moonshine auto-provisioning + AI Interview with TTS + i18n system). This document describes the living architecture of the project.
 
 ---
 
@@ -9,42 +9,56 @@
 ```mermaid
 graph TD
     subgraph "Frontend (React + TypeScript)"
-        A[MainApp<br/>session control UI<br/>mode selector + panic button]
+        A[MainApp<br/>session control UI<br/>mode selector + panic + reindex<br/>transcript bubbles + hint log]
         OV[Overlay<br/>hint display component<br/>3s auto-dismiss<br/>auto-show/hide on session events]
+        HD[Header<br/>logo + i18n language switcher]
+        LI[LiveInterview<br/>AI Interview question display<br/>progress bar + skip/stop]
+        PG[PlanGenerator<br/>job description input<br/>→ generate question plan]
+        PP[PostCallPanel<br/>transcript viewer +<br/>BYOK analyze button]
+        SL[SessionList<br/>session history sidebar]
     end
 
-    subgraph "Tauri Bridge (IPC)"
-        B1[tauri::command<br/>get_db_status]
-        B2[tauri::command<br/>start_session]
-        B2B[tauri::command<br/>stop_session]
-        B2C[tauri::command<br/>panic_mode]
-        B3[tauri::command<br/>index_folder_cmd]
-        B4[tauri::command<br/>search_context]
-        B5[tauri::command<br/>overlay::show_overlay]
-        B6[tauri::command<br/>db::get_sessions]
-        B7[tauri::command<br/>db::get_session_transcript]
-        B8[tauri::command<br/>audio::capture::is_transcript_ready]
-        B9[tauri::command<br/>keys::save_key]
-        B10[tauri::command<br/>keys::has_key]
-        B11[tauri::command<br/>analyze::analyze_session]
-        B12[tauri::command<br/>db::get_setting]
-        B13[tauri::command<br/>db::set_setting]
+    subgraph "Tauri Bridge (IPC — 23 commands)"
+        B1[get_db_status]
+        B2[start_session / stop_session / panic_mode]
+        B3[index_folder_cmd / search_context]
+        B4[classify_text / show_overlay]
+        B5[is_transcript_ready / get_log_dir_path]
+        B6[get_sessions / get_session_transcript]
+        B7[save_key / has_key]
+        B8[get_setting / set_setting]
+        B9[analyze_session]
+        B10[is_moonshine_provisioned / retry_moonshine_download]
+        B11[is_first_run / mark_onboarding_done]
+        B12[check_screen_recording_permission / is_embedding_model_loaded]
+        B13[generate_interview_plan]
+        B14[start_ai_interview / skip_ai_question / stop_ai_interview]
     end
 
     subgraph "Rust Backend (lib.rs)"
         C[db::init_db]
         D[db::register_vec_extension]
-        E[setup handler<br/>DB + AudioCapture + Model + overlay config + PanicState]
+        E[setup handler<br/>DB + AudioCapture + Model + overlay +<br/>PanicState + BatchTracker + InterviewRunner]
         F[audio::capture<br/>AudioCapture]
         EM[rag::embeddings<br/>EmbeddingModel (Mutex)]
         CL[cleanup_orphaned_temp_dirs]
         PS[orchestrator::PanicState<br/>10s hint silence]
         BT[BatchTracker<br/>tracks completed batch<br/>transcriptions per session]
+        IR[Mutex&lt;InterviewRunner&gt;<br/>AI Interview state]
     end
 
-    subgraph "Post-call Analysis (implemented)"
-        AN[analyze::analyze_session<br/>sends transcript + RAG context<br/>to user-configured LLM]
-        KEYS[keys::save_key<br/>keys::has_key<br/>keyring (OS Keychain)]
+    subgraph "Post-call + Interview Analysis"
+        AN[analyze::analyze_session<br/>transcript + RAG → LLM]
+        KEYS[keys::save_key / has_key<br/>keyring (OS Keychain)]
+        PL[interview_plan::generate_interview_plan<br/>job description → question plan]
+    end
+
+    subgraph "AI Interview"
+        RU[interview_runner::start_ai_interview<br/>orchestrates question flow]
+        TTS[tts::speak<br/>macOS say command<br/>Samantha voice]
+        EVQ[interview-question event]
+        EVS[interview-status event]
+        EVF[interview-finished event]
     end
 
     subgraph "Database Layer (db/mod.rs)"
@@ -66,6 +80,7 @@ graph TD
 
     subgraph "Shared Types"
         TT[types::TranscriptLine<br/>types::Speaker]
+        LL[llm::OpenAIResponse / AnthropicResponse<br/>GeminiResponse<br/>shared response types]
     end
 
     subgraph "Overlay Window"
@@ -73,8 +88,8 @@ graph TD
     end
 
     subgraph "RAG Engine (implemented)"
-        S[rag::embeddings<br/>snowflake-arctic-embed-s + Metal]
-        T[rag::indexer<br/>ingest / search / chunk / folder]
+        S[rag::embeddings<br/>snowflake-arctic-embed-s<br/>CPU+Accelerate]
+        T[rag::indexer<br/>ingest / search / chunk / folder<br/>PDF extraction (pdf-extract)]
     end
 
     subgraph "STT Module (implemented, lifecycle-integrated)"
@@ -105,6 +120,10 @@ graph TD
         EV5[session-started]
         EV6[session-stopped]
         EV7[post-call-transcript-ready]
+        EV8[post-call-transcript-error]
+        EV9[interview-question]
+        EV10[interview-status]
+        EV11[interview-finished]
     end
 
     A -->|invoke| B1
@@ -182,11 +201,39 @@ graph TD
     S --> T
     T --> G
 
+    A -->|invoke| B13
+    A -->|invoke| B14
+    B13 --> PL
+    B14 --> RU
+    RU -->|tick questions| TTS
+    RU -->|emit| EVQ
+    RU -->|emit| EVS
+    RU -->|emit| EVF
+    LI -->|listens| EVQ
+    LI -->|listens| EVS
+    LI -->|listens| EVF
+    HD -->|language change| A
+    PG -->|calls generate| B13
+    EV9 --> LI
+    EV9 --> RU
+    EV10 --> LI
+    EV10 --> RU
+    EV11 --> LI
+    EV11 --> RU
+
     style A fill:#e1f5fe,stroke:#0288d1
     style OV fill:#fff3e0,stroke:#f57c00
+    style LI fill:#f3e5f5,stroke:#7b1fa2
+    style PG fill:#f3e5f5,stroke:#7b1fa2
 ```
 
-**Legend:** Solid line = implemented. The STT pipeline integrates classification (VAD → STT → classify → events → DB). When a question is detected, the pipeline pushes a `HintJob` to the orchestrator worker thread via an mpsc channel. The worker queries RAG, builds a hint, and either emits it immediately (Practice) or schedules it via `HintScheduler` (Shadow, 2.5s delay). Expired hints are drained every 500ms in the worker's poll loop. In Shadow mode, before emitting each expired hint, the worker checks `MicVadState` (Channel A VAD) — if the user started speaking since the hint was scheduled, the hint is silently cancelled. `PanicState` (registered in Tauri state) can silence all hints for 10s; the worker checks `hint_silenced_by_panic()` before processing any hint job or emitting expired hints. At session end, Channel A (mic) audio is sent to a batch transcription thread (`kue-batch-transcribe`) via `spawn_batch_transcription()` which runs offline VAD+STT and persists user responses with `speaker='user'`. The `BatchTracker` tracks which sessions have completed batch transcription; the `is_transcript_ready` command and `post-call-transcript-ready` event communicate status to the frontend. Once batch transcription completes, the post-call analysis module (`analyze.rs`) can send the full transcript + RAG context to a user-configured LLM (Anthropic/OpenAI/Gemini/OpenRouter/Ollama) via the `analyze_session` command. API keys are stored in the OS keychain via `keys.rs` (`keyring` crate), never in the `settings` table. The `Overlay` React component listens for `new-hint` Tauri events, auto-shows in Shadow mode on `session-started`, auto-hides on `session-stopped`, and shows a panic indicator on `panic-mode`. The `MainApp` component is a full session control UI with mode selector, start/stop buttons, panic button, session history, and a post-call analysis panel with provider selection and result display.
+**Legend:** Solid line = implemented. The STT pipeline integrates classification (VAD → STT → classify → events → DB). When a question is detected, the pipeline pushes a `HintJob` to the orchestrator worker thread via an mpsc channel. The worker queries RAG, builds a hint, and either emits it immediately (Practice) or schedules it via `HintScheduler` (Shadow, 2.5s delay). Expired hints are drained every 500ms in the worker's poll loop. In Shadow mode, before emitting each expired hint, the worker checks `MicVadState` (Channel A VAD) — if the user started speaking since the hint was scheduled, the hint is silently cancelled. `PanicState` silences all hints for 10s. At session end, Channel A is batch-transcribed in a dedicated thread (`kue-batch-transcribe`) and persisted with `speaker='user'`. The `is_transcript_ready` command and `post-call-transcript-ready`/`post-call-transcript-error` events communicate status.
+
+**AI Interview (Practice mode):** The `PlanGenerator` component takes a job description and calls `generate_interview_plan` (BYOK LLM) → returns a structured question plan. When the user starts the session, `start_ai_interview` launches the `InterviewRunner` (registered as Tauri state), which iterates through planned questions: (1) emits `interview-question` event → frontend `LiveInterview` renders it with progress bar + skip/stop controls, (2) calls `tts::speak()` via macOS `say` (Samantha voice), (3) emits `interview-status: "speaking"` / `"listening"` / `"finished"`, (4) on next question, loops. Commands: `skip_ai_question` / `stop_ai_interview`.
+
+**i18n:** `src/i18n.ts` holds 270+ bilingual EN/ES translation keys. `useLanguage()` hook via `useSyncExternalStore`. Language switcher in `Header.tsx`. Persisted via localStorage + backend `settings.language`. `t()` supports `{{count}}` interpolation.
+
+**New frontend files:** `Header.tsx`, `i18n.ts`, `Icon.tsx` (30 icons), `ui.tsx` (primitives), `hooks.ts` (custom hooks), `validation.ts` (helpers), `ApiKeyInput.tsx`, `types.ts`.
 
 ---
 
@@ -195,33 +242,40 @@ graph TD
 ### 2.1 Frontend (`src/`)
 
 - **`main.tsx`** — Entry point React 18, mounts `<App />` on `#root`.
-- **`App.tsx`** — App router that detects the window label via `getCurrentWebviewWindow()`. If the label is `"overlay"`, renders the `<Overlay />` component; if Moonshine is not yet provisioned, renders `<ProvisioningProgress />` (download progress UI); if first run (`is_first_run` returns `true`), renders `<Onboarding />` (wizard for screen permission, model loading, folder indexing); otherwise renders `<MainApp />` (session control UI).
+- **`i18n.ts`** — i18n system with 270+ bilingual EN/ES translation keys. Provides `t()` template function (with `{{var}}` interpolation), `useLanguage()` hook (via `useSyncExternalStore`), `setLanguage()` / `getLanguage()`, `initLanguage()` (sync restore from localStorage), `loadLanguageFromBackend()` (async from `settings` table), `saveLanguage()`, `speakerLabel()`, `formatLines()`, `Language` type.
+- **`Header.tsx`** — Sticky header with Kue logo (SVG) and language switcher (ES/EN toggle pills, role="group", aria-pressed). Uses `useLanguage()` hook and calls `onLanguageChange` callback.
+- **`Icon.tsx`** — 30 inline SVG icons (24×24 grid, aria-hidden). Exports `Icon` component + `IconName` type union for type-safe usage.
+- **`ui.tsx`** — Shared UI primitives: `Spinner` (animated ring), `SectionLabel` (uppercase label with accent bar), `Equalizer` (animated live bars), `StyledSelect` (accessible listbox with arrow-key navigation, value persistence).
+- **`hooks.ts`** — `usePersistedSetting(key, default)` reads from backend `get_setting` on mount, writes to `set_setting` on value change. `useTauriEvent(event, handler)` auto-cleanup listener wrapper.
+- **`types.ts`** — `IndexSummary` interface (`folder`, `files_indexed`, `chunks_created`, `error_count`).
+- **`validation.ts`** — `sanitizeError()` maps known error prefixes to i18n-friendly messages, truncates at 300 chars. `isValidFolderPath()` checks empty, `..`, invalid chars, absolute path. `formatIndexResult()` formats the `index_folder_cmd` result.
+- **`ApiKeyInput.tsx`** — Per-provider API key input component. Checks `has_key` on mount, provides a text input + save button for the selected provider.
+- **`App.tsx`** (1453 lines) — App router that detects the window label via `getCurrentWebviewWindow()`. If `"overlay"`, renders `<Overlay />`; if Moonshine not provisioned, renders `<ProvisioningProgress />`; if first run, renders `<Onboarding />`; otherwise renders `<MainApp />`. Also initialises i18n (`initLanguage()`, `loadLanguageFromBackend()`).
+- **`ProvisioningProgress.tsx`** — First-launch download progress UI. On mount, checks `is_moonshine_provisioned`; if not provisioned, shows a progress bar, stage label, file counter, error display, and retry button. Listens for `moonshine-download-progress`, `moonshine-provision-error`, and `moonshine-provisioned` events. Calls `onProvisioned` callback on completion.
+- **`Onboarding.tsx`** — 4-step first-run wizard: (1) screen recording permission, (2) embedding model loading, (3) API key config, (4) folder indexing. On completion, `mark_onboarding_done` sets `settings.first_run = 'done'`.
+- **`Overlay.tsx`** — Hint display component for the overlay window. Listens for `new-hint` (3s auto-dismiss), `session-started`/`session-stopped` (auto-show/hide), `panic-mode` (mute indicator).
 - **`MainApp`** (inside `App.tsx`) — Full session control UI with:
-  - Mode selector (Practice/Shadow toggle)
-  - Company/Role input fields (`company` and `role` optional strings, persisted in `sessions` table via `start_session` command)
-  - Start/Stop session buttons connected via `invoke("start_session")` / `invoke("stop_session")`
-  - Panic button connected via `invoke("panic_mode")`, displays a 10s mute indicator
-  - Transcript and hint log display
+  - Mode selector (Practice/Shadow toggle with icon + description cards)
+  - Company/Role input fields (optional, persisted in `sessions` table)
+  - Start/Stop session buttons with loading states
+  - Panic button (10s mute with countdown display)
+  - AI Interview `PlanGenerator` (Practice mode only): job description textarea, duration selector, provider/model picker, generate button, question list display
+  - `LiveInterview` component (visible during AI Interview sessions): question index/total progress bar, question text, status indicator (speaking/listening/finished), skip/end buttons
+  - Chat-bubble transcript display (speaker labels, timestamps, auto-scroll)
+  - Hint section with panic-state styling
+  - `ReindexPanel` modal for on-demand folder re-indexing
   - Session history list with selection
-  - `PostCallPanel` for post-call BYOK analysis (provider/model selection, API key input, analyze button, result display with summary/weak_questions/forgotten_projects/star_improvements)
-  - Listens for `new-transcript`, `new-hint`, `panic-mode`, and `post-call-transcript-ready` events
-- **`ProvisioningProgress.tsx`** — First-launch download progress UI. On mount, checks `is_moonshine_provisioned`; if not provisioned, shows a progress bar, stage label, file counter, error display, and retry button. Listens for `moonshine-download-progress`, `moonshine-provision-error`, and `moonshine-provisioned` events. Calls `onProvisioned` callback when download completes, which transitions `App.tsx` from provisioning view to `MainApp`.
-- **`Overlay.tsx`** — Hint display component rendered inside the overlay window. Listens for:
-  - `new-hint` — shows hint with 3s auto-dismiss via `setTimeout`
-  - `session-started` — auto-shows overlay window in Shadow mode
-  - `session-stopped` — auto-hides overlay window and clears state
-  - `panic-mode` — shows a panic indicator (🔇) for the duration
-  - Hint text displayed in a semi-transparent backdrop-blur container
-- **`index.css`** — Tailwind directives (`@tailwind base/components/utilities`).
-- **`__tests__/setup.ts`** — Vitest setup file that mocks `@tauri-apps/api/core` (invoke), `@tauri-apps/api/event` (listen), and `@tauri-apps/api/webviewWindow` (getCurrentWebviewWindow). All frontend tests import this setup.
-- **`__tests__/Onboarding.test.tsx`** — Tests for Onboarding wizard: step transitions, screen permission polling, folder validation, skip flow, error sanitization.
-- **`__tests__/PostCallPanel.test.tsx`** — Tests for PostCallPanel gating: transcript readiness toggles button state, event filtering by session ID.
-- **`__tests__/ProvisioningProgress.test.tsx`** — Tests for ProvisioningProgress state machine: mount behavior, progress events, error/retry, done event, cleanup after unmount, percent edge cases.
-- **`vitest.config.ts`** — Vitest configuration with React plugin, jsdom environment, globals enabled, and setup file reference.
+  - `PostCallPanel` for BYOK analysis: transcript viewer, provider/model selection, API key input, analyze button, result display (summary/weak_questions/forgotten_projects/star_improvements)
+  - Listens for `new-transcript`, `new-hint`, `panic-mode`, `post-call-transcript-ready`, `post-call-transcript-error`, `interview-question`, `interview-status`, `interview-finished` events
+- **`index.css`** — Tailwind directives + custom keyframes (fade-up, scale-in, eq-bar, pulse-dot).
+- **`__tests__/setup.ts`** — Vitest setup that mocks `@tauri-apps/api/core` (invoke), `@tauri-apps/api/event` (listen), `@tauri-apps/api/webviewWindow` (getCurrentWebviewWindow).
+- **`__tests__/Onboarding.test.tsx`** — Onboarding wizard tests.
+- **`__tests__/PostCallPanel.test.tsx`** — PostCallPanel gating tests.
+- **`__tests__/ProvisioningProgress.test.tsx`** — Provisioning state machine tests.
 
 ### 2.2 Tauri Shell (`lib.rs`)
 
-File `src-tauri/src/lib.rs` (128 lines):
+File `src-tauri/src/lib.rs` (147 lines):
 
 ```rust
 use std::collections::HashSet;
@@ -233,13 +287,17 @@ mod analyze;         // Post-call BYOK analysis (Sprint 5)
 mod audio;
 mod classifier;
 mod db;
+mod interview_plan;  // AI question plan generation (Sprint 7)
+mod interview_runner;// AI Interview orchestrator (Sprint 7)
 mod keys;            // Keychain API key storage
+mod llm;             // Shared LLM response types (OpenAI, Anthropic, Gemini, etc.)
 mod logging;         // File logger (rotates logs, keeps last 5 files)
-mod onboarding;      // First-run wizard (screen permission, model load, folder index)
+mod onboarding;      // First-run wizard (screen permission, model load, API key, folder index)
 mod orchestrator;    // Hint engine + PanicState — wired into lifecycle
 mod overlay;         // Overlay window show/hide command
 mod rag;
 mod stt;             // STT module (Moonshine) — includes provisioning (Sprint 6)
+mod tts;             // TTS via macOS `say` (Sprint 7)
 mod types;
 
 /// Shared state tracking which sessions have completed Channel A batch
@@ -307,6 +365,15 @@ pub fn run() {
             let batch_tracker = BatchTracker(Arc::new(Mutex::new(HashSet::new())));
             app.manage(batch_tracker);
 
+            // Register interview runner state (AI Interview)
+            let interview_runner = std::sync::Mutex::new(
+                interview_runner::InterviewRunner::new(
+                    app.handle().clone(),
+                    db_clone,
+                ),
+            );
+            app.manage(interview_runner);
+
             // Prepend the managed moonshine lib dir to DYLD_LIBRARY_PATH so
             // that @rpath/libonnxruntime.*.dylib is found alongside
             // libmoonshine.dylib when loaded by the FFI engine. Safe here:
@@ -334,6 +401,7 @@ pub fn run() {
             audio::capture::stop_session,
             audio::capture::panic_mode,
             audio::capture::is_transcript_ready,
+            audio::capture::get_log_dir_path,          // <-- new: opens log folder
             rag::indexer::index_folder_cmd,
             rag::indexer::search_context,
             classifier::classify_text,
@@ -347,13 +415,17 @@ pub fn run() {
             onboarding::mark_onboarding_done,
             onboarding::check_screen_recording_permission,
             onboarding::is_embedding_model_loaded,
+            interview_plan::generate_interview_plan,   // <-- new: AI Interview
+            interview_runner::start_ai_interview,       // <-- new
+            interview_runner::skip_ai_question,         // <-- new
+            interview_runner::stop_ai_interview,        // <-- new
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 ```
 
-- **`mod analyze`**, **`mod audio`**, **`mod classifier`**, **`mod db`**, **`mod keys`**, **`mod logging`**, **`mod onboarding`**, **`mod orchestrator`**, **`mod overlay`**, **`mod rag`**, **`mod stt`**, **`mod types`** — Backend submodules. `stt` includes `provisioning` (Sprint 6) for first-launch Moonshine auto-download. `logging` implements file-based logging with rotation (keeps last 5 log files). `onboarding` implements the first-run wizard: screen recording permission check, embedding model loading, and folder indexing.
+- **`mod analyze`**, **`mod audio`**, **`mod classifier`**, **`mod db`**, **`mod interview_plan`**, **`mod interview_runner`**, **`mod keys`**, **`mod llm`**, **`mod logging`**, **`mod onboarding`**, **`mod orchestrator`**, **`mod overlay`**, **`mod rag`**, **`mod stt`**, **`mod tts`**, **`mod types`** — Backend submodules. `stt` includes `provisioning` (Sprint 6) for first-launch Moonshine auto-download. `logging` implements file-based logging with rotation (keeps last 5 log files). `onboarding` implements the first-run wizard: screen recording permission check, embedding model loading, API key configuration, and folder indexing. `llm` provides shared LLM response structs (OpenAI, Anthropic, Gemini, etc.). `tts` wraps macOS `say` for text-to-speech. `interview_plan` generates question plans from job descriptions via BYOK LLM. `interview_runner` orchestrates the AI Interview flow with TTS and event emission.
 - **`cleanup_orphaned_temp_dirs()`** — Removes temporary `kue-session-*` directories left by crashed sessions.
 - **`plugin(tauri_plugin_shell)`** — Standard Tauri v2 plugin for shell operations (not used for BYOK — that uses `reqwest`).
 - **`plugin(tauri_plugin_updater)`** — Tauri v2 auto-updater plugin (configured in `tauri.conf.json` under `plugins.updater`, endpoints configured at build time).
@@ -370,10 +442,13 @@ pub fn run() {
 - **`get_sessions`**, **`get_session_transcript`** — Tauri commands in `db/mod.rs` for retrieving session history and full transcripts from the frontend (used by the post-call panel).
 - **`get_setting`**, **`set_setting`** — Generic key-value read/write in the `settings` table (`db/mod.rs`). Used by `onboarding.rs` for the `first_run` flag and available to the frontend for persistent user preferences (e.g., language, retain_audio).
 - **`is_transcript_ready`** — Tauri command in `audio/capture.rs` that checks `BatchTracker` to see if Channel A batch transcription has completed for a given session.
+- **`get_log_dir_path`** — Tauri command in `audio/capture.rs` that returns the path to the log directory so the frontend can open it via the shell plugin.
 - **`save_key`**, **`has_key`** — Tauri commands in `keys.rs` for storing/checking API keys in the OS keychain via the `keyring` crate.
 - **`is_moonshine_provisioned`**, **`retry_moonshine_download`** — Tauri commands in `stt/provisioning.rs` for checking Moonshine provisioning status and retrying failed downloads.
 - **`is_first_run`**, **`mark_onboarding_done`**, **`check_screen_recording_permission`**, **`is_embedding_model_loaded`** — Tauri commands in `onboarding.rs` that drive the first-run wizard (screen recording permission check via `SCShareableContent::try_current()`, embedding model readiness polling, and onboarding completion flag in `settings.first_run`).
-- **`analyze_session`** — Tauri command in `analyze.rs` that sends the full session transcript + RAG context to a user-configured LLM (Anthropic/OpenAI/Gemini/OpenRouter/Ollama) and returns a structured analysis (summary, weak questions, forgotten projects, STAR improvements).
+- **`analyze_session`** — Tauri command in `analyze.rs` that sends the full session transcript + RAG context to a user-configured LLM (Anthropic/OpenAI/Gemini/OpenRouter/DeepSeek/Ollama) and returns a structured analysis (summary, weak questions, forgotten projects, STAR improvements).
+- **`generate_interview_plan`** — Tauri command in `interview_plan.rs` that takes a job description + duration + provider + optional model and returns a structured `InterviewPlan` (list of `PlannedQuestion`s with text, type, and time budget) generated via the user-configured BYOK LLM.
+- **`start_ai_interview`**, **`skip_ai_question`**, **`stop_ai_interview`** — Tauri commands in `interview_runner.rs` that control the AI Interview flow. `start_ai_interview` receives a session_id + job description + question plan JSON and launches the `InterviewRunner` thread, which iterates through questions, emits `interview-question`/`interview-status` events, and calls `tts::speak()` for each question. `skip_ai_question` advances to the next question. `stop_ai_interview` terminates the interview early.
 - **STT integration:** The STT pipeline is fully integrated into `start_session`. The command creates a DB session, spawns an `STTPipeline` thread that consumes audio from the loopback channel, performs VAD → STT → classify → events → persistence → hint job dispatch. The `new-transcript` and `question-detected` events are emitted to the frontend; question-detected lines also push a `HintJob` to the orchestrator worker.
 
 ### 2.3 Database Module (`db/mod.rs`)
@@ -596,7 +671,15 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 | Mic VAD (Shadow gating)       | **Implemented** | —                                                                                     | `audio/mic_vad.rs`                   |
 | Panic button + PanicState    | **Implemented** (~10s mute via `panic_mode` command + `panic-mode` event) | `PanicState` in Tauri state                                | `orchestrator/mod.rs`, `audio/capture.rs`, `App.tsx`, `Overlay.tsx` |
 | Mode selection UI             | **Implemented** (Practice/Shadow toggle in `App.tsx`) | —                                                                                     | `App.tsx`                           |
-| Post-call BYOK          | **Implemented** (Sprint 5 — `analyze_session` command, `keys.rs` keychain storage, `analyze.rs` prompt builder + LLM API calls for Anthropic/OpenAI/Gemini/OpenRouter/Ollama) | `tauri-plugin-shell` present + `keyring` (keychain), `reqwest` (HTTP), `serde_json` (response parsing) | `analyze.rs`, `keys.rs`, `App.tsx` (PostCallPanel) |
+| Post-call BYOK          | **Implemented** (Sprint 5 — `analyze_session` command, `keys.rs` keychain storage, `analyze.rs` prompt builder + LLM API calls for Anthropic/OpenAI/Gemini/OpenRouter/DeepSeek/Ollama) | `tauri-plugin-shell` present + `keyring` (keychain), `reqwest` (HTTP), `serde_json` (response parsing) | `analyze.rs`, `keys.rs`, `App.tsx` (PostCallPanel) |
+| LLM response types      | **Implemented** — shared response structs for OpenAI/Anthropic/Gemini API responses, extracted from `analyze.rs` for reuse | `serde`, `serde_json` | `llm/mod.rs` |
+| TTS (macOS say) | **Implemented** (Sprint 7 — text-to-speech via macOS `say` command, Samantha voice, 30s timeout, `is_available()` check) | — | `tts/mod.rs` |
+| AI Interview plan gen | **Implemented** (Sprint 7 — `generate_interview_plan` command, job description + duration → structured question plan via BYOK LLM with RAG context) | `serde`, `serde_json` | `interview_plan.rs` |
+| AI Interview runner | **Implemented** (Sprint 7 — `InterviewRunner` thread + Tauri state, emits `interview-question`/`interview-status`/`interview-finished` events, TTS integration, skip/stop commands) | `tokio` (time) | `interview_runner.rs` |
+| i18n system | **Implemented** (Sprint 7 — `i18n.ts` with 270+ bilingual EN/ES keys, `useLanguage()` hook, `t()` template function, localStorage + backend persistence) | — | `src/i18n.ts` |
+| Frontend components | **Implemented** (Sprint 7 — `Header.tsx` with language switcher, `Icon.tsx` 30 SVG icons, `ui.tsx` primitives, `hooks.ts`, `validation.ts`, `ApiKeyInput.tsx`, `ReindexPanel` modal) | `@tauri-apps/api` | `src/Header.tsx`, `src/Icon.tsx`, `src/ui.tsx`, `src/hooks.ts`, `src/validation.ts`, `src/ApiKeyInput.tsx` |
+| Recursive indexing + PDF | **Implemented** (Sprint 7 — `index_folder_cmd` recursively walks subdirectories, PDF text extraction via `pdf-extract` crate) | `pdf-extract` | `rag/indexer.rs` |
+| Log viewing | **Implemented** (Sprint 7 — `get_log_dir_path` command returns log directory path for opening via Tauri shell) | — | `audio/capture.rs` |
 
 ---
 
@@ -636,6 +719,11 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 - **Keychain storage pattern (keys.rs):** API keys are never stored in the `settings` SQLite table. Instead, the `keyring` crate stores them in the OS native keychain (macOS Keychain), identified by the service name `"kue"` and the provider name as the user identifier. The `save_key` and `has_key` Tauri commands expose this to the frontend. The `key_never_in_settings_table` test explicitly verifies that no kue-related file on disk contains the key value.
 
 - **Batch transcription completion tracking (BatchTracker):** A `HashSet<String>` of session IDs wrapped in `Arc<Mutex<...>>` is registered as Tauri state (`BatchTracker`). When the `kue-batch-transcribe` thread finishes processing Channel A, it writes the session ID to this set. The `is_transcript_ready` Tauri command checks the set, and a `post-call-transcript-ready` event is emitted to notify the frontend. This decouples the batch thread completion from the `stop_session` command — the command returns immediately, and the frontend polls or listens for the completion event.
+- **TTS subsystem pattern (tts/mod.rs):** A thin wrapper around the macOS `say` binary. No TTS library dependency — just `std::process::Command` with a 30-second timeout. The `is_available()` helper checks whether `say` is on the PATH (always true on macOS). This keeps the binary small and avoids native TTS library complexity.
+- **Interview plan generation (interview_plan.rs):** Given a job description + duration, uses the same BYOK LLM infrastructure (`reqwest` + provider-specific headers) as `analyze.rs`. Builds a RAG context from the user's documents, constructs a Spanish-language prompt demanding structured JSON (`text`, `qtype`, `budget_seconds`), parses the response into `InterviewPlan`. Separate from `analyze.rs` because the prompt schema, RAG query strategy, and response format differ from post-call analysis.
+- **Interview runner thread (interview_runner.rs):** A state machine with a receiver for `InterviewCommand` messages. When `start_ai_interview` is invoked, the runner loops through each planned question: (1) emits `interview-question` event, (2) calls `tts::speak()` for the question text, (3) sets status to `"listening"` and waits for the next `InterviewCommand::NextQuestion` or timeout, (4) loops. The `skip_ai_question` command sends `NextQuestion`; `stop_ai_interview` sends `Stop`. The runner emits `interview-finished` when all questions are exhausted or the interview is stopped early.
+- **i18n hook pattern (useLanguage):** Uses React 18's `useSyncExternalStore` to subscribe to language changes without a context provider. The `t()` function is a plain synchronous lookup — no top-level `<Provider>` wrapper needed. Language is restored synchronously from localStorage before the first render (`initLanguage()`), then asynchronously from the backend settings table (`loadLanguageFromBackend()`). This avoids a flash of the wrong language on cold start.
+- **Vendored dependency (screencapturekit-rs):** The `screencapturekit-rs` crate is vendored under `src-tauri/vendor/` to avoid upstream maintenance churn. The crate is patched to fix macOS 14+ segfaults and exposes the audio capture API used by `audio/capture.rs`.
 
 ---
 
@@ -668,3 +756,6 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 | `log`                  | Logging facade for file logger                    | 0.4     |
 | `chrono`               | Timestamp formatting for log files                | 0.4     |
 | `tauri-plugin-updater` | Tauri v2 auto-updater plugin                      | 2       |
+| `rubato`               | Audio resampling (mic sample rate conversion)     | 0.15    |
+| `pdf-extract`           | PDF text extraction for RAG indexing              | 0.12    |
+| `tokio`                 | Async runtime (used only for `tokio::time` in interview_runner) | 1       |

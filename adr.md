@@ -329,3 +329,110 @@ Sprint 6 needed to eliminate this friction while ensuring:
 - **Manual download** (the pre-Sprint 6 approach — rejected because it created unacceptable onboarding friction).
 - **Single monolithic download** instead of per-file (rejected — per-file allows resumption/retry of individual files and avoids re-downloading 429 MB on a single hash failure).
 - **Use `reqwest` async instead of blocking** (rejected — would require introducing a Tokio runtime just for provisioning; the blocking thread is simpler and the download is not latency-critical).
+
+---
+
+### ADR-018: AI Interview — macOS `say` TTS + BYOK question plan generation
+
+**Date:** 2026-07-28
+
+**Status:** Accepted
+
+**Context:** Practice mode was extended with an AI-powered mock interview feature. The requirements were:
+- The interviewer must read questions aloud — the user should hear the question, not just read it on screen, simulating a real interview.
+- Questions must be tailored to the user's job description and documents, so they exercise relevant skills.
+- The user should be able to skip questions or end the interview early.
+- The flow must not depend on cloud services for TTS — it must work fully offline.
+
+Two separate sub-decisions:
+
+**Sub-decision A — TTS engine:**
+The app needed a text-to-speech engine that is:
+- Zero additional installation (bundled with macOS)
+- Fast (<1s startup)
+- Works without network
+
+**Sub-decision B — Question plan generation:**
+The plan must be:
+- Generated from the user's job description (paste the JD → get relevant questions)
+- Context-aware (uses the user's own documents/RAG to tailor questions)
+- Structured (question text, type classification, time budget)
+- Generated via the same BYOK LLM provider infrastructure already used for post-call analysis (reuse existing `reqwest` + provider adapters)
+
+**Decision:**
+
+1. **TTS via macOS `say` command** (`tts/mod.rs`): Uses `std::process::Command::new("say")` with the Samantha voice (a high-quality American English female voice available on all macOS versions). The subprocess runs with a 30-second timeout via a monitor thread and `mpsc::recv_timeout`. The `is_available()` check verifies `say` is on PATH (guaranteed on macOS).
+
+2. **Question plan generation via BYOK LLM** (`interview_plan.rs`): A new `generate_interview_plan` Tauri command that:
+   - Takes a `job_description` string, `duration_minutes`, `provider`, and optional `model`
+   - Queries RAG for relevant documents (`search()` with top_k=5) and injects them as context
+   - Builds a Spanish-language prompt requesting a JSON array of `{text, qtype, budget_seconds}`
+   - Calls the same provider-specific HTTP adapters as `analyze.rs` (OpenAI/Anthropic/Gemini/OpenRouter/DeepSeek/Ollama)
+   - Returns a structured `InterviewPlan` with ordered questions
+
+3. **Interview orchestration** (`interview_runner.rs`):
+   - A state machine registered as Tauri state (`Mutex<InterviewRunner>`) that holds a command receiver
+   - On `start_ai_interview`, the runner enters a thread loop that iterates planned questions
+   - For each question: emit `interview-question` event → call `tts::speak()` → emit `interview-status: "listening"` → wait for next command (skip or timeout)
+   - The `skip_ai_question` command advances to the next question; `stop_ai_interview` terminates the loop and emits `interview-finished`
+
+**Consequences:**
+- *(Positive)* Zero TTS dependency — `say` is built into macOS since System 7.
+- *(Positive)* The question plan uses the same BYOK infrastructure as post-call analysis, so the user's existing API key works for both features.
+- *(Positive)* The runner thread is fully controlled by the frontend via Tauri commands — no polling needed.
+- *(Positive)* The frontend `LiveInterview` component renders a clean UI with progress, status indicator, and skip/stop buttons.
+- *(Negative)* macOS `say` Samantha voice sounds noticeably synthetic — not appropriate for production-quality mock interviews. Could be migrated to Piper or Kokoro TTS in a future sprint.
+- *(Negative)* Question plan quality depends entirely on the BYOK LLM chosen. Providers that return unstructured text (not valid JSON) will fail to parse.
+- *(Negative)* The runner thread uses `tokio::time::timeout` (the only Tokio dependency in the project) — minimal, but adds ~50ms to compile time.
+
+**Alternatives considered:**
+- **Piper TTS** (local, high-quality, but requires bundling a ~50MB model and a Rust FFI or sidecar).
+- **ElevenLabs / cloud TTS** (superior voice quality, but breaks the offline requirement and adds cost).
+- **Hardcoded question templates** (no personalization — defeats the purpose of tailoring to the user's job and documents).
+- **Frontend-only TTS via Web Speech API** (available in the Tauri webview, but unreliable for long-form questions and inconsistent across webview versions).
+
+---
+
+### ADR-019: Lightweight custom i18n system over library dependency
+
+**Date:** 2026-07-28
+
+**Status:** Accepted
+
+**Context:** The app needed bilingual support (English/Spanish) for all user-facing strings. Options were:
+
+- **`react-intl` / `react-i18next`:** Full-featured ICU message format, context providers, async loading, plural rules. Adds ~30–60 KB to the bundle.
+- **Custom lightweight system:** A translations object, a `t()` lookup function, and a React hook for reactivity. Zero dependencies beyond React 18.
+- **CSS-only approach** (separate HTML files per language): Impossibly brittle for a dynamic app.
+
+Key constraints:
+- Language must switch instantly without a full page reload.
+- The React tree must re-render on language change without requiring a `<Provider>` wrapper at the root.
+- The chosen language must persist across restarts (localStorage + backend `settings.language`).
+- The system must work in the overlay window too (separate webview, no shared context).
+- Must support template interpolation (`{{count}}` → "5 documents").
+
+**Decision:** Build a custom i18n system (`src/i18n.ts`) with:
+
+1. **Translations as a plain object:** `{ en: { appTitle: "Kue", ... }, es: { appTitle: "Kue", ... } }` — 270+ keys per language, with `as const` for type safety.
+2. **`t(key, vars?)` function:** Synchronous lookup from the current language object. Template variables replaced via simple `String.replace()`.
+3. **`useLanguage()` hook:** Uses React 18's `useSyncExternalStore` to subscribe to language changes. No context provider needed — any component calling `useLanguage()` or `t()` re-renders on language change.
+4. **`initLanguage()` for synchronous restore:** Reads from `localStorage` before the first React render, avoiding a flash of the wrong language.
+5. **`loadLanguageFromBackend()` for async persistence:** Reads `settings.language` from the Rust backend and updates both localStorage and the in-memory state.
+6. **`saveLanguage()` for persistence:** Writes to localStorage (sync) and backend `set_setting` (async fire-and-forget).
+7. **Language switcher in `Header.tsx`:** Two toggle buttons (ES/EN) with `aria-pressed` and keyboard accessibility. Calls `onLanguageChange` which triggers `setLanguage()` + `saveLanguage()`.
+
+**Consequences:**
+- *(Positive)* Zero bundle size impact from i18n libraries — the translations object is ~25 KB gzipped.
+- *(Positive)* Instant language switching — just a state update, no async loading or context re-render.
+- *(Positive)* Works in both windows (main and overlay) without a shared context provider.
+- *(Positive)* Type-safe — `t()` only accepts valid keys from the `Translations` type.
+- *(Negative)* No ICU plural rules — the `{{count}}` interpolation is manual and language-agnostic (works for EN/ES but would not work for languages with complex pluralisation like Arabic or Russian).
+- *(Negative)* No lazy loading — all 270+ keys per language are loaded at startup. Acceptable for v1 with only two languages.
+- *(Negative)* No right-to-left (RTL) support — would need additional work for Arabic/Hebrew if added later.
+
+**Alternatives considered:**
+- **`react-intl`** (full ICU support, but heavier and requires a `<IntlProvider>` wrapper — awkward for the overlay window which has a separate React tree).
+- **`react-i18next`** (similar complexity, requires async setup for a simple synchronous use case).
+- **CSS language classes** (`.lang-en` / `.lang-es` with different text in the markup — completely unmaintainable).
+- **Separate builds per language** (doubles build time, requires CI changes — disproportionate for two languages).
