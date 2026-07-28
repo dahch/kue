@@ -1,12 +1,18 @@
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::State;
 
 use crate::db::{Database, TranscriptLineRow};
 use crate::rag::embeddings::EmbeddingModel;
 use crate::rag::indexer::search;
 use crate::BatchTracker;
+
+// Re-export LLM functions for backwards compatibility
+pub use crate::llm::{
+    call_anthropic, call_deepseek, call_gemini, call_ollama, call_openai, call_openrouter,
+    default_model,
+};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -72,35 +78,35 @@ fn build_analysis_prompt(lines: &[TranscriptLineRow], rag_context: &str) -> Stri
         .join("\n");
 
     format!(
-        r##"Eres un asistente de análisis de entrevistas técnicas. Tu tarea es analizar el transcript completo de una entrevista (preguntas del entrevistador + respuestas del candidato) usando también el contexto de los documentos del candidato (CV, proyectos, métricas).
+        r##"You are a technical interview analysis assistant. Your task is to analyze the full transcript of an interview (interviewer questions + candidate answers) using the candidate's document context (CV, projects, metrics).
 
-## Transcript de la entrevista
+## Interview Transcript
 {}
 
-## Contexto de documentos del candidato
+## Candidate Document Context
 {}
 
-## Formato de respuesta DEBE ser JSON válido con esta estructura exacta (sin markdown, sin bloques ```json, solo JSON puro):
+## Response format MUST be valid JSON with this exact structure (no markdown, no ```json blocks, pure JSON only):
 {{
-  "summary": "Resumen ejecutivo de 3-4 oraciones sobre cómo fue la entrevista: qué preguntaron, cómo respondió el candidato, tono general.",
+  "summary": "Executive summary of 3-4 sentences about how the interview went: what they asked, how the candidate responded, general tone.",
   "weak_questions": [
-    "Pregunta específica que el candidato respondió débilmente y qué podría haber dicho"
+    "Specific question the candidate answered weakly and what they could have said instead"
   ],
   "forgotten_projects": [
-    "Proyecto o métrica del contexto del candidato que habría sido relevante mencionar pero no apareció en sus respuestas"
+    "Project or metric from the candidate's context that would have been relevant to mention but did not appear in their answers"
   ],
   "star_improvements": [
-    "Momento específico donde el candidato podría haber usado mejor la estructura STAR (Situación, Tarea, Acción, Resultado)"
+    "Specific moment where the candidate could have better used the STAR structure (Situation, Task, Action, Result)"
   ]
 }}
 
-## Instrucciones importantes
-1. Identifica las preguntas técnicas y de comportamiento que el entrevistador hizo.
-2. Compara las respuestas del candidato con el contexto disponible en sus documentos.
-3. Si el candidato dejó fuera proyectos relevantes o métricas importantes, menciónalos en `forgotten_projects`.
-4. Señala qué preguntas se respondieron con debilidad o poca profundidad.
-5. Sugiere mejoras concretas de estructura STAR donde el candidato dio respuestas genéricas.
-6. Responde ÚNICAMENTE con el JSON, sin texto adicional."##,
+## Important Instructions
+1. Identify the technical and behavioral questions the interviewer asked.
+2. Compare the candidate's answers with the context available in their documents.
+3. If the candidate left out relevant projects or important metrics, list them in `forgotten_projects`.
+4. Point out which questions were answered weakly or without enough depth.
+5. Suggest concrete STAR structure improvements where the candidate gave generic answers.
+6. Respond ONLY with the JSON, no additional text."##,
         transcript, rag_context
     )
 }
@@ -121,7 +127,7 @@ fn build_rag_context(
         .collect();
 
     if questions.is_empty() {
-        return String::from("(No hay documentos indexados disponibles)");
+        return String::from("(No indexed documents available)");
     }
 
     let mut all_chunks: Vec<String> = Vec::new();
@@ -143,237 +149,10 @@ fn build_rag_context(
     }
 
     if all_chunks.is_empty() {
-        String::from("(No se encontraron documentos relevantes en el contexto del candidato)")
+        String::from("(No relevant documents found in the candidate's context)")
     } else {
         all_chunks.join("\n---\n")
     }
-}
-
-// ---------------------------------------------------------------------------
-// LLM API calls (async via reqwest)
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct OpenAIResponse {
-    #[serde(default)]
-    choices: Vec<OpenAIChoice>,
-}
-
-#[derive(Deserialize)]
-struct OpenAIChoice {
-    #[serde(default)]
-    message: OpenAIMessage,
-}
-
-#[derive(Default, Deserialize)]
-struct OpenAIMessage {
-    #[serde(default)]
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct AnthropicResponse {
-    #[serde(default)]
-    content: Vec<AnthropicContent>,
-}
-
-#[derive(Deserialize)]
-struct AnthropicContent {
-    #[serde(rename = "type")]
-    _type: String,
-    #[serde(default)]
-    text: String,
-}
-
-#[derive(Deserialize)]
-struct GeminiResponse {
-    #[serde(default)]
-    candidates: Vec<GeminiCandidate>,
-}
-
-#[derive(Deserialize)]
-struct GeminiCandidate {
-    #[serde(default)]
-    content: GeminiContent,
-}
-
-#[derive(Default, Deserialize)]
-struct GeminiContent {
-    #[serde(default)]
-    parts: Vec<GeminiPart>,
-}
-
-#[derive(Deserialize)]
-struct GeminiPart {
-    #[serde(default)]
-    text: String,
-}
-
-#[derive(Deserialize)]
-struct OllamaResponse {
-    #[serde(default)]
-    message: Option<OllamaMessage>,
-}
-
-#[derive(Deserialize)]
-struct OllamaMessage {
-    #[serde(default)]
-    content: String,
-}
-
-fn http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| reqwest::Client::new())
-}
-
-async fn call_ollama(prompt: &str, model: &str) -> Result<String, String> {
-    let body = serde_json::json!({
-        "model": model,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "stream": false,
-    });
-
-    let resp = http_client()
-        .post("http://localhost:11434/api/chat")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Ollama request failed: {e}"))?;
-
-    let data: OllamaResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Ollama response parse failed: {e}"))?;
-
-    data.message
-        .map(|m| m.content)
-        .ok_or_else(|| "Ollama returned no message content".to_string())
-}
-
-async fn call_openai(prompt: &str, model: &str, api_key: &str) -> Result<String, String> {
-    let body = serde_json::json!({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "Eres un asistente de análisis de entrevistas técnicas. Siempre respondes ÚNICAMENTE con JSON válido, sin texto adicional ni markdown."},
-            {"role": "user", "content": prompt}
-        ],
-    });
-
-    let resp = http_client()
-        .post("https://api.openai.com/v1/chat/completions")
-        .header("Authorization", format!("Bearer {api_key}"))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("OpenAI request failed: {e}"))?;
-
-    let data: OpenAIResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("OpenAI response parse failed: {e}"))?;
-
-    data.choices
-        .into_iter()
-        .next()
-        .map(|c| c.message.content)
-        .ok_or_else(|| "OpenAI returned no choices".to_string())
-}
-
-async fn call_anthropic(prompt: &str, model: &str, api_key: &str) -> Result<String, String> {
-    let body = serde_json::json!({
-        "model": model,
-        "system": "Eres un asistente de análisis de entrevistas técnicas. Siempre respondes ÚNICAMENTE con JSON válido, sin texto adicional ni markdown.",
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "max_tokens": 4096,
-    });
-
-    let resp = http_client()
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Anthropic request failed: {e}"))?;
-
-    let data: AnthropicResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Anthropic response parse failed: {e}"))?;
-
-    data.content
-        .into_iter()
-        .next()
-        .map(|c| c.text)
-        .ok_or_else(|| "Anthropic returned no content".to_string())
-}
-
-async fn call_gemini(prompt: &str, model: &str, api_key: &str) -> Result<String, String> {
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        model, api_key
-    );
-
-    let body = serde_json::json!({
-        "contents": [{
-            "parts": [{"text": prompt}]
-        }],
-        "generationConfig": {
-            "responseMimeType": "application/json"
-        }
-    });
-
-    let resp = http_client()
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Gemini request failed: {e}"))?;
-
-    let data: GeminiResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Gemini response parse failed: {e}"))?;
-
-    data.candidates
-        .into_iter()
-        .next()
-        .and_then(|c| c.content.parts.into_iter().next())
-        .map(|p| p.text)
-        .ok_or_else(|| "Gemini returned no candidates".to_string())
-}
-
-async fn call_openrouter(prompt: &str, model: &str, api_key: &str) -> Result<String, String> {
-    let body = serde_json::json!({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "Eres un asistente de análisis de entrevistas técnicas. Siempre respondes ÚNICAMENTE con JSON válido, sin texto adicional ni markdown."},
-            {"role": "user", "content": prompt}
-        ],
-    });
-
-    let resp = http_client()
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .header("Authorization", format!("Bearer {api_key}"))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("OpenRouter request failed: {e}"))?;
-
-    let data: OpenAIResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("OpenRouter response parse failed: {e}"))?;
-
-    data.choices
-        .into_iter()
-        .next()
-        .map(|c| c.message.content)
-        .ok_or_else(|| "OpenRouter returned no choices".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -441,21 +220,6 @@ fn extract_json(text: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Default models per provider
-// ---------------------------------------------------------------------------
-
-fn default_model(provider: &str) -> &'static str {
-    match provider {
-        "ollama" => "llama3",
-        "openai" => "gpt-4o",
-        "anthropic" => "claude-3-5-sonnet-20241022",
-        "gemini" => "gemini-1.5-pro",
-        "openrouter" => "openai/gpt-4o",
-        _ => "gpt-4o",
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tauri command (async)
 // ---------------------------------------------------------------------------
 
@@ -468,21 +232,35 @@ pub async fn analyze_session(
     model_state: State<'_, Arc<Mutex<EmbeddingModel>>>,
     batch_tracker: State<'_, BatchTracker>,
 ) -> Result<AnalyzeResult, String> {
-    let ready = batch_tracker
-        .0
-        .lock()
-        .map_err(|e| e.to_string())?
-        .contains(&session_id);
+    let ready = {
+        let tracker = batch_tracker.0.lock().map_err(|e| e.to_string())?;
+        if tracker.contains(&session_id) {
+            true
+        } else {
+            // If not in the in-memory tracker (e.g. after app restart),
+            // check whether transcript lines already exist in the database.
+            let conn = db.conn.lock().map_err(|e| e.to_string())?;
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM transcript_lines WHERE session_id = ?1",
+                    rusqlite::params![session_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            count > 0
+        } // tracker lock is dropped here, so we won't deadlock below
+    };
+
     if !ready {
         return Err(
-            "La transcripción del Canal A aún no está lista. Espera a que termine el procesamiento."
+            "Channel A transcript is not ready yet. Wait for processing to finish."
                 .to_string(),
         );
     }
 
     let lines = get_transcript_lines(&db, &session_id)?;
     if lines.is_empty() {
-        return Err("No hay líneas de transcripción para esta sesión.".to_string());
+        return Err("No transcript lines for this session.".to_string());
     }
 
     let rag_context = build_rag_context(model_state.inner(), &db, &lines);
@@ -500,6 +278,7 @@ pub async fn analyze_session(
         "anthropic" => call_anthropic(&prompt, &model_name, &api_key).await?,
         "gemini" => call_gemini(&prompt, &model_name, &api_key).await?,
         "openrouter" => call_openrouter(&prompt, &model_name, &api_key).await?,
+        "deepseek" => call_deepseek(&prompt, &model_name, &api_key).await?,
         other => return Err(format!("Unknown provider: {other}")),
     };
 
@@ -682,25 +461,6 @@ mod tests {
     }
 
     #[test]
-    fn default_model_for_known_providers() {
-        assert_eq!(default_model("ollama"), "llama3");
-        assert_eq!(default_model("openai"), "gpt-4o");
-        assert_eq!(default_model("anthropic"), "claude-3-5-sonnet-20241022");
-        assert_eq!(default_model("gemini"), "gemini-1.5-pro");
-        assert_eq!(default_model("openrouter"), "openai/gpt-4o");
-    }
-
-    #[test]
-    fn default_model_unknown_falls_back_to_gpt4o() {
-        assert_eq!(default_model("unknown-provider"), "gpt-4o");
-    }
-
-    #[test]
-    fn default_model_case_sensitive() {
-        assert_eq!(default_model("OpenAI"), "gpt-4o", "capitalized 'OpenAI' should fall back");
-    }
-
-    #[test]
     fn analyze_result_serialization() {
         let result = AnalyzeResult {
             summary: "Good interview".to_string(),
@@ -790,11 +550,5 @@ mod tests {
         tracker.0.lock().unwrap().insert("sess-ready".into());
         let ready = tracker.0.lock().unwrap().contains("sess-ready");
         assert!(ready);
-    }
-
-    #[test]
-    fn http_client_is_send_and_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<reqwest::Client>();
     }
 }
