@@ -414,13 +414,14 @@ Key constraints:
 
 **Decision:** Build a custom i18n system (`src/i18n.ts`) with:
 
-1. **Translations as a plain object:** `{ en: { appTitle: "Kue", ... }, es: { appTitle: "Kue", ... } }` — 270+ keys per language, with `as const` for type safety.
+1. **Translations as a plain object:** `{ en: { appTitle: "Kue", ... }, es: { appTitle: "Kue", ... } }` — 142 keys per language (284 total entries), with `as const` for type safety.
 2. **`t(key, vars?)` function:** Synchronous lookup from the current language object. Template variables replaced via simple `String.replace()`.
 3. **`useLanguage()` hook:** Uses React 18's `useSyncExternalStore` to subscribe to language changes. No context provider needed — any component calling `useLanguage()` or `t()` re-renders on language change.
 4. **`initLanguage()` for synchronous restore:** Reads from `localStorage` before the first React render, avoiding a flash of the wrong language.
 5. **`loadLanguageFromBackend()` for async persistence:** Reads `settings.language` from the Rust backend and updates both localStorage and the in-memory state.
 6. **`saveLanguage()` for persistence:** Writes to localStorage (sync) and backend `set_setting` (async fire-and-forget).
 7. **Language switcher in `Header.tsx`:** Two toggle buttons (ES/EN) with `aria-pressed` and keyboard accessibility. Calls `onLanguageChange` which triggers `setLanguage()` + `saveLanguage()`.
+8. **142 keys per language:** The translations object holds 142 keys per language (284 total entries), covering all UI text, onboarding strings, interview statuses, settings labels, and validation messages.
 
 **Consequences:**
 - *(Positive)* Zero bundle size impact from i18n libraries — the translations object is ~25 KB gzipped.
@@ -428,7 +429,7 @@ Key constraints:
 - *(Positive)* Works in both windows (main and overlay) without a shared context provider.
 - *(Positive)* Type-safe — `t()` only accepts valid keys from the `Translations` type.
 - *(Negative)* No ICU plural rules — the `{{count}}` interpolation is manual and language-agnostic (works for EN/ES but would not work for languages with complex pluralisation like Arabic or Russian).
-- *(Negative)* No lazy loading — all 270+ keys per language are loaded at startup. Acceptable for v1 with only two languages.
+- *(Negative)* No lazy loading — all 142 keys per language are loaded at startup. Acceptable for v1 with only two languages.
 - *(Negative)* No right-to-left (RTL) support — would need additional work for Arabic/Hebrew if added later.
 
 **Alternatives considered:**
@@ -436,3 +437,76 @@ Key constraints:
 - **`react-i18next`** (similar complexity, requires async setup for a simple synchronous use case).
 - **CSS language classes** (`.lang-en` / `.lang-es` with different text in the markup — completely unmaintainable).
 - **Separate builds per language** (doubles build time, requires CI changes — disproportionate for two languages).
+
+---
+
+### ADR-020: Settings dialog with per-feature LLM defaults
+
+**Date:** 2026-07-30
+
+**Status:** Accepted
+
+**Context:** The app has three distinct features that use LLMs: hints (real-time during interview), post-call analysis (after session), and interview plan generation (before session). Each feature may need a different provider or model:
+- Hints need low latency → small local model (Ollama) preferred.
+- Post-call analysis needs quality → large cloud model (Anthropic/OpenAI) preferred.
+- Interview plan generation needs structured JSON output → any provider works.
+
+Previously, each feature hard-coded its own provider or relied on a single global setting. The user had to configure the API key separately per feature but had no way to set per-feature provider/model overrides. The `PostCallPanel` had inline provider/model selectors, but the `PlanGenerator` also had its own, and hints used a hardcoded default.
+
+**Decision:** A three-tier LLM configuration system:
+
+1. **Global defaults** stored in `settings` table as `default_provider` (default: `"openai"`) and `default_model` (optional). These apply to any feature without its own override.
+2. **Per-feature overrides** stored as `{feature}_provider` and `{feature}_model` in the same `settings` table (e.g., `analyze_provider`, `plan_provider`, `hint_provider`). Empty values fall back to global defaults.
+3. **Settings dialog with 3 tabs** (`SettingsDialog.tsx`): (a) **API Keys** — shows all 6 providers with key status and inline key management; (b) **LLM Defaults** — global provider/model picker + per-feature rows with global/custom radio toggles; (c) **General** — language switcher (moved from header-only to also available here).
+
+The `useLLMSettings(featureKey, providerHardDefault)` custom hook (`hooks.ts`) encapsulates the read/write logic: reads `{featureKey}_provider`, `{featureKey}_model`, `default_provider`, and `default_model` from the backend on mount, resolves the effective provider/model (feature override wins, then global, then hard-coded default), and provides setter functions for the feature-specific overrides.
+
+**Consequences:**
+- *(Positive)* Users can route each feature to the most appropriate LLM provider without reconfiguring every time.
+- *(Positive)* The `SettingsDialog` provides a single, discoverable UI for all LLM preferences — no more scattered provider dropdowns.
+- *(Positive)* The header settings button (`Header.tsx`) gives quick access, and the `PostCallPanel` includes a "Configure all in Settings" link pointing to the LLM Defaults tab.
+- *(Positive)* The hook pattern keeps component code clean — each feature just calls `useLLMSettings("analyze")` and gets the resolved provider/model.
+- *(Negative)* Six new settings keys per user (`default_provider`, `default_model`, `hint_provider`, `hint_model`, `analyze_provider`, `analyze_model`, `plan_provider`, `plan_model`) — manageable at this scale.
+- *(Negative)* The global default "openai" may not be ideal for users who prefer Anthropic — accepted as a reasonable starting default.
+- *(Negative)* The `useLLMSettings` hook fires independent backend reads for each setting key, adding ~4 IPC round-trips per feature on mount. Acceptable because it happens once at component mount, not in a hot path.
+
+**Alternatives considered:**
+- **Single hardcoded provider per feature** (the pre-ADR-020 state — rejected because users had no way to change provider from the UI without code changes).
+- **Single global provider only** (rejected because it forces the same model on latency-sensitive hints and quality-sensitive analysis).
+- **Store all config in localStorage** (rejected — would diverge from the existing pattern where all persistent settings go in the backend `settings` table).
+- **Redux/Zustand store for LLM config** (disproportionate complexity — the `useLLMSettings` hook with per-key persistence is simpler and doesn't add dependencies).
+
+---
+
+### ADR-021: Key management commands — delete_key and list_saved_keys
+
+**Date:** 2026-07-30
+
+**Status:** Accepted
+
+**Context:** ADR-016 established the pattern of storing API keys in the OS keychain via `keyring`, with `save_key` and `has_key` Tauri commands. As the app gained:
+- More LLM features (hints, analysis, plan generation) — up to 6 providers
+- The `SettingsDialog` (ADR-020) with an API Keys tab showing all providers' key status
+- The need to delete or change a saved key without overwriting via re-entry
+
+Two gaps emerged:
+1. No way to **delete** a key — once saved, the only way to clear it was via System Keychain Access.
+2. No way to **list** which providers have saved keys — the frontend had to call `has_key` individually for each provider, which required 6 sequential IPC calls.
+
+**Decision:**
+
+1. **`delete_key` command:** Calls `keyring::Entry::delete_password()`, with `NoEntry` errors swallowed for idempotency — deleting a non-existent key succeeds silently. The frontend `ApiKeyInput` component exposes a delete button (`showDelete` prop) that calls `delete_key` and triggers `onKeyDeleted`.
+
+2. **`list_saved_keys` command:** Takes a `Vec<String>` of provider names (e.g., `["openai", "anthropic", "gemini", "openrouter", "deepseek", "ollama"]`), calls `get_api_key()` for each, and returns the subset that have stored keys. This reduces 6 IPC calls to 1 and is used by `SettingsDialog`'s API Keys tab to show per-provider key status on mount.
+
+**Consequences:**
+- *(Positive)* Users can delete keys from within the app — no need to open System Keychain Access.
+- *(Positive)* `list_saved_keys` reduces frontend complexity: one call replaces 6 sequential `has_key` calls with a single batch operation.
+- *(Positive)* Both commands follow the existing error conventions: `Result<(), String>` for `delete_key` and `Result<Vec<String>, String>` for `list_saved_keys`.
+- *(Negative)* `list_saved_keys` iterates over providers sequentially in Rust — if a provider's keychain access hangs, it blocks the thread. Acceptable because keychain access is typically sub-millisecond.
+- *(Negative)* The provider list is hardcoded in the frontend (`constants.ts`) and passed in — if a new provider is added without updating the frontend caller, it won't appear in the list. Acceptable — the frontend code is the source of truth for the provider list anyway.
+
+**Alternatives considered:**
+- **Keep the status quo** — `has_key` per provider (6 IPC calls on mount). Rejected because it makes the Settings Dialog's API Keys tab load slowly and requires complex loading state management.
+- **A single `get_all_keys` command returning a map of provider→status** (rejected — would couple the command to the specific provider list, making it harder to extend with new providers without changing both frontend and backend).
+- **Delete via overwrite with empty string** (rejected — the keyring crate treats empty passwords as valid credentials; deleting properly removes the entry).

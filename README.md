@@ -27,7 +27,7 @@ npm install
 npm run tauri:dev
 ```
 
-If Moonshine is not yet provisioned on first launch, a `ProvisioningProgress` UI (progress bar, file counter, stage label, retry button) blocks entry until downloads complete. Once provisioned, the app shows an **Onboarding wizard** (`src/Onboarding.tsx`) that guides the user through screen recording permission, embedding model loading, API key configuration, and folder indexing (steps 1–4). After onboarding, the main session control UI unlocks (mode selector, start/stop, company/role inputs, panic button, transcript log with chat-bubble styling, session history, post-call analysis panel, AI Interview plan generator, reindex dialog). The Rust backend connects to SQLite and creates the schema at `~/Library/Application Support/com.kue.app/kue.db`.
+If Moonshine is not yet provisioned on first launch, a `ProvisioningProgress` UI (progress bar, file counter, stage label, retry button) blocks entry until downloads complete. Once provisioned, the app shows an **Onboarding wizard** (`src/Onboarding.tsx`) that guides the user through screen recording permission, embedding model loading, API key configuration, and folder indexing (steps 1–4). After onboarding, the main session control UI unlocks (mode selector, start/stop, company/role inputs, panic button, transcript log with chat-bubble styling, session history, post-call analysis panel, AI Interview plan generator, reindex dialog, settings dialog with API key management and LLM defaults). The Rust backend connects to SQLite and creates the schema at `~/Library/Application Support/com.kue.app/kue.db`.
 
 **Practice mode** now supports an **AI interviewer**: paste a job description, Kue generates a question plan via your configured LLM, then reads each question aloud using macOS `say` TTS (`tts/mod.rs`). The session transcript captures both your response and the AI's questions. **Shadow mode** works as before (eavesdrops on a real call).
 
@@ -89,8 +89,9 @@ npm run coverage:rust:full
 │  │    PostCall,  │ │      /provisioning)                  │    │
 │  │    Reindex)   │ │  ▸ rag (embeddings + indexer)        │    │
 │  │  Overlay.tsx  │ │  ▸ analyze (post-call BYOK)          │    │
-│  │   (hint       │ │  ▸ keys (keychain API keys)          │    │
-│  │    overlay)   │ │  ▸ onboarding (first-run wizard)     │    │
+│  │   (hint       │ │  ▸ keys (keychain API keys:          │    │
+│  │    overlay)   │ │  │    save, has, delete, list_saved) │    │
+│  │               │ │  ▸ onboarding (first-run wizard)     │    │
 │  │               │ │  ▸ logging (file logger + rotation)  │    │
 │  │               │ │  ▸ llm (shared response types)       │    │
 │  │               │ │  ▸ tts (macOS say, Samantha voice)   │    │
@@ -171,16 +172,19 @@ kue/
 │   │                        #   SessionList, PostCallPanel) — all in one file
 │   ├── main.tsx             # Entry point
 │   ├── index.css            # Tailwind directives + custom animations
-│   ├── Header.tsx           # Sticky header with Kue logo and language switcher (ES/EN)
-│   ├── i18n.ts              # i18n system: translations EN/ES, useLanguage hook, t() function,
+│   ├── Header.tsx           # Sticky header with Kue logo, settings button, i18n language switcher
+│   ├── i18n.ts              # i18n system: 142 bilingual EN/ES keys, useLanguage hook, t() function,
 │   │                        #   persistence via localStorage + backend settings table
-│   ├── Icon.tsx             # Inline SVG icon set (30 icons, 24×24 grid, aria-hidden)
+│   ├── Icon.tsx             # Inline SVG icon set (24 icons, 24×24 grid, aria-hidden)
 │   ├── ui.tsx               # Shared UI primitives: Spinner, SectionLabel, Equalizer, StyledSelect
 │   ├── hooks.ts             # Custom hooks: usePersistedSetting (get+set via backend),
-│   │                        #   useTauriEvent (auto-cleanup listener)
+│   │                        #   useTauriEvent (auto-cleanup listener), useLLMSettings (per-feature
+│   │                        #   provider/model defaults with global fallback)
+│   ├── constants.ts         # ProviderOption interface and PROVIDERS list (6 providers)
 │   ├── types.ts             # IndexSummary interface
 │   ├── validation.ts        # sanitizeError, isValidFolderPath, formatIndexResult
 │   ├── ApiKeyInput.tsx      # API key input component for post-call + plan generation
+│   ├── SettingsDialog.tsx   # Settings dialog with 3 tabs: API Keys, LLM Defaults, General
 │   ├── ProvisioningProgress.tsx  # Moonshine download progress UI (progress bar, file counter,
 │   │                        #   error display, retry button), gates access to Onboarding
 │   ├── Onboarding.tsx       # 4-step first-run wizard: screen permission, model load, API key,
@@ -195,7 +199,7 @@ kue/
 ├── src-tauri/               # Rust backend (Tauri)
 │   ├── src/
 │   │   ├── main.rs          # Entry point
-│   │   ├── lib.rs           # Tauri builder + setup (23 Tauri commands registered)
+│   │   ├── lib.rs           # Tauri builder + setup (25 Tauri commands registered)
 │   │   ├── types.rs         # TranscriptLine, Speaker (STT → classifier contract)
 │   │   ├── db/
 │   │   │   └── mod.rs       # Schema, migrations, sqlite-vec, get_setting/set_setting,

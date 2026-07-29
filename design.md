@@ -18,14 +18,14 @@ graph TD
         SL[SessionList<br/>session history sidebar]
     end
 
-    subgraph "Tauri Bridge (IPC — 23 commands)"
+    subgraph "Tauri Bridge (IPC — 25 commands)"
         B1[get_db_status]
         B2[start_session / stop_session / panic_mode]
         B3[index_folder_cmd / search_context]
         B4[classify_text / show_overlay]
         B5[is_transcript_ready / get_log_dir_path]
         B6[get_sessions / get_session_transcript]
-        B7[save_key / has_key]
+        B7[save_key / has_key / delete_key / list_saved_keys]
         B8[get_setting / set_setting]
         B9[analyze_session]
         B10[is_moonshine_provisioned / retry_moonshine_download]
@@ -231,9 +231,9 @@ graph TD
 
 **AI Interview (Practice mode):** The `PlanGenerator` component takes a job description and calls `generate_interview_plan` (BYOK LLM) → returns a structured question plan. When the user starts the session, `start_ai_interview` launches the `InterviewRunner` (registered as Tauri state), which iterates through planned questions: (1) emits `interview-question` event → frontend `LiveInterview` renders it with progress bar + skip/stop controls, (2) calls `tts::speak()` via macOS `say` (Samantha voice), (3) emits `interview-status: "speaking"` / `"listening"` / `"finished"`, (4) on next question, loops. Commands: `skip_ai_question` / `stop_ai_interview`.
 
-**i18n:** `src/i18n.ts` holds 270+ bilingual EN/ES translation keys. `useLanguage()` hook via `useSyncExternalStore`. Language switcher in `Header.tsx`. Persisted via localStorage + backend `settings.language`. `t()` supports `{{count}}` interpolation.
+**i18n:** `src/i18n.ts` holds 142 bilingual EN/ES translation keys (284 total entries). `useLanguage()` hook via `useSyncExternalStore`. Language switcher in `Header.tsx`. Persisted via localStorage + backend `settings.language`. `t()` supports `{{var}}` interpolation.
 
-**New frontend files:** `Header.tsx`, `i18n.ts`, `Icon.tsx` (30 icons), `ui.tsx` (primitives), `hooks.ts` (custom hooks), `validation.ts` (helpers), `ApiKeyInput.tsx`, `types.ts`.
+**New frontend files:** `Header.tsx`, `i18n.ts`, `Icon.tsx` (24 icons), `ui.tsx` (primitives), `hooks.ts` (custom hooks: `usePersistedSetting`, `useLLMSettings`, `useTauriEvent`), `validation.ts` (helpers), `constants.ts` (Provider list), `ApiKeyInput.tsx`, `SettingsDialog.tsx` (3-tab settings), `types.ts`.
 
 ---
 
@@ -242,14 +242,16 @@ graph TD
 ### 2.1 Frontend (`src/`)
 
 - **`main.tsx`** — Entry point React 18, mounts `<App />` on `#root`.
-- **`i18n.ts`** — i18n system with 270+ bilingual EN/ES translation keys. Provides `t()` template function (with `{{var}}` interpolation), `useLanguage()` hook (via `useSyncExternalStore`), `setLanguage()` / `getLanguage()`, `initLanguage()` (sync restore from localStorage), `loadLanguageFromBackend()` (async from `settings` table), `saveLanguage()`, `speakerLabel()`, `formatLines()`, `Language` type.
-- **`Header.tsx`** — Sticky header with Kue logo (SVG) and language switcher (ES/EN toggle pills, role="group", aria-pressed). Uses `useLanguage()` hook and calls `onLanguageChange` callback.
+- **`i18n.ts`** — i18n system with 142 bilingual EN/ES translation keys (284 total entries). Provides `t()` template function (with `{{var}}` interpolation), `useLanguage()` hook (via `useSyncExternalStore`), `setLanguage()` / `getLanguage()`, `initLanguage()` (sync restore from localStorage), `loadLanguageFromBackend()` (async from `settings` table), `saveLanguage()`, `speakerLabel()`, `formatLines()`, `Language` type.
+- **`Header.tsx`** — Sticky header with Kue logo (SVG), settings button (gear icon, calls `onOpenSettings`), and language switcher (ES/EN toggle pills, role="group", aria-pressed). Uses `useLanguage()` hook and calls `onLanguageChange` callback.
 - **`Icon.tsx`** — 30 inline SVG icons (24×24 grid, aria-hidden). Exports `Icon` component + `IconName` type union for type-safe usage.
 - **`ui.tsx`** — Shared UI primitives: `Spinner` (animated ring), `SectionLabel` (uppercase label with accent bar), `Equalizer` (animated live bars), `StyledSelect` (accessible listbox with arrow-key navigation, value persistence).
-- **`hooks.ts`** — `usePersistedSetting(key, default)` reads from backend `get_setting` on mount, writes to `set_setting` on value change. `useTauriEvent(event, handler)` auto-cleanup listener wrapper.
+- **`hooks.ts`** — `usePersistedSetting(key, default)` reads from backend `get_setting` on mount, writes to `set_setting` on value change. `useTauriEvent(event, handler)` auto-cleanup listener wrapper. `useLLMSettings(featureKey, providerHardDefault)` provides per-feature LLM provider/model settings with global default fallback — reads/writes `{featureKey}_provider`, `{featureKey}_model`, `default_provider`, and `default_model` settings.
+- **`constants.ts`** — `ProviderOption` interface and `PROVIDERS` constant array with 6 entries: OpenAI, Anthropic, Gemini, OpenRouter, DeepSeek, Ollama.
 - **`types.ts`** — `IndexSummary` interface (`folder`, `files_indexed`, `chunks_created`, `error_count`).
 - **`validation.ts`** — `sanitizeError()` maps known error prefixes to i18n-friendly messages, truncates at 300 chars. `isValidFolderPath()` checks empty, `..`, invalid chars, absolute path. `formatIndexResult()` formats the `index_folder_cmd` result.
-- **`ApiKeyInput.tsx`** — Per-provider API key input component. Checks `has_key` on mount, provides a text input + save button for the selected provider.
+- **`ApiKeyInput.tsx`** — Per-provider API key input component. Checks `has_key` on mount, provides a text input + save button for the selected provider. Optionally shows delete button (`showDelete` prop) and supports `onKeySaved`/`onKeyDeleted` callbacks.
+- **`SettingsDialog.tsx`** — Settings dialog with 3 tabs: (1) **API Keys** — per-provider key management using `ApiKeyInput` + `list_saved_keys`/`delete_key` commands, (2) **LLM Defaults** — global provider/model defaults with per-feature overrides for hints/analyze/plan, (3) **General** — language switcher. Accessed via the settings gear button in `Header.tsx`. Passes `onOpenSettings` callback from `MainApp`.
 - **`App.tsx`** (1453 lines) — App router that detects the window label via `getCurrentWebviewWindow()`. If `"overlay"`, renders `<Overlay />`; if Moonshine not provisioned, renders `<ProvisioningProgress />`; if first run, renders `<Onboarding />`; otherwise renders `<MainApp />`. Also initialises i18n (`initLanguage()`, `loadLanguageFromBackend()`).
 - **`ProvisioningProgress.tsx`** — First-launch download progress UI. On mount, checks `is_moonshine_provisioned`; if not provisioned, shows a progress bar, stage label, file counter, error display, and retry button. Listens for `moonshine-download-progress`, `moonshine-provision-error`, and `moonshine-provisioned` events. Calls `onProvisioned` callback on completion.
 - **`Onboarding.tsx`** — 4-step first-run wizard: (1) screen recording permission, (2) embedding model loading, (3) API key config, (4) folder indexing. On completion, `mark_onboarding_done` sets `settings.first_run = 'done'`.
@@ -265,7 +267,7 @@ graph TD
   - Hint section with panic-state styling
   - `ReindexPanel` modal for on-demand folder re-indexing
   - Session history list with selection
-  - `PostCallPanel` for BYOK analysis: transcript viewer, provider/model selection, API key input, analyze button, result display (summary/weak_questions/forgotten_projects/star_improvements)
+  - `PostCallPanel` for BYOK analysis: transcript viewer, provider/model selection, API key input, analyze button, result display (summary/weak_questions/forgotten_projects/star_improvements), "Configure all in Settings" link that passes `onOpenSettings` to open the LLM Defaults tab in `SettingsDialog`
   - Listens for `new-transcript`, `new-hint`, `panic-mode`, `post-call-transcript-ready`, `post-call-transcript-error`, `interview-question`, `interview-status`, `interview-finished` events
 - **`index.css`** — Tailwind directives + custom keyframes (fade-up, scale-in, eq-bar, pulse-dot).
 - **`__tests__/setup.ts`** — Vitest setup that mocks `@tauri-apps/api/core` (invoke), `@tauri-apps/api/event` (listen), `@tauri-apps/api/webviewWindow` (getCurrentWebviewWindow).
@@ -275,7 +277,7 @@ graph TD
 
 ### 2.2 Tauri Shell (`lib.rs`)
 
-File `src-tauri/src/lib.rs` (147 lines):
+File `src-tauri/src/lib.rs` (149 lines):
 
 ```rust
 use std::collections::HashSet;
@@ -408,6 +410,8 @@ pub fn run() {
             overlay::show_overlay,
             keys::save_key,
             keys::has_key,
+            keys::delete_key,
+            keys::list_saved_keys,
             analyze::analyze_session,
             stt::provisioning::is_moonshine_provisioned,
             stt::provisioning::retry_moonshine_download,
@@ -443,7 +447,7 @@ pub fn run() {
 - **`get_setting`**, **`set_setting`** — Generic key-value read/write in the `settings` table (`db/mod.rs`). Used by `onboarding.rs` for the `first_run` flag and available to the frontend for persistent user preferences (e.g., language, retain_audio).
 - **`is_transcript_ready`** — Tauri command in `audio/capture.rs` that checks `BatchTracker` to see if Channel A batch transcription has completed for a given session.
 - **`get_log_dir_path`** — Tauri command in `audio/capture.rs` that returns the path to the log directory so the frontend can open it via the shell plugin.
-- **`save_key`**, **`has_key`** — Tauri commands in `keys.rs` for storing/checking API keys in the OS keychain via the `keyring` crate.
+- **`save_key`**, **`has_key`**, **`delete_key`**, **`list_saved_keys`** — Tauri commands in `keys.rs` for storing, checking, deleting, and listing API keys in the OS keychain via the `keyring` crate. `delete_key` is idempotent (succeeds even if no key exists). `list_saved_keys` takes a `Vec<String>` of provider names and returns those with stored keys — used by `SettingsDialog.tsx` to show key status per provider.
 - **`is_moonshine_provisioned`**, **`retry_moonshine_download`** — Tauri commands in `stt/provisioning.rs` for checking Moonshine provisioning status and retrying failed downloads.
 - **`is_first_run`**, **`mark_onboarding_done`**, **`check_screen_recording_permission`**, **`is_embedding_model_loaded`** — Tauri commands in `onboarding.rs` that drive the first-run wizard (screen recording permission check via `SCShareableContent::try_current()`, embedding model readiness polling, and onboarding completion flag in `settings.first_run`).
 - **`analyze_session`** — Tauri command in `analyze.rs` that sends the full session transcript + RAG context to a user-configured LLM (Anthropic/OpenAI/Gemini/OpenRouter/DeepSeek/Ollama) and returns a structured analysis (summary, weak questions, forgotten projects, STAR improvements).
@@ -674,9 +678,12 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 | Post-call BYOK          | **Implemented** (Sprint 5 — `analyze_session` command, `keys.rs` keychain storage, `analyze.rs` prompt builder + LLM API calls for Anthropic/OpenAI/Gemini/OpenRouter/DeepSeek/Ollama) | `tauri-plugin-shell` present + `keyring` (keychain), `reqwest` (HTTP), `serde_json` (response parsing) | `analyze.rs`, `keys.rs`, `App.tsx` (PostCallPanel) |
 | LLM response types      | **Implemented** — shared response structs for OpenAI/Anthropic/Gemini API responses, extracted from `analyze.rs` for reuse | `serde`, `serde_json` | `llm/mod.rs` |
 | TTS (macOS say) | **Implemented** (Sprint 7 — text-to-speech via macOS `say` command, Samantha voice, 30s timeout, `is_available()` check) | — | `tts/mod.rs` |
+| Key management (delete + list) | **Implemented** — `keys::delete_key` (idempotent delete) and `keys::list_saved_keys` (bulk check across providers) | `keyring` | `keys.rs` |
+| Settings dialog | **Implemented** — 3-tab settings dialog (API Keys, LLM Defaults, General) with per-feature LLM defaults | React 18 | `SettingsDialog.tsx` |
+| LLM defaults persistence | **Implemented** — per-feature (`hint_provider`, `analyze_provider`, `plan_provider`) and global (`default_provider`, `default_model`) LLM configs stored in `settings` table | — | `hooks.ts` (`useLLMSettings`) |
 | AI Interview plan gen | **Implemented** (Sprint 7 — `generate_interview_plan` command, job description + duration → structured question plan via BYOK LLM with RAG context) | `serde`, `serde_json` | `interview_plan.rs` |
 | AI Interview runner | **Implemented** (Sprint 7 — `InterviewRunner` thread + Tauri state, emits `interview-question`/`interview-status`/`interview-finished` events, TTS integration, skip/stop commands) | `tokio` (time) | `interview_runner.rs` |
-| i18n system | **Implemented** (Sprint 7 — `i18n.ts` with 270+ bilingual EN/ES keys, `useLanguage()` hook, `t()` template function, localStorage + backend persistence) | — | `src/i18n.ts` |
+| i18n system | **Implemented** (Sprint 7 — `i18n.ts` with 142 bilingual EN/ES keys [284 total entries], `useLanguage()` hook, `t()` template function, localStorage + backend persistence) | — | `src/i18n.ts` |
 | Frontend components | **Implemented** (Sprint 7 — `Header.tsx` with language switcher, `Icon.tsx` 30 SVG icons, `ui.tsx` primitives, `hooks.ts`, `validation.ts`, `ApiKeyInput.tsx`, `ReindexPanel` modal) | `@tauri-apps/api` | `src/Header.tsx`, `src/Icon.tsx`, `src/ui.tsx`, `src/hooks.ts`, `src/validation.ts`, `src/ApiKeyInput.tsx` |
 | Recursive indexing + PDF | **Implemented** (Sprint 7 — `index_folder_cmd` recursively walks subdirectories, PDF text extraction via `pdf-extract` crate) | `pdf-extract` | `rag/indexer.rs` |
 | Log viewing | **Implemented** (Sprint 7 — `get_log_dir_path` command returns log directory path for opening via Tauri shell) | — | `audio/capture.rs` |
