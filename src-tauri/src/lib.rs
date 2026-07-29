@@ -130,6 +130,8 @@ pub fn run() {
             overlay::show_overlay,
             keys::save_key,
             keys::has_key,
+            keys::delete_key,
+            keys::list_saved_keys,
             analyze::analyze_session,
             stt::provisioning::is_moonshine_provisioned,
             stt::provisioning::retry_moonshine_download,

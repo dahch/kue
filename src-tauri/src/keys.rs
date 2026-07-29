@@ -19,7 +19,6 @@ pub fn get_api_key(provider: &str) -> Result<String, String> {
 /// Delete an API key from the system keychain for a given provider.
 /// Succeeds even if the key doesn't exist (keyring returns an error which we
 /// ignore for idempotency).
-#[allow(dead_code)]
 pub fn delete_api_key(provider: &str) -> Result<(), String> {
     let entry = Entry::new(KEYRING_SERVICE, provider).map_err(|e| e.to_string())?;
     match entry.delete_password() {
@@ -37,6 +36,20 @@ pub fn save_key(provider: String, key: String) -> Result<(), String> {
 #[tauri::command]
 pub fn has_key(provider: String) -> Result<bool, String> {
     Ok(get_api_key(&provider).is_ok())
+}
+
+#[tauri::command]
+pub fn delete_key(provider: String) -> Result<(), String> {
+    delete_api_key(&provider)
+}
+
+#[tauri::command]
+pub fn list_saved_keys(providers: Vec<String>) -> Result<Vec<String>, String> {
+    let saved = providers
+        .into_iter()
+        .filter(|p| get_api_key(p).is_ok())
+        .collect();
+    Ok(saved)
 }
 
 #[cfg(test)]
