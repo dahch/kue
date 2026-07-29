@@ -3,7 +3,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { PROVIDERS } from "./constants";
-import { usePersistedSetting, useTauriEvent } from "./hooks";
+import { useTauriEvent, useLLMSettings } from "./hooks";
 import Onboarding from "./Onboarding";
 import Overlay from "./Overlay";
 import ProvisioningProgress from "./ProvisioningProgress";
@@ -22,6 +22,7 @@ import {
 import type { IndexSummary } from "./types";
 import { formatIndexResult, isValidFolderPath, sanitizeError } from "./validation";
 import ApiKeyInput from "./ApiKeyInput";
+import SettingsDialog from "./SettingsDialog";
 import { Icon, type IconName } from "./Icon";
 import { Equalizer, SectionLabel, Spinner, StyledSelect } from "./ui";
 
@@ -154,12 +155,11 @@ function GhostButton({
 
 /* ---------- Post-call panel ---------- */
 
-export function PostCallPanel({ session }: { session: SessionRow }) {
+export function PostCallPanel({ session, onOpenSettings }: { session: SessionRow; onOpenSettings?: (tab?: "api-keys" | "llm-defaults" | "general") => void }) {
   const [transcriptReady, setTranscriptReady] = useState(false);
   const [checking, setChecking] = useState(true);
   const [processingError, setProcessingError] = useState<string | null>(null);
-  const [provider, setProvider] = usePersistedSetting("analyze_provider", "openai");
-  const [model, setModel] = usePersistedSetting("analyze_model");
+  const { provider, setProvider, model, setModel } = useLLMSettings("analyze");
   const [analyzing, setAnalyzing] = useState(false);
   const [result, setResult] = useState<AnalyzeResult | null>(null);
   const [error, setError] = useState("");
@@ -435,6 +435,15 @@ export function PostCallPanel({ session }: { session: SessionRow }) {
       </div>
 
       <button
+        type="button"
+        onClick={() => onOpenSettings?.("llm-defaults")}
+        className="mb-4 flex items-center gap-1.5 font-mono text-[10px] font-medium uppercase tracking-wider text-zinc-500 transition-colors hover:text-volt-400"
+      >
+        <Icon name="sliders" className="h-3 w-3" />
+        {t("configureAllInSettings")}
+      </button>
+
+      <button
         className={`flex w-full items-center justify-center gap-2 rounded-xl py-3 font-semibold transition-all ${
           !transcriptReady || analyzing
             ? "cursor-not-allowed bg-ink-700 text-zinc-500"
@@ -652,17 +661,25 @@ function PlanGenerator({
   setJobDescription,
   interviewPlan,
   setInterviewPlan,
+  onOpenSettings,
 }: {
   jobDescription: string;
   setJobDescription: (v: string) => void;
   interviewPlan: PlannedQuestion[] | null;
   setInterviewPlan: (v: PlannedQuestion[] | null) => void;
+  onOpenSettings?: (tab?: "api-keys" | "llm-defaults" | "general") => void;
 }) {
   const [durationMinutes, setDurationMinutes] = useState(15);
-  const [planProvider, setPlanProvider] = usePersistedSetting("plan_provider", "openai");
-  const [planModel, setPlanModel] = usePersistedSetting("plan_model");
+  const { provider: planProvider, setProvider: setPlanProvider, model: planModel, setModel: setPlanModel } = useLLMSettings("plan");
   const [generatingPlan, setGeneratingPlan] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
+  const [hasPlanKey, setHasPlanKey] = useState(false);
+
+  useEffect(() => {
+    invoke<boolean>("has_key", { provider: planProvider })
+      .then(setHasPlanKey)
+      .catch(() => setHasPlanKey(false));
+  }, [planProvider]);
 
   const handleGeneratePlan = useCallback(async () => {
     if (!jobDescription.trim()) return;
@@ -749,6 +766,32 @@ function PlanGenerator({
           />
         </div>
       </div>
+
+      {!hasPlanKey && planProvider !== "ollama" && (
+        <div className="mb-4 rounded-lg border border-signal-amber/25 bg-signal-amber/[0.06] p-3">
+          <p className="flex items-start gap-2 text-xs text-signal-amber">
+            <Icon name="alert" className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            {t("noKeyForProviderMsg", { provider: planProvider })}
+          </p>
+          <button
+            type="button"
+            onClick={() => onOpenSettings?.("api-keys")}
+            className="mt-1.5 flex items-center gap-1.5 font-mono text-[10px] font-medium uppercase tracking-wider text-signal-amber transition-colors hover:text-signal-amber/70"
+          >
+            <Icon name="sliders" className="h-3 w-3" />
+            {t("openSettings")}
+          </button>
+        </div>
+      )}
+
+      <button
+        type="button"
+        onClick={() => onOpenSettings?.("llm-defaults")}
+        className="mb-3 flex items-center gap-1.5 font-mono text-[10px] font-medium uppercase tracking-wider text-zinc-500 transition-colors hover:text-volt-400"
+      >
+        <Icon name="sliders" className="h-3 w-3" />
+        {t("configureAllInSettings")}
+      </button>
 
       <button
         className="flex w-full items-center justify-center gap-2 rounded-xl bg-volt-400 py-2.5 font-semibold text-ink-950 transition-all hover:bg-volt-300 active:scale-[0.99] disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-zinc-500 disabled:shadow-none"
@@ -972,6 +1015,8 @@ function MainApp({ onLanguageChange }: { onLanguageChange: (lang: Language) => v
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [selectedSession, setSelectedSession] = useState<SessionRow | null>(null);
   const [showReindex, setShowReindex] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<"api-keys" | "llm-defaults" | "general">("api-keys");
   // Interview plan state
   const [jobDescription, setJobDescription] = useState("");
   const [interviewPlan, setInterviewPlan] = useState<PlannedQuestion[] | null>(null);
@@ -1117,9 +1162,14 @@ function MainApp({ onLanguageChange }: { onLanguageChange: (lang: Language) => v
     { value: "shadow", icon: "eye", descKey: "shadowDesc" },
   ];
 
+  const handleOpenSettings = useCallback((tab?: "api-keys" | "llm-defaults" | "general") => {
+    if (tab) setSettingsTab(tab);
+    setShowSettings(true);
+  }, []);
+
   return (
     <div className="flex min-h-screen flex-col text-white">
-      <Header onLanguageChange={onLanguageChange} />
+      <Header onLanguageChange={onLanguageChange} onOpenSettings={() => handleOpenSettings()} />
 
       {panicking && (
         <div className="flex items-center justify-center gap-2 border-b border-signal-amber/30 bg-signal-amber/10 px-4 py-2 text-sm font-medium text-signal-amber animate-fade-in" role="alert">
@@ -1291,6 +1341,7 @@ function MainApp({ onLanguageChange }: { onLanguageChange: (lang: Language) => v
                 setJobDescription={setJobDescription}
                 interviewPlan={interviewPlan}
                 setInterviewPlan={setInterviewPlan}
+                onOpenSettings={handleOpenSettings}
               />
             )}
 
@@ -1374,7 +1425,7 @@ function MainApp({ onLanguageChange }: { onLanguageChange: (lang: Language) => v
           {/* ============ Right rail ============ */}
           <div className="space-y-6">
             {selectedSession && (
-              <PostCallPanel session={selectedSession} />
+              <PostCallPanel session={selectedSession} onOpenSettings={handleOpenSettings} />
             )}
 
             {!running && (
@@ -1389,6 +1440,12 @@ function MainApp({ onLanguageChange }: { onLanguageChange: (lang: Language) => v
       </main>
 
       {showReindex && <ReindexPanel onClose={() => setShowReindex(false)} />}
+      {showSettings && (
+        <SettingsDialog
+          onClose={() => setShowSettings(false)}
+          initialTab={settingsTab}
+        />
+      )}
     </div>
   );
 }
