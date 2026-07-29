@@ -34,6 +34,18 @@ export function usePersistedSetting(key: string, defaultValue = "") {
   return [value, setValue] as const;
 }
 
+export function useLLMSettings(featureKey: string, providerHardDefault = "openai") {
+  const [featureProvider, setFeatureProvider] = usePersistedSetting(`${featureKey}_provider`);
+  const [featureModel, setFeatureModel] = usePersistedSetting(`${featureKey}_model`);
+  const [globalProvider] = usePersistedSetting("default_provider", providerHardDefault);
+  const [globalModel] = usePersistedSetting("default_model");
+
+  const provider = featureProvider || globalProvider;
+  const model = featureModel || globalModel;
+
+  return { provider, setProvider: setFeatureProvider, model, setModel: setFeatureModel };
+}
+
 export function useTauriEvent<T>(
   event: string,
   handler: (payload: T) => void,
