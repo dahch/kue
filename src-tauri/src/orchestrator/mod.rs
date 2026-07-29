@@ -256,7 +256,9 @@ fn try_llm_hint(
     // Try providers in order: hint_provider → analysis provider → any with a key
     const CANDIDATES: &[&str] = &["openai", "anthropic", "gemini", "openrouter", "deepseek", "ollama"];
 
-    let configured = get_setting_or(app_handle, "hint_provider", "openai");
+    let hint_provider_raw = get_setting_or(app_handle, "hint_provider", "");
+    let default_provider = get_setting_or(app_handle, "default_provider", "openai");
+    let configured = if hint_provider_raw.is_empty() { default_provider.clone() } else { hint_provider_raw };
     let analysis_provider = get_setting_or(app_handle, "provider", "openai");
 
     // Build a priority list: configured hint provider first, then analysis
@@ -271,7 +273,15 @@ fn try_llm_hint(
         }
     }
 
-    let hint_model = get_setting_or(app_handle, "hint_model", "gpt-4o-mini");
+    let hint_model_raw = get_setting_or(app_handle, "hint_model", "");
+    let default_model = get_setting_or(app_handle, "default_model", "");
+    let hint_model = if !hint_model_raw.is_empty() {
+        hint_model_raw
+    } else if !default_model.is_empty() {
+        default_model
+    } else {
+        "gpt-4o-mini".to_string()
+    };
 
     // Find the first provider with a saved API key
     let (provider, api_key) = order.iter().find_map(|p| {
