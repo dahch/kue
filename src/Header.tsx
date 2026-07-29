@@ -3,6 +3,7 @@ import { Icon } from "./Icon";
 
 interface HeaderProps {
   onLanguageChange?: (lang: Language) => void;
+  onOpenSettings?: () => void;
 }
 
 function Logo() {
@@ -29,13 +30,21 @@ function Logo() {
   );
 }
 
-export default function Header({ onLanguageChange }: HeaderProps) {
+export default function Header({ onLanguageChange, onOpenSettings }: HeaderProps) {
   const language = useLanguage();
 
   return (
     <header className="sticky top-0 z-40 flex w-full items-center justify-between border-b border-white/5 bg-ink-950/75 px-6 py-3.5 backdrop-blur-xl">
       <Logo />
       <div className="flex items-center gap-2.5">
+        <button
+          type="button"
+          aria-label={t("settings")}
+          onClick={onOpenSettings}
+          className="flex h-8 w-8 items-center justify-center rounded-lg text-zinc-500 transition-colors hover:bg-white/5 hover:text-white"
+        >
+          <Icon name="sliders" className="h-4 w-4" />
+        </button>
         <Icon name="globe" className="h-4 w-4 text-zinc-500" />
         <div
           role="group"
