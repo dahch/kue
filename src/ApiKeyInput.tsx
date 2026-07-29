@@ -7,10 +7,14 @@ export default function ApiKeyInput({
   provider,
   hasSavedKey,
   onKeySaved,
+  onKeyDeleted,
+  showDelete,
 }: {
   provider: string;
   hasSavedKey: boolean;
   onKeySaved: () => void;
+  onKeyDeleted?: () => void;
+  showDelete?: boolean;
 }) {
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false);
@@ -28,18 +32,42 @@ export default function ApiKeyInput({
     }
   }, [provider, apiKey, onKeySaved]);
 
+  const handleDelete = useCallback(async () => {
+    if (!window.confirm(`${t("deleteKeyConfirm")} (${provider})`)) return;
+    try {
+      await invoke("delete_key", { provider });
+      onKeyDeleted?.();
+    } catch (e) {
+      setError(`${t("error")}: ${e}`);
+    }
+  }, [provider, onKeyDeleted]);
+
   return (
     <div className="mb-4">
       <div className="mb-1.5 flex items-center justify-between">
         <label htmlFor={`api-key-${provider}`} className="block font-mono text-[10px] font-medium uppercase tracking-[0.14em] text-zinc-500">
           {t("apiKey")} ({provider})
         </label>
-        {hasSavedKey && (
-          <span className="flex items-center gap-1 font-mono text-[10px] font-medium uppercase tracking-wider text-volt-400">
-            <Icon name="check" className="h-3 w-3" />
-            {t("apiKeySaved")}
-          </span>
-        )}
+        <div className="flex items-center gap-2">
+          {hasSavedKey && (
+            <>
+              <span className="flex items-center gap-1 font-mono text-[10px] font-medium uppercase tracking-wider text-volt-400">
+                <Icon name="check" className="h-3 w-3" />
+                {t("apiKeySaved")}
+              </span>
+              {showDelete && (
+                <button
+                  type="button"
+                  onClick={handleDelete}
+                  className="flex items-center gap-1 font-mono text-[10px] font-medium uppercase tracking-wider text-signal-red/70 transition-colors hover:text-signal-red"
+                >
+                  <Icon name="x" className="h-3 w-3" />
+                  {t("delete")}
+                </button>
+              )}
+            </>
+          )}
+        </div>
       </div>
       <div className="flex gap-2">
         <div className="relative flex-1">
