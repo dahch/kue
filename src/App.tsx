@@ -856,9 +856,17 @@ function PlanGenerator({
 
 /* ---------- Live AI interview ---------- */
 
-function LiveInterview() {
+function LiveInterview({ plan }: { plan: PlannedQuestion[] | null }) {
   const [aiQuestion, setAiQuestion] = useState<{ index: number; total: number; text: string } | null>(null);
   const [aiStatus, setAiStatus] = useState<"speaking" | "listening" | "finished" | null>(null);
+
+  // The runner may be slow or stall before emitting interview-question. Seed
+  // the display from the local plan so the buttons are always usable.
+  const resolvedQuestion = aiQuestion ?? (plan && plan.length > 0 ? {
+    index: 0,
+    total: plan.length,
+    text: plan[0].text,
+  } : null);
 
   useTauriEvent<{ question_index: number; total_questions: number; text: string }>(
     "interview-question",
@@ -879,7 +887,28 @@ function LiveInterview() {
     setAiStatus("finished");
   });
 
-  if (!aiQuestion) return null;
+  const handleNext = useCallback(async () => {
+    // Trust the runner as the single source of truth: it emits
+    // `interview-question` for the next index and we update from that event.
+    // Only fall back to local navigation if the runner is unreachable (e.g.
+    // disconnected), so the two sources can't drift apart.
+    try {
+      await invoke("skip_ai_question");
+    } catch (e) {
+      console.warn("Failed to advance question on runner; using local plan:", e);
+      if (plan && plan.length > 0) {
+        setAiQuestion((prev) => {
+          const cur = prev?.index ?? 0;
+          if (cur + 1 >= plan.length) return prev; // last question — stay
+          return { index: cur + 1, total: plan.length, text: plan[cur + 1].text };
+        });
+      }
+    }
+  }, [plan]);
+
+  if (!resolvedQuestion) return null;
+
+  const isLast = resolvedQuestion.index + 1 >= resolvedQuestion.total;
 
   return (
     <section className="rounded-2xl border border-volt-400/30 bg-volt-400/[0.04] p-6 shadow-volt animate-fade-up">
@@ -889,18 +918,18 @@ function LiveInterview() {
           {t("aiInterview")}
         </h2>
         <span className="font-mono text-[11px] tabular-nums text-zinc-400">
-          {t("question")} {aiQuestion.index + 1}/{aiQuestion.total}
+          {t("question")} {resolvedQuestion.index + 1}/{resolvedQuestion.total}
         </span>
       </div>
 
       <div aria-hidden="true" className="mb-4 h-1 w-full overflow-hidden rounded-full bg-ink-700">
         <div
           className="h-full rounded-full bg-volt-400 transition-all duration-500"
-          style={{ width: `${((aiQuestion.index + 1) / aiQuestion.total) * 100}%` }}
+          style={{ width: `${((resolvedQuestion.index + 1) / resolvedQuestion.total) * 100}%` }}
         />
       </div>
 
-      <p className="text-lg font-medium leading-relaxed text-white">{aiQuestion.text}</p>
+      <p className="text-lg font-medium leading-relaxed text-white">{resolvedQuestion.text}</p>
 
       <p className="mt-3 flex items-center gap-2 text-xs text-zinc-400">
         {aiStatus === "listening" && <Equalizer />}
@@ -910,13 +939,12 @@ function LiveInterview() {
       {aiStatus !== "finished" && (
         <div className="mt-4 flex gap-2">
           <GhostButton
-            icon="skip"
+            icon="next"
+            disabled={isLast || aiStatus === null}
             className="px-3 py-1.5 text-xs"
-            onClick={async () => {
-              try { await invoke("skip_ai_question"); } catch { console.warn("Failed to skip question"); }
-            }}
+            onClick={handleNext}
           >
-            {t("skipQuestion")}
+            {t("nextQuestion")}
           </GhostButton>
           <GhostButton
             icon="stop"
@@ -1010,6 +1038,8 @@ function MainApp({ onLanguageChange }: { onLanguageChange: (lang: Language) => v
   const [stopping, setStopping] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
   const [lastHint, setLastHint] = useState("");
+  const [hintVisible, setHintVisible] = useState(false);
+  const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [panicking, setPanicking] = useState(false);
   const [panicUntil, setPanicUntil] = useState(0);
   const [sessions, setSessions] = useState<SessionRow[]>([]);
@@ -1033,11 +1063,16 @@ function MainApp({ onLanguageChange }: { onLanguageChange: (lang: Language) => v
 
   useTauriEvent<HintPayload>("new-hint", (payload) => {
     setLastHint(payload.text);
+    setHintVisible(true);
+    if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
+    hintTimerRef.current = setTimeout(() => setHintVisible(false), 8000);
   });
 
   useTauriEvent<PanicPayload>("panic-mode", (payload) => {
     setPanicking(true);
     setLastHint("");
+    setHintVisible(false);
+    if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
     setPanicUntil(Date.now() + payload.until_secs * 1000);
     if (panicTimerRef.current) clearTimeout(panicTimerRef.current);
     const ms = payload.until_secs * 1000;
@@ -1073,6 +1108,15 @@ function MainApp({ onLanguageChange }: { onLanguageChange: (lang: Language) => v
     return () => clearInterval(id);
   }, [running, startedAt]);
 
+  // Clean up hint/panic timers on unmount so a stale callback can't fire
+  // setState after the component is gone.
+  useEffect(() => {
+    return () => {
+      if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
+      if (panicTimerRef.current) clearTimeout(panicTimerRef.current);
+    };
+  }, []);
+
   const refreshSessions = useCallback(async () => {
     try {
       const list: SessionRow[] = await invoke("get_sessions");
@@ -1097,6 +1141,8 @@ function MainApp({ onLanguageChange }: { onLanguageChange: (lang: Language) => v
       });
       setTranscript([]);
       setLastHint("");
+      setHintVisible(false);
+      if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
       setRunning(true);
       setStartedAt(Date.now());
       setElapsed(0);
@@ -1122,6 +1168,7 @@ function MainApp({ onLanguageChange }: { onLanguageChange: (lang: Language) => v
   const handleStop = useCallback(async () => {
     setStopping(true);
     try {
+      try { await invoke("stop_ai_interview"); } catch (e) { console.warn("Failed to stop interview:", e); }
       await invoke("stop_session");
       setRunning(false);
       setStartedAt(null);
@@ -1332,7 +1379,7 @@ function MainApp({ onLanguageChange }: { onLanguageChange: (lang: Language) => v
             </section>
 
             {/* ============ Live AI question ============ */}
-            {running && <LiveInterview />}
+            {running && mode === "practice" && <LiveInterview plan={interviewPlan} />}
 
             {/* ============ Plan generator ============ */}
             {!running && mode === "practice" && (
@@ -1386,40 +1433,34 @@ function MainApp({ onLanguageChange }: { onLanguageChange: (lang: Language) => v
               </div>
             </section>
 
-            {/* ============ Hint ============ */}
-            <section
-              className={`rounded-2xl border p-6 shadow-card transition-colors duration-500 animate-fade-up ${
-                panicking
-                  ? "border-signal-amber/25 bg-ink-900"
-                  : lastHint
-                    ? "border-volt-400/30 bg-gradient-to-br from-volt-400/[0.07] to-ink-900"
-                    : "border-white/5 bg-ink-900"
-              }`}
-            >
-              <div className="mb-3 flex items-center gap-2.5">
-                <span
-                  className={`flex h-8 w-8 items-center justify-center rounded-lg transition-colors ${
-                    panicking
-                      ? "bg-signal-amber/15 text-signal-amber"
-                      : "bg-volt-400/10 text-volt-400"
-                  }`}
-                >
-                  <Icon name={panicking ? "mute" : "bolt"} className="h-4 w-4" />
-                </span>
-                <h3 className="font-mono text-[11px] font-medium uppercase tracking-[0.18em] text-zinc-400">
-                  {t("hint")}
-                </h3>
+            {/* ============ Hint (floating toast) ============ */}
+            {hintVisible && lastHint && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="pointer-events-none fixed left-1/2 top-4 z-50 w-full max-w-xl -translate-x-1/2 px-4 animate-fade-down"
+              >
+                <div className="pointer-events-auto flex items-start gap-3 rounded-xl border border-volt-400/40 bg-ink-900/95 p-4 shadow-volt backdrop-blur-sm">
+                  <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-volt-400/15 text-volt-400">
+                    <Icon name="bolt" className="h-4 w-4" />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <p className="font-mono text-[10px] font-medium uppercase tracking-[0.18em] text-volt-400">
+                      {t("hint")}
+                    </p>
+                    <p className="mt-0.5 text-sm leading-relaxed text-white">{lastHint}</p>
+                  </div>
+                  <button
+                    type="button"
+                    aria-label={t("close")}
+                    onClick={() => setHintVisible(false)}
+                    className="mt-0.5 rounded-md p-1 text-zinc-400 transition-colors hover:bg-white/10 hover:text-white"
+                  >
+                    <Icon name="x" className="h-4 w-4" />
+                  </button>
+                </div>
               </div>
-              {panicking ? (
-                <p className="text-sm text-signal-amber">{t("panicBanner")}</p>
-              ) : lastHint ? (
-                <p key={lastHint} className="text-base font-medium leading-relaxed text-white animate-fade-up">
-                  {lastHint}
-                </p>
-              ) : (
-                <p className="text-sm text-zinc-500">{t("noHint")}</p>
-              )}
-            </section>
+            )}
           </div>
 
           {/* ============ Right rail ============ */}

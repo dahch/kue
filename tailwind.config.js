@@ -41,6 +41,10 @@ export default {
           from: { opacity: "0", transform: "translateY(8px)" },
           to: { opacity: "1", transform: "translateY(0)" },
         },
+        "fade-down": {
+          from: { opacity: "0", transform: "translateY(-12px)" },
+          to: { opacity: "1", transform: "translateY(0)" },
+        },
         "fade-in": {
           from: { opacity: "0" },
           to: { opacity: "1" },
@@ -68,6 +72,7 @@ export default {
       },
       animation: {
         "fade-up": "fade-up 0.35s cubic-bezier(0.22, 1, 0.36, 1) both",
+        "fade-down": "fade-down 0.3s cubic-bezier(0.22, 1, 0.36, 1) both",
         "fade-in": "fade-in 0.3s ease both",
         "scale-in": "scale-in 0.25s cubic-bezier(0.22, 1, 0.36, 1) both",
         "pulse-dot": "pulse-dot 1.6s ease-in-out infinite",

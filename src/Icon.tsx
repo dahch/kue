@@ -20,6 +20,7 @@ export type IconName =
   | "key"
   | "mic"
   | "mute"
+  | "next"
   | "play"
   | "refresh"
   | "shield"
@@ -88,6 +89,7 @@ const PATHS: Record<IconName, string[]> = {
     "m16 9.5 5 5",
     "m21 9.5-5 5",
   ],
+  next: ["M4.5 5v14l9-7-9-7Z", "M19.5 5v14"],
   play: ["M7.5 4.8v14.4L20 12 7.5 4.8Z"],
   refresh: [
     "M21 12a9 9 0 1 1-2.6-6.3",
