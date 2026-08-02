@@ -414,14 +414,14 @@ Key constraints:
 
 **Decision:** Build a custom i18n system (`src/i18n.ts`) with:
 
-1. **Translations as a plain object:** `{ en: { appTitle: "Kue", ... }, es: { appTitle: "Kue", ... } }` — 142 keys per language (284 total entries), with `as const` for type safety.
+1. **Translations as a plain object:** `{ en: { appTitle: "Kue", ... }, es: { appTitle: "Kue", ... } }` — 141 keys per language (282 total entries), with `as const` for type safety.
 2. **`t(key, vars?)` function:** Synchronous lookup from the current language object. Template variables replaced via simple `String.replace()`.
 3. **`useLanguage()` hook:** Uses React 18's `useSyncExternalStore` to subscribe to language changes. No context provider needed — any component calling `useLanguage()` or `t()` re-renders on language change.
 4. **`initLanguage()` for synchronous restore:** Reads from `localStorage` before the first React render, avoiding a flash of the wrong language.
 5. **`loadLanguageFromBackend()` for async persistence:** Reads `settings.language` from the Rust backend and updates both localStorage and the in-memory state.
 6. **`saveLanguage()` for persistence:** Writes to localStorage (sync) and backend `set_setting` (async fire-and-forget).
 7. **Language switcher in `Header.tsx`:** Two toggle buttons (ES/EN) with `aria-pressed` and keyboard accessibility. Calls `onLanguageChange` which triggers `setLanguage()` + `saveLanguage()`.
-8. **142 keys per language:** The translations object holds 142 keys per language (284 total entries), covering all UI text, onboarding strings, interview statuses, settings labels, and validation messages.
+8. **141 keys per language:** The translations object holds 141 keys per language (282 total entries), covering all UI text, onboarding strings, interview statuses, settings labels, and validation messages.
 
 **Consequences:**
 - *(Positive)* Zero bundle size impact from i18n libraries — the translations object is ~25 KB gzipped.
@@ -429,7 +429,7 @@ Key constraints:
 - *(Positive)* Works in both windows (main and overlay) without a shared context provider.
 - *(Positive)* Type-safe — `t()` only accepts valid keys from the `Translations` type.
 - *(Negative)* No ICU plural rules — the `{{count}}` interpolation is manual and language-agnostic (works for EN/ES but would not work for languages with complex pluralisation like Arabic or Russian).
-- *(Negative)* No lazy loading — all 142 keys per language are loaded at startup. Acceptable for v1 with only two languages.
+- *(Negative)* No lazy loading — all 141 keys per language are loaded at startup. Acceptable for v1 with only two languages.
 - *(Negative)* No right-to-left (RTL) support — would need additional work for Arabic/Hebrew if added later.
 
 **Alternatives considered:**
@@ -466,7 +466,7 @@ The `useLLMSettings(featureKey, providerHardDefault)` custom hook (`hooks.ts`) e
 - *(Positive)* The `SettingsDialog` provides a single, discoverable UI for all LLM preferences — no more scattered provider dropdowns.
 - *(Positive)* The header settings button (`Header.tsx`) gives quick access, and the `PostCallPanel` includes a "Configure all in Settings" link pointing to the LLM Defaults tab.
 - *(Positive)* The hook pattern keeps component code clean — each feature just calls `useLLMSettings("analyze")` and gets the resolved provider/model.
-- *(Negative)* Six new settings keys per user (`default_provider`, `default_model`, `hint_provider`, `hint_model`, `analyze_provider`, `analyze_model`, `plan_provider`, `plan_model`) — manageable at this scale.
+- *(Negative)* Eight new settings keys per user (`default_provider`, `default_model`, `hint_provider`, `hint_model`, `analyze_provider`, `analyze_model`, `plan_provider`, `plan_model`) — manageable at this scale.
 - *(Negative)* The global default "openai" may not be ideal for users who prefer Anthropic — accepted as a reasonable starting default.
 - *(Negative)* The `useLLMSettings` hook fires independent backend reads for each setting key, adding ~4 IPC round-trips per feature on mount. Acceptable because it happens once at component mount, not in a hot path.
 

@@ -41,7 +41,7 @@ npm run test:watch    # watch mode
 # Rust tests (database — all logic implemented)
 npm run test:rust:db
 
-# Rust tests (all modules, ~530 tests)
+# Rust tests (all modules, ~549 tests)
 npm run test:rust
 
 # Rust coverage (requires cargo-tarpaulin)
@@ -62,7 +62,7 @@ npm run coverage:rust:full
 | `npm run test` | Frontend unit tests (Vitest) |
 | `npm run test:watch` | Frontend tests in watch mode |
 | `npm run test:rust:db` | Tests for the database module only |
-| `npm run test:rust` | Tests for all Rust modules (~530 tests) |
+| `npm run test:rust` | Tests for all Rust modules (~549 tests) |
 | `npm run coverage:rust` | Runs Rust tests (alias for `test:rust`) |
 | `npm run coverage:rust:check` | Checks availability of coverage tools |
 | `npm run coverage:rust:db` | Coverage for the database module (tarpaulin) |
@@ -173,9 +173,9 @@ kue/
 │   ├── main.tsx             # Entry point
 │   ├── index.css            # Tailwind directives + custom animations
 │   ├── Header.tsx           # Sticky header with Kue logo, settings button, i18n language switcher
-│   ├── i18n.ts              # i18n system: 142 bilingual EN/ES keys, useLanguage hook, t() function,
+│   ├── i18n.ts              # i18n system: 141 bilingual EN/ES keys, useLanguage hook, t() function,
 │   │                        #   persistence via localStorage + backend settings table
-│   ├── Icon.tsx             # Inline SVG icon set (24 icons, 24×24 grid, aria-hidden)
+│   ├── Icon.tsx             # Inline SVG icon set (25 icons, 24×24 grid, aria-hidden)
 │   ├── ui.tsx               # Shared UI primitives: Spinner, SectionLabel, Equalizer, StyledSelect
 │   ├── hooks.ts             # Custom hooks: usePersistedSetting (get+set via backend),
 │   │                        #   useTauriEvent (auto-cleanup listener), useLLMSettings (per-feature
@@ -199,7 +199,7 @@ kue/
 ├── src-tauri/               # Rust backend (Tauri)
 │   ├── src/
 │   │   ├── main.rs          # Entry point
-│   │   ├── lib.rs           # Tauri builder + setup (25 Tauri commands registered)
+│   │   ├── lib.rs           # Tauri builder + setup (29 Tauri commands registered)
 │   │   ├── types.rs         # TranscriptLine, Speaker (STT → classifier contract)
 │   │   ├── db/
 │   │   │   └── mod.rs       # Schema, migrations, sqlite-vec, get_setting/set_setting,
@@ -228,7 +228,7 @@ kue/
 │   │   │   ├── embeddings.rs # BERT model (snowflake-arctic-embed-s, CPU+Accelerate)
 │   │   │   └── indexer.rs   # Ingestion, chunking, indexing, vector search, PDF extraction
 │   │   ├── analyze.rs       # Post-call BYOK analysis (Anthropic/OpenAI/Gemini/...)
-│   │   ├── keys.rs          # Keychain API key storage (save_key/has_key Tauri commands)
+│   │   ├── keys.rs          # Keychain API key storage (save_key/has_key/delete_key/list_saved_keys cmds)
 │   │   ├── onboarding.rs    # First-run wizard (screen permission, model load, folder index)
 │   │   ├── logging.rs       # File logger with rotation (keeps last 5 files)
 │   │   ├── llm/

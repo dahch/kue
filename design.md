@@ -18,7 +18,7 @@ graph TD
         SL[SessionList<br/>session history sidebar]
     end
 
-    subgraph "Tauri Bridge (IPC — 25 commands)"
+    subgraph "Tauri Bridge (IPC — 29 commands)"
         B1[get_db_status]
         B2[start_session / stop_session / panic_mode]
         B3[index_folder_cmd / search_context]
@@ -128,10 +128,9 @@ graph TD
 
     A -->|invoke| B1
     A -->|invoke| B2
-    A -->|invoke| B2B
-    A -->|invoke| B2C
     A -->|invoke| B3
     A -->|invoke| B4
+    A -->|invoke| B5
     A -->|invoke| B6
     A -->|invoke| B7
     A -->|invoke| B8
@@ -142,18 +141,17 @@ graph TD
     A -->|invoke| B13
     B1 --> C
     B2 --> F
-    B2B --> F
-    B2C --> PS
+    B2 --> PS
     B3 --> T
     B4 --> T
     B6 --> G
-    B7 --> G
-    B8 --> BT
-    B9 --> KEYS
-    B10 --> KEYS
-    B11 --> AN
-    B12 --> G
-    B13 --> G
+    B7 --> KEYS
+    B8 --> G
+    B9 --> AN
+    B10 --> Q1
+    B11 --> G
+    B12 --> EM
+    B13 --> PL
     C --> G
     D --> G
     E --> C
@@ -201,8 +199,8 @@ graph TD
     S --> T
     T --> G
 
-    A -->|invoke| B13
     A -->|invoke| B14
+    B5 --> BT
     B13 --> PL
     B14 --> RU
     RU -->|tick questions| TTS
@@ -231,9 +229,9 @@ graph TD
 
 **AI Interview (Practice mode):** The `PlanGenerator` component takes a job description and calls `generate_interview_plan` (BYOK LLM) → returns a structured question plan. When the user starts the session, `start_ai_interview` launches the `InterviewRunner` (registered as Tauri state), which iterates through planned questions: (1) emits `interview-question` event → frontend `LiveInterview` renders it with progress bar + skip/stop controls, (2) calls `tts::speak()` via macOS `say` (Samantha voice), (3) emits `interview-status: "speaking"` / `"listening"` / `"finished"`, (4) on next question, loops. Commands: `skip_ai_question` / `stop_ai_interview`.
 
-**i18n:** `src/i18n.ts` holds 142 bilingual EN/ES translation keys (284 total entries). `useLanguage()` hook via `useSyncExternalStore`. Language switcher in `Header.tsx`. Persisted via localStorage + backend `settings.language`. `t()` supports `{{var}}` interpolation.
+**i18n:** `src/i18n.ts` holds 141 bilingual EN/ES translation keys (282 total entries). `useLanguage()` hook via `useSyncExternalStore`. Language switcher in `Header.tsx`. Persisted via localStorage + backend `settings.language`. `t()` supports `{{var}}` interpolation.
 
-**New frontend files:** `Header.tsx`, `i18n.ts`, `Icon.tsx` (24 icons), `ui.tsx` (primitives), `hooks.ts` (custom hooks: `usePersistedSetting`, `useLLMSettings`, `useTauriEvent`), `validation.ts` (helpers), `constants.ts` (Provider list), `ApiKeyInput.tsx`, `SettingsDialog.tsx` (3-tab settings), `types.ts`.
+**New frontend files:** `Header.tsx`, `i18n.ts`, `Icon.tsx` (25 icons), `ui.tsx` (primitives), `hooks.ts` (custom hooks: `usePersistedSetting`, `useLLMSettings`, `useTauriEvent`), `validation.ts` (helpers), `constants.ts` (Provider list), `ApiKeyInput.tsx`, `SettingsDialog.tsx` (3-tab settings), `types.ts`.
 
 ---
 
@@ -242,9 +240,9 @@ graph TD
 ### 2.1 Frontend (`src/`)
 
 - **`main.tsx`** — Entry point React 18, mounts `<App />` on `#root`.
-- **`i18n.ts`** — i18n system with 142 bilingual EN/ES translation keys (284 total entries). Provides `t()` template function (with `{{var}}` interpolation), `useLanguage()` hook (via `useSyncExternalStore`), `setLanguage()` / `getLanguage()`, `initLanguage()` (sync restore from localStorage), `loadLanguageFromBackend()` (async from `settings` table), `saveLanguage()`, `speakerLabel()`, `formatLines()`, `Language` type.
+- **`i18n.ts`** — i18n system with 141 bilingual EN/ES translation keys (282 total entries). Provides `t()` template function (with `{{var}}` interpolation), `useLanguage()` hook (via `useSyncExternalStore`), `setLanguage()` / `getLanguage()`, `initLanguage()` (sync restore from localStorage), `loadLanguageFromBackend()` (async from `settings` table), `saveLanguage()`, `speakerLabel()`, `formatLines()`, `Language` type.
 - **`Header.tsx`** — Sticky header with Kue logo (SVG), settings button (gear icon, calls `onOpenSettings`), and language switcher (ES/EN toggle pills, role="group", aria-pressed). Uses `useLanguage()` hook and calls `onLanguageChange` callback.
-- **`Icon.tsx`** — 30 inline SVG icons (24×24 grid, aria-hidden). Exports `Icon` component + `IconName` type union for type-safe usage.
+- **`Icon.tsx`** — 25 inline SVG icons (24×24 grid, aria-hidden). Exports `Icon` component + `IconName` type union for type-safe usage.
 - **`ui.tsx`** — Shared UI primitives: `Spinner` (animated ring), `SectionLabel` (uppercase label with accent bar), `Equalizer` (animated live bars), `StyledSelect` (accessible listbox with arrow-key navigation, value persistence).
 - **`hooks.ts`** — `usePersistedSetting(key, default)` reads from backend `get_setting` on mount, writes to `set_setting` on value change. `useTauriEvent(event, handler)` auto-cleanup listener wrapper. `useLLMSettings(featureKey, providerHardDefault)` provides per-feature LLM provider/model settings with global default fallback — reads/writes `{featureKey}_provider`, `{featureKey}_model`, `default_provider`, and `default_model` settings.
 - **`constants.ts`** — `ProviderOption` interface and `PROVIDERS` constant array with 6 entries: OpenAI, Anthropic, Gemini, OpenRouter, DeepSeek, Ollama.
@@ -252,7 +250,7 @@ graph TD
 - **`validation.ts`** — `sanitizeError()` maps known error prefixes to i18n-friendly messages, truncates at 300 chars. `isValidFolderPath()` checks empty, `..`, invalid chars, absolute path. `formatIndexResult()` formats the `index_folder_cmd` result.
 - **`ApiKeyInput.tsx`** — Per-provider API key input component. Checks `has_key` on mount, provides a text input + save button for the selected provider. Optionally shows delete button (`showDelete` prop) and supports `onKeySaved`/`onKeyDeleted` callbacks.
 - **`SettingsDialog.tsx`** — Settings dialog with 3 tabs: (1) **API Keys** — per-provider key management using `ApiKeyInput` + `list_saved_keys`/`delete_key` commands, (2) **LLM Defaults** — global provider/model defaults with per-feature overrides for hints/analyze/plan, (3) **General** — language switcher. Accessed via the settings gear button in `Header.tsx`. Passes `onOpenSettings` callback from `MainApp`.
-- **`App.tsx`** (1453 lines) — App router that detects the window label via `getCurrentWebviewWindow()`. If `"overlay"`, renders `<Overlay />`; if Moonshine not provisioned, renders `<ProvisioningProgress />`; if first run, renders `<Onboarding />`; otherwise renders `<MainApp />`. Also initialises i18n (`initLanguage()`, `loadLanguageFromBackend()`).
+- **`App.tsx`** (1551 lines) — App router that detects the window label via `getCurrentWebviewWindow()`. If `"overlay"`, renders `<Overlay />`; if Moonshine not provisioned, renders `<ProvisioningProgress />`; if first run, renders `<Onboarding />`; otherwise renders `<MainApp />`. Also initialises i18n (`initLanguage()`, `loadLanguageFromBackend()`).
 - **`ProvisioningProgress.tsx`** — First-launch download progress UI. On mount, checks `is_moonshine_provisioned`; if not provisioned, shows a progress bar, stage label, file counter, error display, and retry button. Listens for `moonshine-download-progress`, `moonshine-provision-error`, and `moonshine-provisioned` events. Calls `onProvisioned` callback on completion.
 - **`Onboarding.tsx`** — 4-step first-run wizard: (1) screen recording permission, (2) embedding model loading, (3) API key config, (4) folder indexing. On completion, `mark_onboarding_done` sets `settings.first_run = 'done'`.
 - **`Overlay.tsx`** — Hint display component for the overlay window. Listens for `new-hint` (3s auto-dismiss), `session-started`/`session-stopped` (auto-show/hide), `panic-mode` (mute indicator).
@@ -277,7 +275,7 @@ graph TD
 
 ### 2.2 Tauri Shell (`lib.rs`)
 
-File `src-tauri/src/lib.rs` (149 lines):
+File `src-tauri/src/lib.rs` (147 lines):
 
 ```rust
 use std::collections::HashSet;
@@ -457,13 +455,13 @@ pub fn run() {
 
 ### 2.3 Database Module (`db/mod.rs`)
 
-The substantial module of the app (~1192 lines, 34 tests). See §3 for schema details and §4 for tests.
+The substantial module of the app (~1258 lines, 34 tests). See §3 for schema details and §4 for tests.
 
 ### 2.4 Audio Module (`audio/`)
 
 #### `audio/capture.rs`
 
-Substantial module (~1638 lines, 72 tests) that implements dual audio capture:
+Substantial module (~2352 lines, 54 tests) that implements dual audio capture:
 
 - **Microphone (Channel A):** via `cpal`, supports i16 and f32 sample formats with automatic conversion to i16.
 - **Loopback (Channel B):** via `screencapturekit-rs` (ScreenCaptureKit), captures the system output audio (interviewer's voice). `excludes_current_process_audio: true` to avoid echo.
@@ -474,7 +472,7 @@ Substantial module (~1638 lines, 72 tests) that implements dual audio capture:
 
 #### `audio/mic_vad.rs`
 
-Moderate module (~365 lines, 18 tests) that wraps `SimpleVAD` for Channel A (mic):
+Moderate module (~363 lines, 18 tests) that wraps `SimpleVAD` for Channel A (mic):
 
 - **`MicVadState`** — Thread-safe struct wrapping an energy-based VAD (`SimpleVAD` from the STT module). Tracks silence→speech transition timestamps on the mic channel.
 - **`feed_audio(samples)`** — Feeds i16 mic samples and updates the VAD state. Must be called from the mic capture thread.
@@ -484,22 +482,22 @@ Moderate module (~365 lines, 18 tests) that wraps `SimpleVAD` for Channel A (mic
 
 ### 2.5 STT + Classifier Module (`stt/`, `classifier/`)
 
-**STT Module (`stt/`, ~1400 non-test lines, ~138 tests including cli/vad/pipeline/ffi/batch/provisioning)** — implements real-time transcription of Channel B and batch transcription of Channel A, integrated into the app lifecycle via `start_session`/`stop_session`:
+**STT Module (`stt/`, ~4646 lines total, ~156 tests including cli/vad/pipeline/ffi/batch/provisioning)** — implements real-time transcription of Channel B and batch transcription of Channel A, integrated into the app lifecycle via `start_session`/`stop_session`:
 
 - **`stt/mod.rs`** — `STTEngine` trait with `load()` and `transcribe_audio_chunk()`, `STTConfig`, blanket impl for `Box<T>`. Also exposes `persist_transcript_line()` and `create_engine()` at module level (extracted from `pipeline.rs` and `ffi.rs`).
 - **`stt/ffi.rs`** — `MoonshineFFIEngine`: loads `libmoonshine.dylib` at runtime via `libloading`, declares FFI bindings with `#[repr(C)]` for `CTranscript`, `CTranscriptLine`, etc. Calls the Moonshine streaming API: `create_stream` → `start_stream` → `add_audio_to_stream` → `transcribe_stream`. Frees resources in `Drop`.
 - **`stt/cli.rs`** — `MoonshineCLIEngine` (fallback): writes WAV segments to temp with UUID, invokes `moonshine-voice transcribe --wav-path <file>` as a subprocess, parses the last line of output.
 - **`stt/vad.rs`** — `SimpleVAD`: voice activity detection by RMS energy with configurable threshold, minimum speech duration, and silence timeout.
 - **`stt/pipeline.rs`** — `STTPipeline`: orchestrator that receives audio from loopback via `mpsc::Receiver`, runs VAD + segment buffer + STT engine + calls `classifier::classify()` on each transcribed line + emits `new-transcript` and `question-detected` events + persists in `transcript_lines`.
-- **`stt/batch.rs`** — `transcribe_channel_batch()`: offline batch transcription of a full-channel WAV file. Used post-session to transcribe Channel A (mic, user voice) via Moonshine + SimpleVAD chunking. Reads the entire WAV into memory, segments by VAD, transcribes each segment, persists with `speaker='user'` in `transcript_lines`. Runs in a dedicated `kue-batch-transcribe` thread spawned from `stop_session`'s stop path. Emits `post-call-transcript-ready` event on completion. Handles empty/corrupt WAVs, whitespace-only results, uneven sample lengths, and non-standard sample rates. Includes 27 tests covering edge cases (empty, corrupt, all-silence, short speech, multiple segments, partial chunks, different sample rates, DB timestamp/session-id verification).
+- **`stt/batch.rs`** — `transcribe_channel_batch()`: offline batch transcription of a full-channel WAV file. Used post-session to transcribe Channel A (mic, user voice) via Moonshine + SimpleVAD chunking. Reads the entire WAV into memory, segments by VAD, transcribes each segment, persists with `speaker='user'` in `transcript_lines`. Runs in a dedicated `kue-batch-transcribe` thread spawned from `stop_session`'s stop path. Emits `post-call-transcript-ready` event on completion. Handles empty/corrupt WAVs, whitespace-only results, uneven sample lengths, and non-standard sample rates. Includes 29 tests covering edge cases (empty, corrupt, all-silence, short speech, multiple segments, partial chunks, different sample rates, DB timestamp/session-id verification).
 
 **Lifecycle integration:** When `start_session` is called, the command creates a DB session (in `sessions` table), spawns an `STTPipeline` thread via `spawn_processing_thread()`, and connects it to the loopback audio stream. The pipeline runs until `stop()` is called, at which point the session is finalized, any pending shadow hints are cancelled via `HintCommand::CancelSession`, and temp WAV files are cleaned up (or retained if `retain_audio` is enabled). On stop, Channel A (mic WAV) is sent to a batch transcription thread (`kue-batch-transcribe`) via `spawn_batch_transcription()`, which transcribes the entire Channel A recording offline using `stt::batch::transcribe_channel_batch()` and persists user responses with `speaker='user'`. The `post-call-transcript-ready` event is emitted on completion.
 
-**Moonshine auto-provisioning (`stt/provisioning.rs`, 905 lines, 17 tests):** On first launch, `ensure_moonshine_installed()` spawns a `kue-moonshine-provision` thread that downloads `libmoonshine.dylib` + `libonnxruntime.1.23.2.dylib` (~53 MB) from PyPI and 8 model files (~429 MB) from `download.moonshine.ai`. Progress is reported via `moonshine-download-progress` events (throttled to 250ms). The `is_moonshine_provisioned` command lets the frontend check status; `retry_moonshine_download` retries on failure.
+**Moonshine auto-provisioning (`stt/provisioning.rs`, 942 lines, 32 tests):** On first launch, `ensure_moonshine_installed()` spawns a `kue-moonshine-provision` thread that downloads `libmoonshine.dylib` + `libonnxruntime.1.23.2.dylib` (~53 MB) from PyPI and 8 model files (~429 MB) from `download.moonshine.ai`. Progress is reported via `moonshine-download-progress` events (throttled to 250ms). The `is_moonshine_provisioned` command lets the frontend check status; `retry_moonshine_download` retries on failure.
 
 **Auto-detection:** At runtime, tries FFI first (`libmoonshine.dylib` in `MOONSHINE_LIB_DIR` or standard paths), falls back to CLI if the library is not found. No Whisper — Moonshine is the only option.
 
-**138 tests:** cover `parse_transcript` (null ptr, 0 lines, completed/incomplete, empty text, preferred line), `rms` (8 cases), VAD (24 cases: silence, speech, timeout, reset, minimum duration, empty, threshold, boundary, accumulation, reset during speech, etc.), temp WAV writing (3 cases: data, empty, unique names), FFI (11 cases: transcript parsing, multi-line, C wraparound), CLI (15 cases: subprocess, parse, edge cases), `STTPipeline` (engine selection, load delegation, start/end session, process chunk, flush segment, DB persistence, poisoned mutex, special characters, multiple lines, hint job dispatch), batch transcription (27 cases: empty/corrupt/all-silence WAVs, user/interviewer speaker, multi-segment, silent engine, whitespace-only text, mixed segments, partial chunks, different sample rates, DB timestamp/session-id verification, chunk_size, sample_offset_to_ms, Send trait, trailing segment edge cases), provisioning (17 cases: SHA-256 verification, size validation, ZIP extraction, dylib detection), and `stt/mod.rs` module-level tests (21 cases: engine creation, persist_transcript_line, engine auto-detection).
+**156 tests:** cover `parse_transcript` (null ptr, 0 lines, completed/incomplete, empty text, preferred line), `rms` (8 cases), VAD (24 cases: silence, speech, timeout, reset, minimum duration, empty, threshold, boundary, accumulation, reset during speech, etc.), temp WAV writing (3 cases: data, empty, unique names), FFI (11 cases: transcript parsing, multi-line, C wraparound), CLI (15 cases: subprocess, parse, edge cases), `STTPipeline` (engine selection, load delegation, start/end session, process chunk, flush segment, DB persistence, poisoned mutex, special characters, multiple lines, hint job dispatch), batch transcription (29 cases: empty/corrupt/all-silence WAVs, user/interviewer speaker, multi-segment, silent engine, whitespace-only text, mixed segments, partial chunks, different sample rates, DB timestamp/session-id verification, chunk_size, sample_offset_to_ms, Send trait, trailing segment edge cases), provisioning (32 cases: SHA-256 verification, size validation, ZIP extraction, dylib detection), and `stt/mod.rs` module-level tests (22 cases: engine creation, persist_transcript_line, engine auto-detection).
 
 **Classifier Module (`classifier/mod.rs`, 76 tests)** — heuristics-based question classifier, no LLM:
 
@@ -510,18 +508,18 @@ Moderate module (~365 lines, 18 tests) that wraps `SimpleVAD` for Channel A (mic
 
 ### 2.9 Post-call Analysis Module (`analyze.rs` + `keys.rs`)
 
-**Post-call analysis (`analyze.rs`, ~800 lines, 32 tests)** — implements the `analyze_session` Tauri command for BYOK post-call analysis:
+**Post-call analysis (`analyze.rs`, ~568 lines, 28 tests)** — implements the `analyze_session` Tauri command for BYOK post-call analysis:
 
 - **`analyze::analyze_session`** — Tauri command `fn analyze_session(session_id, provider, model, db, model_state, batch_tracker)`. Guards: rejects if batch transcription is not yet complete (checks `BatchTracker`).
 - **`build_analysis_prompt`** — Builds a structured Spanish-language prompt that includes:
   - The full transcript (both speakers, labeled as "Candidato" and "Entrevistador")
   - RAG context from the user's documents (queried via `search()`)
   - A strict JSON schema requirement for the response
-- **Provider-specific URLs and headers:** Maps provider names (`"anthropic"`, `"openai"`, `"gemini"`, `"openrouter"`, `"ollama"`) to their API endpoints and header formats.
+- **Provider-specific URLs and headers:** Maps provider names (`"anthropic"`, `"openai"`, `"gemini"`, `"openrouter"`, `"deepseek"`, `"ollama"`) to their API endpoints and header formats.
 - **Response parsing:** Attempts to extract valid JSON from the LLM response (handles markdown code block wrapping), then deserializes into `AnalyzeResult` with four fields: `summary`, `weak_questions`, `forgotten_projects`, `star_improvements`.
 - **Error handling:** Returns structured `String` errors for failed HTTP requests, JSON parsing failures, or missing API keys.
 
-**Keychain storage (`keys.rs`, ~110 lines, 6 ignored tests)** — manages API key storage in the OS native keychain:
+**Keychain storage (`keys.rs`, ~126 lines, 6 ignored tests)** — manages API key storage in the OS native keychain:
 
 - **`keys::save_api_key(provider, key)`** — Stores a key for a given provider in the OS keychain via the `keyring` crate.
 - **`keys::get_api_key(provider)`** — Retrieves a key from the keychain; returns `Err` if no key exists.
@@ -544,7 +542,7 @@ Moderate module (~365 lines, 18 tests) that wraps `SimpleVAD` for Channel A (mic
 
 ### 2.7 Orchestrator Module (`orchestrator/`)
 
-**Orchestrator module (`orchestrator/mod.rs` + `orchestrator/worker.rs`, >1400 lines including tests, 72 tests)** — binds classifier + RAG + hint emission into a cohesive hint engine:
+**Orchestrator module (`orchestrator/mod.rs` + `orchestrator/worker.rs`, >1900 lines including tests, 73 tests)** — binds classifier + RAG + hint emission into a cohesive hint engine:
 
 - **`orchestrator::HintJob`** — data struct carrying `session_id`, `text` (the transcribed question), `qtype` (classified question type), and `mode` (`"practice"` or `"shadow"`).
 - **`orchestrator::HintCommand`** — enum for the hint worker's message protocol: `Process(HintJob)` and `CancelSession(String)`.
@@ -563,7 +561,7 @@ Moderate module (~365 lines, 18 tests) that wraps `SimpleVAD` for Channel A (mic
 
 ### 2.8 Overlay Module (`overlay.rs`)
 
-Small module (~88 lines, 6 tests) that controls the overlay window:
+Small module (~91 lines, 6 tests) that controls the overlay window:
 
 - **`overlay::show_overlay()`** — Tauri command `fn show_overlay(show: bool, app_handle: AppHandle) -> Result<(), String>`. If `show=true`, shows the overlay window and sets focus; if `show=false`, hides it. Returns an error if the `"overlay"` webview window doesn't exist (misconfigured `tauri.conf.json`).
 - **`overlay::ERR_OVERLAY_WINDOW_NOT_FOUND`** — Public error constant for test assertions.
@@ -683,8 +681,8 @@ All DDL uses `IF NOT EXISTS`. The `open_and_migrate_is_idempotent` test runs the
 | LLM defaults persistence | **Implemented** — per-feature (`hint_provider`, `analyze_provider`, `plan_provider`) and global (`default_provider`, `default_model`) LLM configs stored in `settings` table | — | `hooks.ts` (`useLLMSettings`) |
 | AI Interview plan gen | **Implemented** (Sprint 7 — `generate_interview_plan` command, job description + duration → structured question plan via BYOK LLM with RAG context) | `serde`, `serde_json` | `interview_plan.rs` |
 | AI Interview runner | **Implemented** (Sprint 7 — `InterviewRunner` thread + Tauri state, emits `interview-question`/`interview-status`/`interview-finished` events, TTS integration, skip/stop commands) | `tokio` (time) | `interview_runner.rs` |
-| i18n system | **Implemented** (Sprint 7 — `i18n.ts` with 142 bilingual EN/ES keys [284 total entries], `useLanguage()` hook, `t()` template function, localStorage + backend persistence) | — | `src/i18n.ts` |
-| Frontend components | **Implemented** (Sprint 7 — `Header.tsx` with language switcher, `Icon.tsx` 30 SVG icons, `ui.tsx` primitives, `hooks.ts`, `validation.ts`, `ApiKeyInput.tsx`, `ReindexPanel` modal) | `@tauri-apps/api` | `src/Header.tsx`, `src/Icon.tsx`, `src/ui.tsx`, `src/hooks.ts`, `src/validation.ts`, `src/ApiKeyInput.tsx` |
+| i18n system | **Implemented** (Sprint 7 — `i18n.ts` with 141 bilingual EN/ES keys [282 total entries], `useLanguage()` hook, `t()` template function, localStorage + backend persistence) | — | `src/i18n.ts` |
+| Frontend components | **Implemented** (Sprint 7 — `Header.tsx` with language switcher, `Icon.tsx` 25 SVG icons, `ui.tsx` primitives, `hooks.ts`, `validation.ts`, `ApiKeyInput.tsx`, `ReindexPanel` modal) | `@tauri-apps/api` | `src/Header.tsx`, `src/Icon.tsx`, `src/ui.tsx`, `src/hooks.ts`, `src/validation.ts`, `src/ApiKeyInput.tsx` |
 | Recursive indexing + PDF | **Implemented** (Sprint 7 — `index_folder_cmd` recursively walks subdirectories, PDF text extraction via `pdf-extract` crate) | `pdf-extract` | `rag/indexer.rs` |
 | Log viewing | **Implemented** (Sprint 7 — `get_log_dir_path` command returns log directory path for opening via Tauri shell) | — | `audio/capture.rs` |
 
