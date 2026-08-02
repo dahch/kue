@@ -113,8 +113,10 @@ mod tests {
             for entry in entries.flatten() {
                 if entry.file_name().to_string_lossy().contains("kue") {
                     if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                        assert!(!content.contains("sk-test"),
-                            "key should never appear in app files");
+                        assert!(
+                            !content.contains("sk-test"),
+                            "key should never appear in app files"
+                        );
                     }
                 }
             }

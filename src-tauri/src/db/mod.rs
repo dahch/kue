@@ -47,7 +47,11 @@ pub fn register_vec_extension() {
             *const rusqlite::ffi::sqlite3_api_routines,
         ) -> std::os::raw::c_int = std::mem::transmute(ptr);
         let rc = rusqlite::ffi::sqlite3_auto_extension(Some(entry));
-        assert_eq!(rc, rusqlite::ffi::SQLITE_OK, "sqlite3_auto_extension failed");
+        assert_eq!(
+            rc,
+            rusqlite::ffi::SQLITE_OK,
+            "sqlite3_auto_extension failed"
+        );
     }
 }
 
@@ -100,7 +104,10 @@ const SCHEMA_DDL: &str = "
 ";
 
 fn vec0_ddl() -> String {
-    format!("CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding float[{}]);", EMBEDDING_DIM)
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding float[{}]);",
+        EMBEDDING_DIM
+    )
 }
 
 /// Core logic: open a SQLite connection at `db_path`, enable WAL mode,
@@ -231,9 +238,11 @@ pub struct TranscriptLineRow {
 pub fn get_setting(key: String, db: tauri::State<'_, Database>) -> Result<Option<String>, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let value: Option<String> = conn
-        .query_row("SELECT value FROM settings WHERE key = ?1", [key.as_str()], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            [key.as_str()],
+            |row| row.get(0),
+        )
         .ok();
     Ok(value)
 }
@@ -368,7 +377,10 @@ mod tests {
         let result = conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS test_vec USING vec0(embedding float[384]);",
         );
-        assert!(result.is_ok(), "vec0 table creation should succeed after registering extension");
+        assert!(
+            result.is_ok(),
+            "vec0 table creation should succeed after registering extension"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -381,8 +393,14 @@ mod tests {
         let db_path = tmp.path().join("test.db");
 
         let db = open_and_migrate_with_vec(&db_path).unwrap();
-        assert!(db_path.exists(), "database file should exist at the specified path");
-        assert_eq!(db.path, db_path, "returned path should match the requested path");
+        assert!(
+            db_path.exists(),
+            "database file should exist at the specified path"
+        );
+        assert_eq!(
+            db.path, db_path,
+            "returned path should match the requested path"
+        );
     }
 
     #[test]
@@ -427,7 +445,10 @@ mod tests {
         // Both should see the same set of tables
         let status1 = get_db_status_inner(&db1).unwrap();
         let status2 = get_db_status_inner(&db2).unwrap();
-        assert_eq!(status1.tables, status2.tables, "second migration should not change tables");
+        assert_eq!(
+            status1.tables, status2.tables,
+            "second migration should not change tables"
+        );
     }
 
     #[test]
@@ -510,10 +531,7 @@ mod tests {
             "empty database should have no tables, got: {:?}",
             status.tables
         );
-        assert!(
-            status.path.ends_with("test_empty.db"),
-            "path should match"
-        );
+        assert!(status.path.ends_with("test_empty.db"), "path should match");
     }
 
     #[test]
@@ -761,10 +779,7 @@ mod tests {
             "INSERT INTO chunks (document_id, text, chunk_index) VALUES (?1, ?2, ?3)",
             rusqlite::params![999, "some text", 0],
         );
-        assert!(
-            result.is_err(),
-            "FK constraint should reject orphan chunks"
-        );
+        assert!(result.is_err(), "FK constraint should reject orphan chunks");
     }
 
     // -----------------------------------------------------------------------
@@ -881,7 +896,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(value, "true", "retain_audio should be overridable to 'true'");
+        assert_eq!(
+            value, "true",
+            "retain_audio should be overridable to 'true'"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -910,7 +928,10 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 4, "should support multiple settings (retain_audio + first_run defaults)");
+        assert_eq!(
+            count, 4,
+            "should support multiple settings (retain_audio + first_run defaults)"
+        );
     }
 
     #[test]
@@ -1023,21 +1044,25 @@ mod tests {
             "INSERT INTO transcript_lines (session_id, speaker, text, started_at_ms, ended_at_ms)
              VALUES ('sess-t1', 'interviewer', 'Hello?', 0, 1000)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO transcript_lines (session_id, speaker, text, started_at_ms, ended_at_ms)
              VALUES ('sess-t1', 'user', 'Yes, I am here', 1000, 3000)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         drop(conn);
 
         let guard = db.conn.lock().unwrap();
-        let mut stmt = guard.prepare(
-            "SELECT id, speaker, text, started_at_ms, ended_at_ms
+        let mut stmt = guard
+            .prepare(
+                "SELECT id, speaker, text, started_at_ms, ended_at_ms
              FROM transcript_lines
              WHERE session_id = ?1
              ORDER BY started_at_ms ASC",
-        ).unwrap();
+            )
+            .unwrap();
         let lines: Vec<TranscriptLineRow> = stmt
             .query_map(rusqlite::params!["sess-t1"], |row| {
                 Ok(TranscriptLineRow {
@@ -1086,12 +1111,14 @@ mod tests {
         }
 
         let conn = db.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT s.id, s.started_at, s.ended_at, s.company, s.role, s.mode,
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, s.started_at, s.ended_at, s.company, s.role, s.mode,
                     (SELECT COUNT(*) FROM transcript_lines WHERE session_id = s.id) as line_count
              FROM sessions s
              ORDER BY s.started_at DESC",
-        ).unwrap();
+            )
+            .unwrap();
         let sessions: Vec<SessionRow> = stmt
             .query_map([], |row| {
                 Ok(SessionRow {
@@ -1127,12 +1154,14 @@ mod tests {
         let db = open_and_migrate_with_vec(&db_path).unwrap();
 
         let conn = db.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT s.id, s.started_at, s.ended_at, s.company, s.role, s.mode,
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, s.started_at, s.ended_at, s.company, s.role, s.mode,
                     (SELECT COUNT(*) FROM transcript_lines WHERE session_id = s.id) as line_count
              FROM sessions s
              ORDER BY s.started_at DESC",
-        ).unwrap();
+            )
+            .unwrap();
         let sessions: Vec<SessionRow> = stmt
             .query_map([], |row| {
                 Ok(SessionRow {
@@ -1165,13 +1194,17 @@ mod tests {
         conn.execute(
             "INSERT INTO sessions (company, role, mode) VALUES ('Test', 'Eng', 'practice')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let id: String = conn
             .query_row("SELECT id FROM sessions", [], |row| row.get(0))
             .unwrap();
         // id is hex(randomblob(16)) → 32 hex chars
         assert_eq!(id.len(), 32, "auto-generated id should be 32 hex chars");
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "id should be hex");
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "id should be hex"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1194,7 +1227,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO sessions (company, role, mode) VALUES ('C1', 'R1', 'practice')",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
         {
             let conn = db2.conn.lock().unwrap();

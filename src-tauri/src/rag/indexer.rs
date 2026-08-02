@@ -395,7 +395,12 @@ mod tests {
             static COUNTER: AtomicU32 = AtomicU32::new(0);
             let mut dir = std::env::temp_dir();
             let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-            dir.push(format!("kue_rag_test_{}_{}_{}", std::process::id(), label, id));
+            dir.push(format!(
+                "kue_rag_test_{}_{}_{}",
+                std::process::id(),
+                label,
+                id
+            ));
             let _ = std::fs::create_dir_all(&dir);
             TempDir { path: dir }
         }
@@ -531,7 +536,10 @@ mod tests {
         let text: String = conn
             .query_row("SELECT text FROM chunks WHERE id = 1", [], |row| row.get(0))
             .unwrap();
-        assert!(text.contains("Kue"), "chunk text should contain original content");
+        assert!(
+            text.contains("Kue"),
+            "chunk text should contain original content"
+        );
     }
 
     #[test]
@@ -589,7 +597,12 @@ mod tests {
         let model = MockEmbeddingModel;
 
         let files: Vec<String> = (0..3)
-            .map(|i| tmp.path().join(format!("doc_{i}.txt")).to_string_lossy().to_string())
+            .map(|i| {
+                tmp.path()
+                    .join(format!("doc_{i}.txt"))
+                    .to_string_lossy()
+                    .to_string()
+            })
             .collect();
         ingest_documents(&model, &db, &files).unwrap();
 
@@ -635,7 +648,11 @@ mod tests {
         let db = open_and_migrate(&db_path).unwrap();
         let model = MockEmbeddingModel;
 
-        let files = vec![tmp.path().join("search_me.txt").to_string_lossy().to_string()];
+        let files = vec![tmp
+            .path()
+            .join("search_me.txt")
+            .to_string_lossy()
+            .to_string()];
         ingest_documents(&model, &db, &files).unwrap();
 
         let results = search(&model, &db, "prisma", 5).unwrap();
@@ -678,7 +695,12 @@ mod tests {
         let model = MockEmbeddingModel;
 
         let files: Vec<String> = (0..5)
-            .map(|i| tmp.path().join(format!("doc_{i}.txt")).to_string_lossy().to_string())
+            .map(|i| {
+                tmp.path()
+                    .join(format!("doc_{i}.txt"))
+                    .to_string_lossy()
+                    .to_string()
+            })
             .collect();
         ingest_documents(&model, &db, &files).unwrap();
 
@@ -704,7 +726,10 @@ mod tests {
         // With overlap=0, no word should appear in consecutive chunks
         let first_words: Vec<&str> = chunks[0].split_whitespace().collect();
         let second_words: Vec<&str> = chunks[1].split_whitespace().collect();
-        let common: Vec<&&str> = first_words.iter().filter(|w| second_words.contains(w)).collect();
+        let common: Vec<&&str> = first_words
+            .iter()
+            .filter(|w| second_words.contains(w))
+            .collect();
         assert_eq!(common.len(), 0, "no overlap when overlap=0");
     }
 
@@ -721,14 +746,20 @@ mod tests {
             let first: Vec<&str> = pair[0].split_whitespace().collect();
             let second: Vec<&str> = pair[1].split_whitespace().collect();
             let overlap: Vec<&&str> = first.iter().filter(|w| second.contains(w)).collect();
-            assert!(overlap.len() >= 20, "expected large overlap between consecutive chunks");
+            assert!(
+                overlap.len() >= 20,
+                "expected large overlap between consecutive chunks"
+            );
         }
     }
 
     #[test]
     fn chunk_text_only_whitespace() {
         let chunks = chunk_text("   \n  \t  \r\n  ", 200, 20);
-        assert!(chunks.is_empty(), "whitespace-only text should yield no chunks");
+        assert!(
+            chunks.is_empty(),
+            "whitespace-only text should yield no chunks"
+        );
     }
 
     #[test]
@@ -776,7 +807,11 @@ mod tests {
         let db = open_and_migrate(&db_path).unwrap();
         let model = MockEmbeddingModel;
 
-        let files = vec![tmp.path().join("nonexistent.txt").to_string_lossy().to_string()];
+        let files = vec![tmp
+            .path()
+            .join("nonexistent.txt")
+            .to_string_lossy()
+            .to_string()];
         let result = ingest_documents(&model, &db, &files);
         assert!(result.is_err(), "should error for non-existent file");
     }
@@ -830,7 +865,10 @@ mod tests {
         let chunk_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
             .unwrap();
-        assert!(chunk_count >= 2, "500 words / 200 chunk_size should produce >= 2 chunks, got {chunk_count}");
+        assert!(
+            chunk_count >= 2,
+            "500 words / 200 chunk_size should produce >= 2 chunks, got {chunk_count}"
+        );
 
         // Verify chunks are stored in order
         let indexes: Vec<i32> = {
@@ -865,7 +903,10 @@ mod tests {
         let result = ingest_documents(&failing, &db, &files);
         assert!(result.is_err(), "should propagate embedding error");
         assert!(
-            result.unwrap_err().to_string().contains("mock embedding failure"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("mock embedding failure"),
             "error should contain the mock's error message"
         );
     }
@@ -885,7 +926,10 @@ mod tests {
 
         let files = vec![tmp.path().join("binary.txt").to_string_lossy().to_string()];
         let result = ingest_documents(&model, &db, &files);
-        assert!(result.is_err(), "binary file should cause read_to_string error");
+        assert!(
+            result.is_err(),
+            "binary file should cause read_to_string error"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -931,7 +975,11 @@ mod tests {
                 .filter_map(|r| r.ok())
                 .collect()
         };
-        assert_eq!(names, vec!["doc_a.txt", "doc_b.md"], "filenames should match and be sorted");
+        assert_eq!(
+            names,
+            vec!["doc_a.txt", "doc_b.md"],
+            "filenames should match and be sorted"
+        );
     }
 
     #[test]
@@ -962,9 +1010,15 @@ mod tests {
         let model = MockEmbeddingModel;
 
         let result = index_folder(&model, &db, tmp.path().to_string_lossy().as_ref());
-        assert!(result.is_err(), "should error when no supported files found");
+        assert!(
+            result.is_err(),
+            "should error when no supported files found"
+        );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("no supported files"), "error should mention no supported files: {err}");
+        assert!(
+            err.contains("no supported files"),
+            "error should mention no supported files: {err}"
+        );
     }
 
     #[test]
@@ -1015,7 +1069,10 @@ mod tests {
         let doc_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(doc_count, 2, "should index both root and subdirectory files");
+        assert_eq!(
+            doc_count, 2,
+            "should index both root and subdirectory files"
+        );
 
         let mut names: Vec<String> = {
             let mut stmt = conn
@@ -1073,7 +1130,10 @@ mod tests {
 
         // Empty query string — mock returns a valid embedding, so search runs
         let results = search(&model, &db, "", 5).unwrap();
-        assert!(results.is_empty(), "search on empty DB with empty query returns empty");
+        assert!(
+            results.is_empty(),
+            "search on empty DB with empty query returns empty"
+        );
     }
 
     #[test]
@@ -1096,9 +1156,16 @@ mod tests {
 
         // Requesting more results than available should return all available
         let results = search(&model, &db, "test", 100).unwrap();
-        assert!(!results.is_empty(), "should return results even when k > available");
+        assert!(
+            !results.is_empty(),
+            "should return results even when k > available"
+        );
         // With one small document, we should have exactly 1 chunk
-        assert_eq!(results.len(), 1, "should return exactly the 1 available chunk");
+        assert_eq!(
+            results.len(),
+            1,
+            "should return exactly the 1 available chunk"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1221,12 +1288,30 @@ mod tests {
 
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"id\":42"), "should contain id: {json}");
-        assert!(json.contains("\"document_id\":7"), "should contain document_id: {json}");
-        assert!(json.contains("\"text\":\"Rust is safe and fast.\""), "should contain text: {json}");
-        assert!(json.contains("\"chunk_index\":0"), "should contain chunk_index: {json}");
-        assert!(json.contains("\"tag\":\"rust\""), "should contain tag: {json}");
-        assert!(json.contains("\"metric\":\"safety\""), "should contain metric: {json}");
-        assert!(json.contains("\"score\":0.95"), "should contain score: {json}");
+        assert!(
+            json.contains("\"document_id\":7"),
+            "should contain document_id: {json}"
+        );
+        assert!(
+            json.contains("\"text\":\"Rust is safe and fast.\""),
+            "should contain text: {json}"
+        );
+        assert!(
+            json.contains("\"chunk_index\":0"),
+            "should contain chunk_index: {json}"
+        );
+        assert!(
+            json.contains("\"tag\":\"rust\""),
+            "should contain tag: {json}"
+        );
+        assert!(
+            json.contains("\"metric\":\"safety\""),
+            "should contain metric: {json}"
+        );
+        assert!(
+            json.contains("\"score\":0.95"),
+            "should contain score: {json}"
+        );
     }
 
     #[test]
@@ -1242,8 +1327,14 @@ mod tests {
         };
 
         let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("\"tag\":null"), "null tag should serialize as null: {json}");
-        assert!(json.contains("\"metric\":null"), "null metric should serialize as null: {json}");
+        assert!(
+            json.contains("\"tag\":null"),
+            "null tag should serialize as null: {json}"
+        );
+        assert!(
+            json.contains("\"metric\":null"),
+            "null metric should serialize as null: {json}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1256,18 +1347,38 @@ mod tests {
     /// a user is likely to encounter.
     fn dense_technical_text() -> String {
         let terms = [
-            "TypeScript", "PostgreSQL", "microservicios", "implementé",
-            "NestJS", "Redis", "PrismaORM", "query_performance_optimization_v2",
-            "AWS/GCP/Azure", "CI/CD pipelines", "Docker/Kubernetes",
-            "10000rps", "40% reducción_latencia", "N+1 queries",
-            "SQLAlchemy/TypeORM", "Webpack/Vite/Rollup", "REST/GraphQL/gRPC",
-            "JWT/OAuth2/SAML", "kubernetes_cluster_autoscaling_policy",
-            "micrófono_estéreo_cancela_ruido", "entrevistador@empresa.com",
-            "ABTestingFrameworkV3", "RTSP/WebRTC/SIP", "MongoDB/Postgres/MySQL",
-            "event_sourcing_CQRS_pattern", "DDD/Hexagonal/Clean Architecture",
-            "k8s_deployment_rolling_update_strategy", "99.9% uptime SLA",
-            "OpenTelemetry/Jaeger/Prometheus", "Grafana+Loki+Tempo stack",
-            "feature_flags_toggle_gradual_rollout", "gRPC_stream_bidirectional",
+            "TypeScript",
+            "PostgreSQL",
+            "microservicios",
+            "implementé",
+            "NestJS",
+            "Redis",
+            "PrismaORM",
+            "query_performance_optimization_v2",
+            "AWS/GCP/Azure",
+            "CI/CD pipelines",
+            "Docker/Kubernetes",
+            "10000rps",
+            "40% reducción_latencia",
+            "N+1 queries",
+            "SQLAlchemy/TypeORM",
+            "Webpack/Vite/Rollup",
+            "REST/GraphQL/gRPC",
+            "JWT/OAuth2/SAML",
+            "kubernetes_cluster_autoscaling_policy",
+            "micrófono_estéreo_cancela_ruido",
+            "entrevistador@empresa.com",
+            "ABTestingFrameworkV3",
+            "RTSP/WebRTC/SIP",
+            "MongoDB/Postgres/MySQL",
+            "event_sourcing_CQRS_pattern",
+            "DDD/Hexagonal/Clean Architecture",
+            "k8s_deployment_rolling_update_strategy",
+            "99.9% uptime SLA",
+            "OpenTelemetry/Jaeger/Prometheus",
+            "Grafana+Loki+Tempo stack",
+            "feature_flags_toggle_gradual_rollout",
+            "gRPC_stream_bidirectional",
         ];
         // Generate 600 words of dense technical content
         let mut text = String::new();
@@ -1356,19 +1467,19 @@ mod tests {
         std::fs::write(
             tmp.path().join("stack.txt"),
             "Stack principal: TypeScript, Node.js, NestJS, Prisma, PostgreSQL, Redis, Docker.",
-        ).unwrap();
+        )
+        .unwrap();
 
         let db_path = tmp.path().join("test.db");
         let db = open_and_migrate(&db_path).unwrap();
 
-        let model = crate::rag::embeddings::load_embedding_model()
-            .expect("should load embedding model");
+        let model =
+            crate::rag::embeddings::load_embedding_model().expect("should load embedding model");
 
         index_folder(&model, &db, tmp.path().to_string_lossy().as_ref())
             .expect("should index folder");
 
-        let results = search(&model, &db, "Prisma ORM migraciones", 3)
-            .expect("should search");
+        let results = search(&model, &db, "Prisma ORM migraciones", 3).expect("should search");
         assert!(!results.is_empty(), "should find results for 'Prisma'");
         assert!(
             results[0].text.contains("Prisma"),

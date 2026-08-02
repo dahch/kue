@@ -160,12 +160,11 @@ fn build_rag_context(
 // ---------------------------------------------------------------------------
 
 fn parse_llm_response(raw: &str) -> Result<AnalyzeResult, String> {
-    let json_str = extract_json(raw).ok_or_else(|| {
-        format!("No JSON found in LLM response: {raw:.200}")
-    })?;
+    let json_str =
+        extract_json(raw).ok_or_else(|| format!("No JSON found in LLM response: {raw:.200}"))?;
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(&json_str).map_err(|e| format!("Failed to parse LLM JSON: {e}\nRaw: {json_str:.200}"))?;
+    let parsed: serde_json::Value = serde_json::from_str(&json_str)
+        .map_err(|e| format!("Failed to parse LLM JSON: {e}\nRaw: {json_str:.200}"))?;
 
     Ok(AnalyzeResult {
         summary: parsed
@@ -176,17 +175,29 @@ fn parse_llm_response(raw: &str) -> Result<AnalyzeResult, String> {
         weak_questions: parsed
             .get("weak_questions")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default(),
         forgotten_projects: parsed
             .get("forgotten_projects")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default(),
         star_improvements: parsed
             .get("star_improvements")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default(),
     })
 }
@@ -253,8 +264,7 @@ pub async fn analyze_session(
 
     if !ready {
         return Err(
-            "Channel A transcript is not ready yet. Wait for processing to finish."
-                .to_string(),
+            "Channel A transcript is not ready yet. Wait for processing to finish.".to_string(),
         );
     }
 
@@ -296,7 +306,10 @@ mod tests {
     #[test]
     fn extract_json_from_plain() {
         let input = r#"{"summary": "test"}"#;
-        assert_eq!(extract_json(input), Some(r#"{"summary": "test"}"#.to_string()));
+        assert_eq!(
+            extract_json(input),
+            Some(r#"{"summary": "test"}"#.to_string())
+        );
     }
 
     #[test]
@@ -530,7 +543,8 @@ mod tests {
             started_at_ms: 0,
             ended_at_ms: 100,
         }];
-        let questions: Vec<&str> = lines.iter()
+        let questions: Vec<&str> = lines
+            .iter()
             .filter(|l| l.speaker == "interviewer")
             .map(|l| l.text.as_str())
             .collect();

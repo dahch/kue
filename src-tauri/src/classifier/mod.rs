@@ -23,95 +23,292 @@ impl QuestionType {
 }
 
 const IMPERATIVE_TRIGGERS: &[&str] = &[
-    "cuéntame", "dime", "descríbeme", "explícame", "camínenme por",
-    "háblame", "compárteme", "platícame", "nárrame",
-    "tell me", "describe", "explain", "walk me through", "talk me through",
-    "share", "give me an example", "give me an example of", "give me an instance of",
-    "could you", "would you", "can you", "will you", "do you", "have you", "has you",
-    "are you able to", "podrías", "puedes", "puedas", "harías", "harias",
-    "me cuentas", "me describes", "me explicas", "me hablas", "me compartes",
-    "cuéntanos", "cuentanos", "dinos", "dinos", "explícanos", "explicanos",
-    "cuéntame de una vez", "cuéntame sobre", "dime sobre", "háblame de",
-    "walk us through", "run me through", "run us through", "paint me a picture",
+    "cuéntame",
+    "dime",
+    "descríbeme",
+    "explícame",
+    "camínenme por",
+    "háblame",
+    "compárteme",
+    "platícame",
+    "nárrame",
+    "tell me",
+    "describe",
+    "explain",
+    "walk me through",
+    "talk me through",
+    "share",
+    "give me an example",
+    "give me an example of",
+    "give me an instance of",
+    "could you",
+    "would you",
+    "can you",
+    "will you",
+    "do you",
+    "have you",
+    "has you",
+    "are you able to",
+    "podrías",
+    "puedes",
+    "puedas",
+    "harías",
+    "harias",
+    "me cuentas",
+    "me describes",
+    "me explicas",
+    "me hablas",
+    "me compartes",
+    "cuéntanos",
+    "cuentanos",
+    "dinos",
+    "dinos",
+    "explícanos",
+    "explicanos",
+    "cuéntame de una vez",
+    "cuéntame sobre",
+    "dime sobre",
+    "háblame de",
+    "walk us through",
+    "run me through",
+    "run us through",
+    "paint me a picture",
 ];
 
 const QUESTION_START_TRIGGERS: &[&str] = &[
-    "what", "which", "who", "where", "when", "why", "how", "are", "is", "can",
-    "could", "would", "will", "do", "does", "did", "have", "has", "should", "shall",
-    "qué", "cuál", "cuáles", "cuando", "cuándo", "dónde", "donde", "por qué",
-    "porque", "porqué", "quién", "quien", "cómo", "como", "es", "está", "esta",
-    "puede", "podría", "debería", "tiene", "ha", "hace", "será", "seria",
+    "what", "which", "who", "where", "when", "why", "how", "are", "is", "can", "could", "would",
+    "will", "do", "does", "did", "have", "has", "should", "shall", "qué", "cuál", "cuáles",
+    "cuando", "cuándo", "dónde", "donde", "por qué", "porque", "porqué", "quién", "quien", "cómo",
+    "como", "es", "está", "esta", "puede", "podría", "debería", "tiene", "ha", "hace", "será",
+    "seria",
 ];
 
 const EXCLUSION_LIST: &[&str] = &[
-    "cómo estás", "cómo está", "me escuchas", "me oyes",
-    "how are you", "can you hear me", "are you there",
-    "how's it going", "you there", "you still there",
+    "cómo estás",
+    "cómo está",
+    "me escuchas",
+    "me oyes",
+    "how are you",
+    "can you hear me",
+    "are you there",
+    "how's it going",
+    "you there",
+    "you still there",
 ];
 
 const TECHNICAL_KEYWORDS: &[&str] = &[
-    "error", "código", "code", "debug", "implementaste", "implement",
-    "bug", "test", "prueba", "performance", "rendimiento",
-    "optimiz", "api", "endpoint", "database", "base de datos",
-    "algoritmo", "algorithm", "estructura de datos", "data structure",
-    "complejidad", "complexity", "memoria", "memory", "concurrencia",
-    "concurrency", "thread", "hilo", "async", "asíncrono",
-    "framework", "librería", "library", "dependencia", "dependency",
-    "tecnología", "technology", "stack", "lenguaje", "language",
-    "cómo lo hiciste", "cómo lo resolviste", "cómo implementaste",
-    "how did you", "what technology", "what library",
+    "error",
+    "código",
+    "code",
+    "debug",
+    "implementaste",
+    "implement",
+    "bug",
+    "test",
+    "prueba",
+    "performance",
+    "rendimiento",
+    "optimiz",
+    "api",
+    "endpoint",
+    "database",
+    "base de datos",
+    "algoritmo",
+    "algorithm",
+    "estructura de datos",
+    "data structure",
+    "complejidad",
+    "complexity",
+    "memoria",
+    "memory",
+    "concurrencia",
+    "concurrency",
+    "thread",
+    "hilo",
+    "async",
+    "asíncrono",
+    "framework",
+    "librería",
+    "library",
+    "dependencia",
+    "dependency",
+    "tecnología",
+    "technology",
+    "stack",
+    "lenguaje",
+    "language",
+    "cómo lo hiciste",
+    "cómo lo resolviste",
+    "cómo implementaste",
+    "how did you",
+    "what technology",
+    "what library",
 ];
 
 const STAR_KEYWORDS: &[&str] = &[
-    "lideraste", "lead", "liderazgo", "leadership", "equipo", "team",
-    "conflicto", "conflict", "situación", "situation", "desacuerdo",
-    "disagreement", "negociación", "negotiation", "comunicación",
-    "communication", "colaboración", "collaboration", "retroalimentación",
-    "feedback", "mentor", "mentoring", "delegación", "delegation",
-    "presión", "pressure", "fecha límite", "deadline", "stakeholder",
-    "cliente difícil", "difficult client", "fracaso", "failure",
-    "error", "mistake", "aprendiste", "learned", "creciste", "grew",
-    "momento", "experiencia", "experience", "vez que", "time when",
-    "cuéntame de una vez", "tell me about a time",
-    "dame un ejemplo", "give me an example",
-    "cómo manejaste", "how did you handle", "cómo resolviste",
-    "cómo manejas", "cómo manejó",
+    "lideraste",
+    "lead",
+    "liderazgo",
+    "leadership",
+    "equipo",
+    "team",
+    "conflicto",
+    "conflict",
+    "situación",
+    "situation",
+    "desacuerdo",
+    "disagreement",
+    "negociación",
+    "negotiation",
+    "comunicación",
+    "communication",
+    "colaboración",
+    "collaboration",
+    "retroalimentación",
+    "feedback",
+    "mentor",
+    "mentoring",
+    "delegación",
+    "delegation",
+    "presión",
+    "pressure",
+    "fecha límite",
+    "deadline",
+    "stakeholder",
+    "cliente difícil",
+    "difficult client",
+    "fracaso",
+    "failure",
+    "error",
+    "mistake",
+    "aprendiste",
+    "learned",
+    "creciste",
+    "grew",
+    "momento",
+    "experiencia",
+    "experience",
+    "vez que",
+    "time when",
+    "cuéntame de una vez",
+    "tell me about a time",
+    "dame un ejemplo",
+    "give me an example",
+    "cómo manejaste",
+    "how did you handle",
+    "cómo resolviste",
+    "cómo manejas",
+    "cómo manejó",
 ];
 
 const ARCHITECTURE_KEYWORDS: &[&str] = &[
-    "arquitectura", "architecture", "escalabilidad", "scalability",
-    "diseño", "design", "patrón", "pattern", "microservicios",
-    "microservices", "monolito", "monolith", "eventos", "events",
-    "cqrs", "event sourcing", "hexagonal", "clean architecture",
-    "ddd", "domain driven", "capas", "layers", "modular", "módulos",
-    "acoplamiento", "coupling", "cohesión", "cohesion", "solid",
-    "principios", "principle", "distribuido", "distributed",
-    "alta disponibilidad", "high availability", "disponibilidad",
-    "availability", "tolerancia a fallos", "fault tolerance",
-    "diagrama", "componentes", "components",
-    "cómo diseñaste", "how did you design", "cómo modelaste",
-    "how would you design", "diseña", "design a",
+    "arquitectura",
+    "architecture",
+    "escalabilidad",
+    "scalability",
+    "diseño",
+    "design",
+    "patrón",
+    "pattern",
+    "microservicios",
+    "microservices",
+    "monolito",
+    "monolith",
+    "eventos",
+    "events",
+    "cqrs",
+    "event sourcing",
+    "hexagonal",
+    "clean architecture",
+    "ddd",
+    "domain driven",
+    "capas",
+    "layers",
+    "modular",
+    "módulos",
+    "acoplamiento",
+    "coupling",
+    "cohesión",
+    "cohesion",
+    "solid",
+    "principios",
+    "principle",
+    "distribuido",
+    "distributed",
+    "alta disponibilidad",
+    "high availability",
+    "disponibilidad",
+    "availability",
+    "tolerancia a fallos",
+    "fault tolerance",
+    "diagrama",
+    "componentes",
+    "components",
+    "cómo diseñaste",
+    "how did you design",
+    "cómo modelaste",
+    "how would you design",
+    "diseña",
+    "design a",
 ];
 
 const TRAP_KEYWORDS: &[&str] = &[
-    "defecto", "defect", "debilidad", "weakness", "fallo", "fail",
-    "crítica", "criticism", "crítica", "critique", "peor",
-    "worst", "mayor error", "biggest mistake", "mayor fracaso",
-    "biggest failure", "despedir", "fire", "despedido", "fired",
-    "odias", "hate", "detestas", "detest", "no te gusta",
-    "don't like", "qué harías diferente", "what would you do differently",
-    "qué cambiarías", "what would you change",
-    "por qué deberíamos contratarte", "why should we hire you",
-    "por qué te fuiste", "why did you leave",
-    "arrepientes", "regret", "arrepentimiento",
-    "frustr", "frustration", "frustración",
-    "fracaso profesional", "professional failure",
-    "debilidad profesional", "professional weakness",
-    "punto débil", "weak point", "peor proyecto", "worst project",
-    "experiencia negativa", "negative experience",
-    "qué aprendiste de tus errores", "what did you learn from your mistakes",
-    "retroalimentación negativa", "negative feedback",
-    "situación incómoda", "awkward situation",
+    "defecto",
+    "defect",
+    "debilidad",
+    "weakness",
+    "fallo",
+    "fail",
+    "crítica",
+    "criticism",
+    "crítica",
+    "critique",
+    "peor",
+    "worst",
+    "mayor error",
+    "biggest mistake",
+    "mayor fracaso",
+    "biggest failure",
+    "despedir",
+    "fire",
+    "despedido",
+    "fired",
+    "odias",
+    "hate",
+    "detestas",
+    "detest",
+    "no te gusta",
+    "don't like",
+    "qué harías diferente",
+    "what would you do differently",
+    "qué cambiarías",
+    "what would you change",
+    "por qué deberíamos contratarte",
+    "why should we hire you",
+    "por qué te fuiste",
+    "why did you leave",
+    "arrepientes",
+    "regret",
+    "arrepentimiento",
+    "frustr",
+    "frustration",
+    "frustración",
+    "fracaso profesional",
+    "professional failure",
+    "debilidad profesional",
+    "professional weakness",
+    "punto débil",
+    "weak point",
+    "peor proyecto",
+    "worst project",
+    "experiencia negativa",
+    "negative experience",
+    "qué aprendiste de tus errores",
+    "what did you learn from your mistakes",
+    "retroalimentación negativa",
+    "negative feedback",
+    "situación incómoda",
+    "awkward situation",
 ];
 
 pub fn classify(text: &str) -> QuestionType {
@@ -176,11 +373,7 @@ pub fn classify(text: &str) -> QuestionType {
     }
 
     // If no keywords matched, try to infer type from known question patterns
-    if technical_score == 0
-        && behavioral_score == 0
-        && architecture_score == 0
-        && trap_score == 0
-    {
+    if technical_score == 0 && behavioral_score == 0 && architecture_score == 0 && trap_score == 0 {
         // Technical questions often ask about implementation details
         if lower.contains("cómo")
             || lower.contains("how")
@@ -213,7 +406,8 @@ pub fn classify(text: &str) -> QuestionType {
         || lower.contains("dime")
         || lower.contains("háblame")
         || lower.contains("give me an example");
-    if is_experience_question && behavioral_score == 0 && architecture_score == 0 && trap_score == 0 {
+    if is_experience_question && behavioral_score == 0 && architecture_score == 0 && trap_score == 0
+    {
         behavioral_score = 1;
     }
 
@@ -378,10 +572,7 @@ mod tests {
 
     #[test]
     fn classifies_trap_by_keyword() {
-        assert_eq!(
-            classify("¿Cuál es tu mayor debilidad?"),
-            QuestionType::Trap
-        );
+        assert_eq!(classify("¿Cuál es tu mayor debilidad?"), QuestionType::Trap);
     }
 
     // -----------------------------------------------------------------------
@@ -477,28 +668,19 @@ mod tests {
     fn zero_score_fallback_technical_what_tool() {
         // "what tool" matches the fallback heuristic (line 160)
         // but is NOT in any keyword list → hits line 164
-        assert_eq!(
-            classify("What tool did you use?"),
-            QuestionType::Technical
-        );
+        assert_eq!(classify("What tool did you use?"), QuestionType::Technical);
     }
 
     #[test]
     fn zero_score_fallback_behavioral_cuando() {
         // "cuándo" is NOT in STAR_KEYWORDS, but matches fallback (line 167) → hits line 174
-        assert_eq!(
-            classify("¿Cuándo fue eso?"),
-            QuestionType::Star
-        );
+        assert_eq!(classify("¿Cuándo fue eso?"), QuestionType::Star);
     }
 
     #[test]
     fn zero_score_fallback_behavioral_when() {
         // "when" (standalone) is NOT in STAR_KEYWORDS, matches fallback (line 168) → hits line 174
-        assert_eq!(
-            classify("When did that happen?"),
-            QuestionType::Star
-        );
+        assert_eq!(classify("When did that happen?"), QuestionType::Star);
     }
 
     #[test]
@@ -519,10 +701,7 @@ mod tests {
     fn experience_override_hablame() {
         // "háblame" is NOT in STAR_KEYWORDS but triggers the experience
         // question override (line 185, 188). No other keywords → behavioral_score = 1.
-        assert_eq!(
-            classify("Háblame de ti"),
-            QuestionType::Star
-        );
+        assert_eq!(classify("Háblame de ti"), QuestionType::Star);
     }
 
     #[test]
@@ -530,10 +709,7 @@ mod tests {
         // "walk me through code": imperative trigger fires, "code" keyword gives
         // technical_score=1. The experience override is suppressed at line 183
         // because the text contains "code". Returns Technical.
-        assert_eq!(
-            classify("Walk me through code"),
-            QuestionType::Technical
-        );
+        assert_eq!(classify("Walk me through code"), QuestionType::Technical);
     }
 
     // -----------------------------------------------------------------------
@@ -544,10 +720,7 @@ mod tests {
     fn exclusion_wins_over_imperative_triggers() {
         // "how are you" is in EXCLUSION_LIST and checked before imperative
         // detection → returns None regardless of other content
-        assert_eq!(
-            classify("Tell me how are you"),
-            QuestionType::None
-        );
+        assert_eq!(classify("Tell me how are you"), QuestionType::None);
     }
 
     #[test]
@@ -676,15 +849,15 @@ mod tests {
 
     #[test]
     fn classify_text_none() {
-        assert_eq!(classify_text("Me gusta programar".into()), QuestionType::None);
+        assert_eq!(
+            classify_text("Me gusta programar".into()),
+            QuestionType::None
+        );
     }
 
     #[test]
     fn classify_text_small_talk() {
-        assert_eq!(
-            classify_text("¿Cómo estás?".into()),
-            QuestionType::None
-        );
+        assert_eq!(classify_text("¿Cómo estás?".into()), QuestionType::None);
     }
 
     #[test]
@@ -757,10 +930,7 @@ mod tests {
     #[test]
     fn classify_imperative_not_at_start_but_marked() {
         // "dime" in the body (after leading word) is handled by body check
-        assert_eq!(
-            classify("Y dime sobre tu experiencia"),
-            QuestionType::Star
-        );
+        assert_eq!(classify("Y dime sobre tu experiencia"), QuestionType::Star);
     }
 
     #[test]
@@ -772,10 +942,7 @@ mod tests {
     #[test]
     fn classify_fallback_technical_via_como() {
         // "cómo" in the text triggers the fallback technical_score increment
-        assert_eq!(
-            classify("¿Cómo lo hiciste?"),
-            QuestionType::Technical
-        );
+        assert_eq!(classify("¿Cómo lo hiciste?"), QuestionType::Technical);
     }
 
     #[test]
@@ -799,7 +966,10 @@ mod tests {
         let long_text = "¿Cómo implementaste ".repeat(100) + "?";
         let result = classify(&long_text);
         // Should not panic and should return a valid QuestionType
-        assert!(matches!(result, QuestionType::Technical | QuestionType::None));
+        assert!(matches!(
+            result,
+            QuestionType::Technical | QuestionType::None
+        ));
     }
 
     #[test]
@@ -865,10 +1035,7 @@ mod tests {
 
     #[test]
     fn classify_text_single_word_imperative() {
-        assert_eq!(
-            classify_text("Cuéntame".into()),
-            QuestionType::Star
-        );
+        assert_eq!(classify_text("Cuéntame".into()), QuestionType::Star);
     }
 
     #[test]

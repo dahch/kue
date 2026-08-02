@@ -24,21 +24,9 @@ type StartStream = unsafe extern "C" fn(i32, i32) -> i32;
 
 type StopStream = unsafe extern "C" fn(i32, i32) -> i32;
 
-type AddAudioToStream = unsafe extern "C" fn(
-    i32,
-    i32,
-    *const f32,
-    u64,
-    i32,
-    u32,
-) -> i32;
+type AddAudioToStream = unsafe extern "C" fn(i32, i32, *const f32, u64, i32, u32) -> i32;
 
-type TranscribeStream = unsafe extern "C" fn(
-    i32,
-    i32,
-    u32,
-    *mut *mut std::ffi::c_void,
-) -> i32;
+type TranscribeStream = unsafe extern "C" fn(i32, i32, u32, *mut *mut std::ffi::c_void) -> i32;
 
 const MOONSHINE_HEADER_VERSION: i32 = 20000;
 const MOONSHINE_MODEL_ARCH_MEDIUM_STREAMING: u32 = 5;
@@ -115,11 +103,7 @@ impl MoonshineFFIEngine {
     }
 
     fn try_load_lib() -> Option<Library> {
-        let lib_names = [
-            "libmoonshine.dylib",
-            "libmoonshine.so",
-            "moonshine.dll",
-        ];
+        let lib_names = ["libmoonshine.dylib", "libmoonshine.so", "moonshine.dll"];
 
         // Prefer the managed lib dir set by the provisioning module
         // (app_data_dir/moonshine/lib), then fall back to dev paths.
@@ -178,8 +162,8 @@ unsafe impl Send for MoonshineFFIEngine {}
 
 impl STTEngine for MoonshineFFIEngine {
     fn load(&mut self, model_path: &PathBuf, language: &str) -> Result<(), String> {
-        let lib = Self::try_load_lib()
-            .ok_or_else(|| "Moonshine shared library not found".to_string())?;
+        let lib =
+            Self::try_load_lib().ok_or_else(|| "Moonshine shared library not found".to_string())?;
 
         let load_fn: Symbol<LoadTranscriber> = unsafe {
             lib.get(b"moonshine_load_transcriber_from_files")
@@ -211,10 +195,13 @@ impl STTEngine for MoonshineFFIEngine {
         let stream_handle = unsafe { create_fn(handle, 0) };
         if stream_handle < 0 {
             unsafe {
-                let free_fn: Symbol<FreeTranscriber> = lib.get(b"moonshine_free_transcriber").unwrap();
+                let free_fn: Symbol<FreeTranscriber> =
+                    lib.get(b"moonshine_free_transcriber").unwrap();
                 free_fn(handle);
             }
-            return Err(format!("Moonshine create stream failed (code: {stream_handle})"));
+            return Err(format!(
+                "Moonshine create stream failed (code: {stream_handle})"
+            ));
         }
 
         let start_fn: Symbol<StartStream> = unsafe {
@@ -226,7 +213,8 @@ impl STTEngine for MoonshineFFIEngine {
             unsafe {
                 let free_s: Symbol<FreeStream> = lib.get(b"moonshine_free_stream").unwrap();
                 free_s(handle, stream_handle);
-                let free_t: Symbol<FreeTranscriber> = lib.get(b"moonshine_free_transcriber").unwrap();
+                let free_t: Symbol<FreeTranscriber> =
+                    lib.get(b"moonshine_free_transcriber").unwrap();
                 free_t(handle);
             }
             return Err(format!("Moonshine start stream failed (code: {rc})"));
@@ -251,19 +239,20 @@ impl STTEngine for MoonshineFFIEngine {
 
         let lib = self.lib.as_ref()?;
 
-        let add_audio_fn: Symbol<AddAudioToStream> = unsafe {
-            lib.get(b"moonshine_transcribe_add_audio_to_stream").ok()?
-        };
+        let add_audio_fn: Symbol<AddAudioToStream> =
+            unsafe { lib.get(b"moonshine_transcribe_add_audio_to_stream").ok()? };
 
-        let transcribe_fn: Symbol<TranscribeStream> = unsafe {
-            lib.get(b"moonshine_transcribe_stream").ok()?
-        };
+        let transcribe_fn: Symbol<TranscribeStream> =
+            unsafe { lib.get(b"moonshine_transcribe_stream").ok()? };
 
         if chunk.is_empty() {
             return None;
         }
 
-        let f32_samples: Vec<f32> = chunk.iter().map(|&s| (s as f32) / (i16::MAX as f32)).collect();
+        let f32_samples: Vec<f32> = chunk
+            .iter()
+            .map(|&s| (s as f32) / (i16::MAX as f32))
+            .collect();
 
         unsafe {
             let rc = add_audio_fn(
@@ -280,9 +269,7 @@ impl STTEngine for MoonshineFFIEngine {
         }
 
         let mut out_transcript: *mut std::ffi::c_void = std::ptr::null_mut();
-        let rc = unsafe {
-            transcribe_fn(handle, stream, 0, &mut out_transcript)
-        };
+        let rc = unsafe { transcribe_fn(handle, stream, 0, &mut out_transcript) };
 
         if rc != 0 || out_transcript.is_null() {
             return None;
@@ -306,7 +293,8 @@ impl Drop for MoonshineFFIEngine {
                 }
                 let free_s: Symbol<FreeStream> = lib.get(b"moonshine_free_stream").unwrap();
                 free_s(h, s);
-                let free_t: Symbol<FreeTranscriber> = lib.get(b"moonshine_free_transcriber").unwrap();
+                let free_t: Symbol<FreeTranscriber> =
+                    lib.get(b"moonshine_free_transcriber").unwrap();
                 free_t(h);
             }
         }

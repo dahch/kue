@@ -93,7 +93,10 @@ impl MoonshineCLIEngine {
                 None
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                log::warn!("CLI: {}-second timeout exceeded for transcribe_file", Self::CLI_TIMEOUT_SECS);
+                log::warn!(
+                    "CLI: {}-second timeout exceeded for transcribe_file",
+                    Self::CLI_TIMEOUT_SECS
+                );
                 None
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -241,13 +244,20 @@ mod tests {
         // UUID v4 has 4 hyphens, plus one between uuid and counter.
         // After removing "segment-" prefix and ".wav" suffix, the remaining
         // string should have 5 hyphens total.
-        let middle = filename.trim_start_matches("segment-").trim_end_matches(".wav");
+        let middle = filename
+            .trim_start_matches("segment-")
+            .trim_end_matches(".wav");
         let hyphen_count = middle.chars().filter(|&c| c == '-').count();
-        assert_eq!(hyphen_count, 5, "uuid has 4 hyphens + 1 separator before counter");
+        assert_eq!(
+            hyphen_count, 5,
+            "uuid has 4 hyphens + 1 separator before counter"
+        );
         // Verify the last segment (after the last hyphen) is a number
         let last_hyphen = middle.rfind('-').unwrap();
         let counter_str = &middle[last_hyphen + 1..];
-        counter_str.parse::<u32>().expect("counter should be a valid u32");
+        counter_str
+            .parse::<u32>()
+            .expect("counter should be a valid u32");
         // Verify filename is unique by generating another
         let path2 = write_wav_temp(&samples).unwrap();
         assert_ne!(path, path2, "each call should produce a unique filename");

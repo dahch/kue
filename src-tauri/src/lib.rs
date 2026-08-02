@@ -88,12 +88,10 @@ pub fn run() {
             app.manage(batch_tracker);
 
             // Register interview runner state
-            let interview_runner = std::sync::Mutex::new(
-                interview_runner::InterviewRunner::new(
-                    app.handle().clone(),
-                    db_clone,
-                ),
-            );
+            let interview_runner = std::sync::Mutex::new(interview_runner::InterviewRunner::new(
+                app.handle().clone(),
+                db_clone,
+            ));
             app.manage(interview_runner);
 
             // Prepend the managed moonshine lib dir to DYLD_LIBRARY_PATH so

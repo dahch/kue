@@ -38,8 +38,7 @@ impl MicVadState {
     /// `since`.  This is the primary signal the hint worker uses to decide
     /// whether to cancel a pending Shadow hint.
     pub fn has_speech_since(&self, since: Instant) -> bool {
-        self.last_speech_start
-            .is_some_and(|t| t > since)
+        self.last_speech_start.is_some_and(|t| t > since)
     }
 
     /// Returns `true` if the VAD currently considers the user to be speaking.
@@ -123,7 +122,10 @@ mod tests {
             s.feed_audio(&speech_chunk());
         }
         assert!(s.is_currently_speaking());
-        assert!(s.has_speech_since(before), "should have recorded a speech start");
+        assert!(
+            s.has_speech_since(before),
+            "should have recorded a speech start"
+        );
 
         // After a transition, has_speech_since should still return true for
         // a time BEFORE the transition.
@@ -133,10 +135,7 @@ mod tests {
         );
         // And false for a time AFTER the transition.
         let after = Instant::now() + Duration::from_secs(60);
-        assert!(
-            !s.has_speech_since(after),
-            "no speech in the far future"
-        );
+        assert!(!s.has_speech_since(after), "no speech in the far future");
     }
 
     #[test]
@@ -219,8 +218,10 @@ mod tests {
         let after_reset = Instant::now();
         s.feed_audio(&speech_chunk()); // 100ms < 200ms
         assert!(!s.is_currently_speaking());
-        assert!(!s.has_speech_since(after_reset),
-            "reset cleared last_speech_start");
+        assert!(
+            !s.has_speech_since(after_reset),
+            "reset cleared last_speech_start"
+        );
 
         s.feed_audio(&speech_chunk()); // now 200ms
         assert!(s.is_currently_speaking());
@@ -329,8 +330,7 @@ mod tests {
         assert!(!s.is_currently_speaking());
         // last_speech_start should still be the old transition time
         assert_eq!(
-            s.last_speech_start,
-            start,
+            s.last_speech_start, start,
             "transition to silence must not overwrite last_speech_start"
         );
     }
@@ -360,6 +360,4 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<MicVadState>();
     }
-
-
 }

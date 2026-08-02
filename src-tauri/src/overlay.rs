@@ -83,6 +83,9 @@ mod tests {
         // Simulate the `ok_or_else` closure: produce the error string
         let err = || ERR_OVERLAY_WINDOW_NOT_FOUND.to_string();
         let simulated = err();
-        assert_eq!(simulated, "overlay window not found — is tauri.conf.json configured?");
+        assert_eq!(
+            simulated,
+            "overlay window not found — is tauri.conf.json configured?"
+        );
     }
 }

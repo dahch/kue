@@ -19,12 +19,10 @@ const WHEEL_URL: &str = "https://files.pythonhosted.org/packages/cc/a3/af1e1f0aa
 
 /// SHA-256 of the wheel published by PyPI (from pypi.org/pypi/moonshine-voice/json).
 /// Trust anchor: PyPI publishes and signs these digests.
-const WHEEL_SHA256: &str =
-    "fb4c81f2fa96674d336530bc1cf2f86b6a4fc8b3c02e138a7a5c768c283f8bc7";
+const WHEEL_SHA256: &str = "fb4c81f2fa96674d336530bc1cf2f86b6a4fc8b3c02e138a7a5c768c283f8bc7";
 
 /// Base URL for Moonshine Medium Streaming English model (quantised).
-const MODEL_BASE: &str =
-    "https://download.moonshine.ai/model/medium-streaming-en/quantized";
+const MODEL_BASE: &str = "https://download.moonshine.ai/model/medium-streaming-en/quantized";
 
 /// Model file manifests: (filename, expected_size, sha256_hex).
 ///
@@ -35,14 +33,46 @@ const MODEL_BASE: &str =
 ///   on the day the pins were recorded. A vendor-published signature
 ///   would be stronger — none exists today from Moonshine.
 const MODEL_FILES: &[(&str, u64, &str)] = &[
-    ("adapter.ort", 3_647_712, "16307442b7f4229f2f1511fc51b545cec9616e55872c588f3a297bbc6f4762ea"),
-    ("cross_kv.ort", 11_544_952, "354b9a955caeb768b528f447f0a36ce4b850ca7b4531900165df304d97904fba"),
-    ("decoder_kv.ort", 146_216_448, "fa67aa87521247f5bf44d3e44d4e4978e58c1f114249c3c6909c882624056715"),
-    ("decoder_kv_with_attention.ort", 146_138_304, "40919de95d08690da3a8ff6df14cf55b3220046f3b767b4a4b769e7b32aaf2d2"),
-    ("encoder.ort", 94_202_872, "a5f11167a62eef61787fe8410453257d6ddb8eba90af461a9604e5f2e93d5322"),
-    ("frontend.ort", 47_467_256, "378fe8a5d7090a1b9ab88bbb1fc95bde010cdd64ec23419350d2d23c675636e9"),
-    ("streaming_config.json", 513, "28e83b7a28e91472692a035e0dae3116422ae43aeb2bef5ed822c44ce89b88af"),
-    ("tokenizer.bin", 249_974, "6884b35fd6377d4c4d32336a0bc152f36b64d1e45b6503683cdc238250a8472d"),
+    (
+        "adapter.ort",
+        3_647_712,
+        "16307442b7f4229f2f1511fc51b545cec9616e55872c588f3a297bbc6f4762ea",
+    ),
+    (
+        "cross_kv.ort",
+        11_544_952,
+        "354b9a955caeb768b528f447f0a36ce4b850ca7b4531900165df304d97904fba",
+    ),
+    (
+        "decoder_kv.ort",
+        146_216_448,
+        "fa67aa87521247f5bf44d3e44d4e4978e58c1f114249c3c6909c882624056715",
+    ),
+    (
+        "decoder_kv_with_attention.ort",
+        146_138_304,
+        "40919de95d08690da3a8ff6df14cf55b3220046f3b767b4a4b769e7b32aaf2d2",
+    ),
+    (
+        "encoder.ort",
+        94_202_872,
+        "a5f11167a62eef61787fe8410453257d6ddb8eba90af461a9604e5f2e93d5322",
+    ),
+    (
+        "frontend.ort",
+        47_467_256,
+        "378fe8a5d7090a1b9ab88bbb1fc95bde010cdd64ec23419350d2d23c675636e9",
+    ),
+    (
+        "streaming_config.json",
+        513,
+        "28e83b7a28e91472692a035e0dae3116422ae43aeb2bef5ed822c44ce89b88af",
+    ),
+    (
+        "tokenizer.bin",
+        249_974,
+        "6884b35fd6377d4c4d32336a0bc152f36b64d1e45b6503683cdc238250a8472d",
+    ),
 ];
 
 /// Wheel-internal paths for the two dylib files.
@@ -238,22 +268,12 @@ pub fn retry_moonshine_download(app_handle: tauri::AppHandle) -> Result<String, 
 // Dylib provisioning (download wheel → extract → verify)
 // ---------------------------------------------------------------------------
 
-fn provision_dylibs(
-    app_handle: &tauri::AppHandle,
-    lib_dir: &Path,
-) -> Result<(), String> {
-    fs::create_dir_all(lib_dir)
-        .map_err(|e| format!("create lib dir {:?}: {e}", lib_dir))?;
+fn provision_dylibs(app_handle: &tauri::AppHandle, lib_dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(lib_dir).map_err(|e| format!("create lib dir {:?}: {e}", lib_dir))?;
 
     eprintln!("[kue] Downloading moonshine-voice wheel (51.9 MB)...");
 
-    let wheel_bytes = download_file(
-        WHEEL_URL,
-        app_handle,
-        ProvisionStage::Dylibs,
-        0,
-        2,
-    )?;
+    let wheel_bytes = download_file(WHEEL_URL, app_handle, ProvisionStage::Dylibs, 0, 2)?;
 
     // Verify SHA-256 against the PyPI-published digest before extracting.
     // This is the strongest trust anchor we have for the wheel contents.
@@ -319,8 +339,7 @@ fn download_file(
 
 fn extract_dylibs(wheel_bytes: &[u8], dest: &Path) -> Result<(), String> {
     let cursor = std::io::Cursor::new(wheel_bytes);
-    let mut archive =
-        zip::ZipArchive::new(cursor).map_err(|e| format!("corrupt wheel: {e}"))?;
+    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("corrupt wheel: {e}"))?;
 
     for target in DYLIB_PATHS {
         let mut file = archive
@@ -332,11 +351,10 @@ fn extract_dylibs(wheel_bytes: &[u8], dest: &Path) -> Result<(), String> {
             .ok_or_else(|| format!("bad zip entry name: {target}"))?;
 
         let dest_path = dest.join(filename);
-        let mut out = fs::File::create(&dest_path)
-            .map_err(|e| format!("create {:?}: {e}", dest_path))?;
+        let mut out =
+            fs::File::create(&dest_path).map_err(|e| format!("create {:?}: {e}", dest_path))?;
 
-        io::copy(&mut file, &mut out)
-            .map_err(|e| format!("extract {}: {e}", target))?;
+        io::copy(&mut file, &mut out).map_err(|e| format!("extract {}: {e}", target))?;
     }
 
     Ok(())
@@ -361,10 +379,14 @@ fn verify_dylib_sizes_plausible(lib_dir: &Path) -> Result<(), String> {
     // libmoonshine.dylib should be ~27 MB, ONNX should be ~26 MB.
     // Allow for minor size variations.
     if main_size < 20_000_000 {
-        return Err(format!("libmoonshine.dylib appears truncated ({main_size} bytes)"));
+        return Err(format!(
+            "libmoonshine.dylib appears truncated ({main_size} bytes)"
+        ));
     }
     if onnx_size < 20_000_000 {
-        return Err(format!("libonnxruntime.*.dylib appears truncated ({onnx_size} bytes)"));
+        return Err(format!(
+            "libonnxruntime.*.dylib appears truncated ({onnx_size} bytes)"
+        ));
     }
 
     eprintln!(
@@ -405,16 +427,11 @@ fn check_existing_model_file(path: &Path, expected_size: u64) -> bool {
 // Model provisioning
 // ---------------------------------------------------------------------------
 
-fn provision_model(
-    app_handle: &tauri::AppHandle,
-    model_dir: &Path,
-) -> Result<(), String> {
-    fs::create_dir_all(model_dir)
-        .map_err(|e| format!("create model dir {:?}: {e}", model_dir))?;
+fn provision_model(app_handle: &tauri::AppHandle, model_dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(model_dir).map_err(|e| format!("create model dir {:?}: {e}", model_dir))?;
 
     let file_count = MODEL_FILES.len() as u32;
-    let total_mb: f64 = MODEL_FILES.iter().map(|(_, s, _)| *s as f64).sum::<f64>()
-        / 1_048_576.0;
+    let total_mb: f64 = MODEL_FILES.iter().map(|(_, s, _)| *s as f64).sum::<f64>() / 1_048_576.0;
     eprintln!("[kue] Downloading Moonshine model ({file_count} files, ~{total_mb:.0} MB)...");
 
     for (idx, (name, expected_size, expected_hash)) in MODEL_FILES.iter().enumerate() {
@@ -428,7 +445,9 @@ fn provision_model(
             match fs::read(&dest) {
                 Ok(data) => match verify_sha256(&data, expected_hash) {
                     Ok(()) => {
-                        eprintln!("[kue]   model file already present: {name} ({size} bytes, SHA-256 OK)");
+                        eprintln!(
+                            "[kue]   model file already present: {name} ({size} bytes, SHA-256 OK)"
+                        );
                         continue;
                     }
                     Err(e) => {
@@ -460,12 +479,10 @@ fn provision_model(
         }
 
         // SHA-256 verification (pinned at build time — see MODEL_FILES doc).
-        verify_sha256(&data, expected_hash).map_err(|e| {
-            format!("Model file {name} integrity check failed: {e}")
-        })?;
+        verify_sha256(&data, expected_hash)
+            .map_err(|e| format!("Model file {name} integrity check failed: {e}"))?;
 
-        fs::write(&dest, &data)
-            .map_err(|e| format!("write model file {:?}: {e}", dest))?;
+        fs::write(&dest, &data).map_err(|e| format!("write model file {:?}: {e}", dest))?;
 
         eprintln!(
             "[kue]   downloaded {name} ({:.1} MB, SHA-256 OK)",
@@ -573,10 +590,12 @@ mod tests {
             let opts = zip::write::FileOptions::<()>::default()
                 .compression_method(zip::CompressionMethod::Stored);
 
-            zip.start_file("moonshine_voice/libmoonshine.dylib", opts).unwrap();
+            zip.start_file("moonshine_voice/libmoonshine.dylib", opts)
+                .unwrap();
             zip.write_all(b"fake dylib content A").unwrap();
 
-            zip.start_file("moonshine_voice/libonnxruntime.1.23.2.dylib", opts).unwrap();
+            zip.start_file("moonshine_voice/libonnxruntime.1.23.2.dylib", opts)
+                .unwrap();
             zip.write_all(b"fake onnx content B").unwrap();
 
             zip.finish().unwrap().into_inner()
@@ -588,9 +607,18 @@ mod tests {
         let main_path = dest.join("libmoonshine.dylib");
         let onnx_path = dest.join("libonnxruntime.1.23.2.dylib");
         assert!(main_path.exists(), "libmoonshine.dylib should exist");
-        assert!(onnx_path.exists(), "libonnxruntime.1.23.2.dylib should exist");
-        assert_eq!(fs::read_to_string(&main_path).unwrap(), "fake dylib content A");
-        assert_eq!(fs::read_to_string(&onnx_path).unwrap(), "fake onnx content B");
+        assert!(
+            onnx_path.exists(),
+            "libonnxruntime.1.23.2.dylib should exist"
+        );
+        assert_eq!(
+            fs::read_to_string(&main_path).unwrap(),
+            "fake dylib content A"
+        );
+        assert_eq!(
+            fs::read_to_string(&onnx_path).unwrap(),
+            "fake onnx content B"
+        );
 
         let _ = fs::remove_dir_all(&dest);
     }
@@ -605,7 +633,10 @@ mod tests {
         let _ = fs::write(lib_dir.join("libonnxruntime.1.23.2.dylib"), b"also small");
 
         let result = verify_dylib_sizes_plausible(&lib_dir);
-        assert!(result.is_err(), "tiny dylibs should be rejected as truncated");
+        assert!(
+            result.is_err(),
+            "tiny dylibs should be rejected as truncated"
+        );
         assert!(
             result.unwrap_err().contains("truncated"),
             "error should mention truncation"
@@ -650,8 +681,11 @@ mod tests {
         // Same-size content with different content → must reject.
         let original = b"AAAA-BBBB-CCCC-DDDD-EEEE";
         let tampered = b"ZZZZ-YYYY-XXXX-WWWW-VVVV";
-        assert_eq!(original.len(), tampered.len(),
-            "test strings must have identical length");
+        assert_eq!(
+            original.len(),
+            tampered.len(),
+            "test strings must have identical length"
+        );
 
         let hash_original = {
             let mut h = Sha256::new();
@@ -659,8 +693,10 @@ mod tests {
             hex::encode(h.finalize())
         };
 
-        assert!(verify_sha256(tampered, &hash_original).is_err(),
-            "same-size tampered content must produce SHA-256 mismatch");
+        assert!(
+            verify_sha256(tampered, &hash_original).is_err(),
+            "same-size tampered content must produce SHA-256 mismatch"
+        );
     }
 
     #[test]
@@ -834,7 +870,8 @@ mod tests {
             let opts = zip::write::FileOptions::<()>::default()
                 .compression_method(zip::CompressionMethod::Stored);
 
-            zip.start_file("moonshine_voice/libmoonshine.dylib", opts).unwrap();
+            zip.start_file("moonshine_voice/libmoonshine.dylib", opts)
+                .unwrap();
             zip.write_all(b"fake content").unwrap();
             // Intentionally skip libonnxruntime.1.23.2.dylib
 

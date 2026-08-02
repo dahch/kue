@@ -117,8 +117,8 @@ fn extract_json(text: &str) -> Option<String> {
 }
 
 fn parse_interview_plan(raw: &str) -> Result<InterviewPlan, String> {
-    let json_str = extract_json(raw)
-        .ok_or_else(|| format!("No JSON found in LLM response: {raw:.200}"))?;
+    let json_str =
+        extract_json(raw).ok_or_else(|| format!("No JSON found in LLM response: {raw:.200}"))?;
 
     let parsed: serde_json::Value = serde_json::from_str(&json_str)
         .map_err(|e| format!("Failed to parse LLM JSON: {e}\nRaw: {json_str:.200}"))?;

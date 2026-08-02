@@ -58,9 +58,7 @@ pub fn check_screen_recording_permission() -> Result<bool, String> {
 /// The model is loaded during app setup (synchronous). This command lets
 /// the frontend poll and show a loading indicator while it finishes.
 #[tauri::command]
-pub fn is_embedding_model_loaded(
-    app_handle: tauri::AppHandle,
-) -> bool {
+pub fn is_embedding_model_loaded(app_handle: tauri::AppHandle) -> bool {
     app_handle
         .try_state::<std::sync::Arc<std::sync::Mutex<crate::rag::embeddings::EmbeddingModel>>>()
         .is_some()
@@ -127,7 +125,10 @@ mod tests {
         let db = setup_db(&db_path);
         mark_onboarding_done_inner(&db).unwrap();
         let result = is_first_run_inner(&db).unwrap();
-        assert!(!result, "should not need onboarding after mark_onboarding_done");
+        assert!(
+            !result,
+            "should not need onboarding after mark_onboarding_done"
+        );
     }
 
     #[test]
@@ -144,7 +145,10 @@ mod tests {
             .unwrap();
         }
         let result = is_first_run_inner(&db).unwrap();
-        assert!(result, "arbitrary value should be treated as first run (only 'done' skips)");
+        assert!(
+            result,
+            "arbitrary value should be treated as first run (only 'done' skips)"
+        );
     }
 
     #[test]
@@ -185,9 +189,11 @@ mod tests {
 
         let conn = db.conn.lock().unwrap();
         let value: String = conn
-            .query_row("SELECT value FROM settings WHERE key='first_run'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT value FROM settings WHERE key='first_run'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(value, "done");
     }
@@ -203,9 +209,11 @@ mod tests {
 
         let conn = db.conn.lock().unwrap();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM settings WHERE key='first_run'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key='first_run'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(count, 1, "idempotent: only one row should exist");
     }
@@ -264,10 +272,7 @@ mod tests {
                 path: db_path,
             };
             let result = mark_onboarding_done_inner(&ro_db);
-            assert!(
-                result.is_err(),
-                "write to read-only database should fail"
-            );
+            assert!(result.is_err(), "write to read-only database should fail");
             let err = result.unwrap_err();
             assert!(
                 err.contains("readonly") || err.contains("unable to open"),
@@ -292,10 +297,8 @@ mod tests {
 
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         // Create only a dummy table — no `settings` table at all.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS dummy (id INTEGER PRIMARY KEY);",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS dummy (id INTEGER PRIMARY KEY);")
+            .unwrap();
 
         let db = Database {
             conn: std::sync::Mutex::new(conn),
@@ -305,7 +308,10 @@ mod tests {
         // The query on non-existent `settings` table returns an SQL error.
         // is_first_run_inner returns Ok(true) for any query error.
         let result = is_first_run_inner(&db).unwrap();
-        assert!(result, "SQL error should be treated as first run (safe default)");
+        assert!(
+            result,
+            "SQL error should be treated as first run (safe default)"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use candle_core::{Device, DType, Tensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
 use hf_hub::api::sync::Api;
@@ -47,7 +47,8 @@ impl EmbeddingModel {
         let config_path = repo.get("config.json")?;
         let weights_path = repo.get("model.safetensors")?;
 
-        let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| format!("tokenizer: {e}"))?;
+        let tokenizer =
+            Tokenizer::from_file(tokenizer_path).map_err(|e| format!("tokenizer: {e}"))?;
 
         let config: Config = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
 
@@ -60,7 +61,11 @@ impl EmbeddingModel {
             unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &device)? };
         let model = BertModel::load(vb, &config)?;
 
-        Ok(Self { model, tokenizer, device })
+        Ok(Self {
+            model,
+            tokenizer,
+            device,
+        })
     }
 }
 
@@ -167,7 +172,10 @@ mod tests {
 
     #[test]
     fn embedding_dim_is_correct() {
-        assert_eq!(EMBEDDING_DIM, 384, "snowflake-arctic-embed-s outputs 384-dim vectors");
+        assert_eq!(
+            EMBEDDING_DIM, 384,
+            "snowflake-arctic-embed-s outputs 384-dim vectors"
+        );
     }
 
     #[test]
@@ -212,7 +220,9 @@ mod tests {
     #[test]
     fn embedder_handles_special_characters() {
         let e = TestEmbedder;
-        let emb = e.generate_embedding("Hello, World! café résumé ñoño 日本国 αβγ 📚🧪").unwrap();
+        let emb = e
+            .generate_embedding("Hello, World! café résumé ñoño 日本国 αβγ 📚🧪")
+            .unwrap();
         assert_eq!(emb.len(), EMBEDDING_DIM);
     }
 
@@ -241,19 +251,31 @@ mod tests {
     #[test]
     fn token_count_default_impl_leading_trailing_whitespace() {
         let e = TestEmbedder;
-        assert_eq!(e.token_count("  hello world  "), 2, "whitespace should be stripped by split_whitespace");
+        assert_eq!(
+            e.token_count("  hello world  "),
+            2,
+            "whitespace should be stripped by split_whitespace"
+        );
     }
 
     #[test]
     fn token_count_default_impl_multiline() {
         let e = TestEmbedder;
-        assert_eq!(e.token_count("line1\nline2\tline3"), 3, "newlines and tabs are whitespace separators");
+        assert_eq!(
+            e.token_count("line1\nline2\tline3"),
+            3,
+            "newlines and tabs are whitespace separators"
+        );
     }
 
     #[test]
     fn token_count_default_impl_only_whitespace() {
         let e = TestEmbedder;
-        assert_eq!(e.token_count("   \n  \t  "), 0, "only whitespace should yield 0 tokens");
+        assert_eq!(
+            e.token_count("   \n  \t  "),
+            0,
+            "only whitespace should yield 0 tokens"
+        );
     }
 
     #[test]

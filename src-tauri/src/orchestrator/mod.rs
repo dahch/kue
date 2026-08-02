@@ -23,9 +23,10 @@ impl PanicState {
     }
 
     pub fn is_panicking(&self) -> bool {
-        self.0.lock().ok().is_some_and(|guard| {
-            guard.is_some_and(|until| Instant::now() < until)
-        })
+        self.0
+            .lock()
+            .ok()
+            .is_some_and(|guard| guard.is_some_and(|until| Instant::now() < until))
     }
 }
 
@@ -132,10 +133,12 @@ fn hint_silenced_by_panic(app_handle: &tauri::AppHandle) -> bool {
         .is_some_and(|s| s.is_panicking())
 }
 
-pub fn should_cancel_hint(hint: &PendingHint, mic_vad: Option<&crate::audio::mic_vad::MicVadState>) -> bool {
-    mic_vad.is_some_and(|vad| {
-        vad.is_currently_speaking() || vad.has_speech_since(hint.scheduled_at)
-    })
+pub fn should_cancel_hint(
+    hint: &PendingHint,
+    mic_vad: Option<&crate::audio::mic_vad::MicVadState>,
+) -> bool {
+    mic_vad
+        .is_some_and(|vad| vad.is_currently_speaking() || vad.has_speech_since(hint.scheduled_at))
 }
 
 /// Drains expired hints from the scheduler and emits them via Tauri events.
@@ -185,7 +188,7 @@ pub fn emit_expired_hints(app_handle: &tauri::AppHandle, scheduler: &HintSchedul
             session_id: hint.session_id,
         };
         if let Err(e) = app_handle.emit("new-hint", &payload) {
-                log::warn!("Failed to emit expired hint: {e}");
+            log::warn!("Failed to emit expired hint: {e}");
         }
     }
 }
@@ -254,11 +257,22 @@ fn try_llm_hint(
     model: &impl Embedder,
 ) -> Option<String> {
     // Try providers in order: hint_provider → analysis provider → any with a key
-    const CANDIDATES: &[&str] = &["openai", "anthropic", "gemini", "openrouter", "deepseek", "ollama"];
+    const CANDIDATES: &[&str] = &[
+        "openai",
+        "anthropic",
+        "gemini",
+        "openrouter",
+        "deepseek",
+        "ollama",
+    ];
 
     let hint_provider_raw = get_setting_or(app_handle, "hint_provider", "");
     let default_provider = get_setting_or(app_handle, "default_provider", "openai");
-    let configured = if hint_provider_raw.is_empty() { default_provider.clone() } else { hint_provider_raw };
+    let configured = if hint_provider_raw.is_empty() {
+        default_provider.clone()
+    } else {
+        hint_provider_raw
+    };
     let analysis_provider = get_setting_or(app_handle, "provider", "openai");
 
     // Build a priority list: configured hint provider first, then analysis
@@ -284,14 +298,15 @@ fn try_llm_hint(
     };
 
     // Find the first provider with a saved API key
-    let (provider, api_key) = order.iter().find_map(|p| {
-        crate::keys::get_api_key(p).ok().map(|k| (p.to_string(), k))
-    })?;
+    let (provider, api_key) = order
+        .iter()
+        .find_map(|p| crate::keys::get_api_key(p).ok().map(|k| (p.to_string(), k)))?;
 
     // Build RAG context: concatenate top-k chunk texts
     let rag_context = match search(model, db, question, HINT_TOP_K) {
         Ok(results) if !results.is_empty() => {
-            let chunks: Vec<String> = results.iter()
+            let chunks: Vec<String> = results
+                .iter()
                 .map(|r| {
                     if let (Some(tag), Some(metric)) = (&r.tag, &r.metric) {
                         format!("[{}] {} — {}", tag, r.text, metric)
@@ -314,9 +329,13 @@ fn try_llm_hint(
     // enforced through a channel from a helper thread.
     let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
     std::thread::spawn(move || {
-        let result = tauri::async_runtime::block_on(
-            crate::llm::generate_hint(&q, &rag, &provider, &model_name, &api_key)
-        );
+        let result = tauri::async_runtime::block_on(crate::llm::generate_hint(
+            &q,
+            &rag,
+            &provider,
+            &model_name,
+            &api_key,
+        ));
         let _ = tx.send(result);
     });
 
@@ -345,17 +364,20 @@ fn get_setting_or(app_handle: &tauri::AppHandle, key: &str, default_val: &str) -
         .try_state::<Database>()
         .and_then(|db| {
             let conn = db.conn.lock().ok()?;
-            conn.query_row(
-                "SELECT value FROM settings WHERE key = ?1",
-                [key],
-                |row| row.get::<_, String>(0),
-            )
+            conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                row.get::<_, String>(0)
+            })
             .ok()
         })
         .unwrap_or_else(|| default_val.to_string())
 }
 
-fn build_hint_text(text: &str, qtype: QuestionType, db: &Database, model: &impl Embedder) -> String {
+fn build_hint_text(
+    text: &str,
+    qtype: QuestionType,
+    db: &Database,
+    model: &impl Embedder,
+) -> String {
     if text.trim().is_empty() {
         return String::new();
     }
@@ -577,7 +599,11 @@ mod tests {
         let expired = s.tick(Instant::now());
 
         // Only "sess-b" hint should fire
-        assert_eq!(expired.len(), 1, "only sess-b hint should survive cancel_all");
+        assert_eq!(
+            expired.len(),
+            1,
+            "only sess-b hint should survive cancel_all"
+        );
         assert_eq!(expired[0].session_id, "sess-b");
         assert_eq!(expired[0].text, "hint b");
 
@@ -603,7 +629,11 @@ mod tests {
 
         // The hint should still be in the queue
         let expired2 = s.tick(start + Duration::from_secs(90));
-        assert_eq!(expired2.len(), 1, "future hint should expire after its deadline");
+        assert_eq!(
+            expired2.len(),
+            1,
+            "future hint should expire after its deadline"
+        );
     }
 
     #[test]
@@ -621,29 +651,45 @@ mod tests {
         s.cancel_all("sess-other");
         std::thread::sleep(Duration::from_millis(20));
         let expired = s.tick(Instant::now());
-        assert_eq!(expired.len(), 1, "cancel on unrelated session should not remove hints");
+        assert_eq!(
+            expired.len(),
+            1,
+            "cancel on unrelated session should not remove hints"
+        );
     }
 
     // ── build_hint_text: guard clauses ──
 
     #[test]
     fn no_question_returns_empty() {
-        let hint =
-            build_hint_text("not a question", QuestionType::None, &test_db("none"), &MockEmbedder);
+        let hint = build_hint_text(
+            "not a question",
+            QuestionType::None,
+            &test_db("none"),
+            &MockEmbedder,
+        );
         assert!(hint.is_empty());
     }
 
     #[test]
     fn empty_text_returns_empty() {
-        let hint =
-            build_hint_text("", QuestionType::Technical, &test_db("empty"), &MockEmbedder);
+        let hint = build_hint_text(
+            "",
+            QuestionType::Technical,
+            &test_db("empty"),
+            &MockEmbedder,
+        );
         assert!(hint.is_empty());
     }
 
     #[test]
     fn whitespace_only_text_returns_empty() {
-        let hint =
-            build_hint_text("   ", QuestionType::Technical, &test_db("ws"), &MockEmbedder);
+        let hint = build_hint_text(
+            "   ",
+            QuestionType::Technical,
+            &test_db("ws"),
+            &MockEmbedder,
+        );
         assert!(hint.is_empty());
     }
 
@@ -775,8 +821,7 @@ mod tests {
     fn hint_for_star_question_without_rag_uses_star_hint() {
         let model = MockEmbedder;
         let db = test_db("generic_star");
-        let hint =
-            build_hint_text("Tell me about a challenge", QuestionType::Star, &db, &model);
+        let hint = build_hint_text("Tell me about a challenge", QuestionType::Star, &db, &model);
         assert!(hint.contains("STAR"));
     }
 
@@ -786,23 +831,35 @@ mod tests {
     fn hint_for_technical_question_with_search_error_uses_generic() {
         let db = test_db("err_tech");
         let hint = build_hint_text("anything", QuestionType::Technical, &db, &FailingEmbedder);
-        assert!(hint.contains("stack"), "should fall back to generic Technical hint");
+        assert!(
+            hint.contains("stack"),
+            "should fall back to generic Technical hint"
+        );
     }
 
     #[test]
     fn hint_for_star_question_with_search_error_uses_star_hint() {
         let db = test_db("err_star");
         let hint = build_hint_text("anything", QuestionType::Star, &db, &FailingEmbedder);
-        assert!(hint.contains("STAR"), "should fall back to generic Star hint");
+        assert!(
+            hint.contains("STAR"),
+            "should fall back to generic Star hint"
+        );
     }
 
     #[test]
     fn hint_for_architecture_question_with_search_error_uses_arch_hint() {
         let db = test_db("err_arch");
-        let hint =
-            build_hint_text("anything", QuestionType::Architecture, &db, &FailingEmbedder);
-        assert!(hint.contains("arquitectura") || hint.contains("capas") || hint.contains("trade-offs"),
-            "should fall back to generic Architecture hint");
+        let hint = build_hint_text(
+            "anything",
+            QuestionType::Architecture,
+            &db,
+            &FailingEmbedder,
+        );
+        assert!(
+            hint.contains("arquitectura") || hint.contains("capas") || hint.contains("trade-offs"),
+            "should fall back to generic Architecture hint"
+        );
     }
 
     // ── build_hint_text: search results with tag/metric combinations ──
@@ -937,14 +994,8 @@ mod tests {
         model: &MockEmbedder,
     ) {
         generate_and_emit_hint(
-            text,
-            qtype,
-            "shadow",
-            session_id,
-            None, // no AppHandle needed in shadow mode
-            scheduler,
-            db,
-            model,
+            text, qtype, "shadow", session_id, None, // no AppHandle needed in shadow mode
+            scheduler, db, model,
         );
     }
 
@@ -958,7 +1009,14 @@ mod tests {
 
         // Schedule a shadow hint (simulates what the worker does after
         // receiving HintCommand::Process in shadow mode).
-        schedule_shadow_hint(&scheduler, session_id, "What is Rust?", QuestionType::Technical, &db, &model);
+        schedule_shadow_hint(
+            &scheduler,
+            session_id,
+            "What is Rust?",
+            QuestionType::Technical,
+            &db,
+            &model,
+        );
 
         // Simulate session end — same CancelSession command that the
         // pipeline sends when its thread exits.
@@ -986,13 +1044,24 @@ mod tests {
         let session_id = "sess-nocancel";
         let text = "Tell me about a conflict";
 
-        schedule_shadow_hint(&scheduler, session_id, text, QuestionType::Star, &db, &model);
+        schedule_shadow_hint(
+            &scheduler,
+            session_id,
+            text,
+            QuestionType::Star,
+            &db,
+            &model,
+        );
 
         // Advance simulated time well past the 2.5s delay.
         let future = Instant::now() + Duration::from_secs(5);
         let expired = scheduler.tick(future);
 
-        assert_eq!(expired.len(), 1, "without CancelSession the hint should fire");
+        assert_eq!(
+            expired.len(),
+            1,
+            "without CancelSession the hint should fire"
+        );
         assert_eq!(expired[0].session_id, session_id);
         // The hint text is built from RAG (generic Star hint since DB is empty)
         assert!(
@@ -1000,7 +1069,11 @@ mod tests {
             "hint text should contain the generic Star hint, got: {}",
             expired[0].text
         );
-        assert_eq!(expired[0].qtype, QuestionType::Star, "qtype should be preserved through the roundtrip");
+        assert_eq!(
+            expired[0].qtype,
+            QuestionType::Star,
+            "qtype should be preserved through the roundtrip"
+        );
 
         // Second tick should return nothing (hint was consumed)
         let again = scheduler.tick(future);
@@ -1051,8 +1124,10 @@ mod tests {
             fire_at: Instant::now(),
             scheduled_at: Instant::now() - std::time::Duration::from_secs(10),
         };
-        assert!(should_cancel_hint(&hint, Some(&vad)),
-            "should cancel when user is currently speaking");
+        assert!(
+            should_cancel_hint(&hint, Some(&vad)),
+            "should cancel when user is currently speaking"
+        );
     }
 
     #[test]
@@ -1074,8 +1149,10 @@ mod tests {
             vad.feed_audio(&vec![5000i16; 1600]);
         }
         assert!(vad.has_speech_since(before));
-        assert!(should_cancel_hint(&hint, Some(&vad)),
-            "should cancel when user spoke after hint was scheduled");
+        assert!(
+            should_cancel_hint(&hint, Some(&vad)),
+            "should cancel when user spoke after hint was scheduled"
+        );
     }
 
     #[test]
@@ -1098,10 +1175,14 @@ mod tests {
         // `has_speech_since(now)` will be false because the speech start
         // happened before `now`. But `is_currently_speaking()` is true,
         // so `should_cancel_hint` returns true anyway.
-        assert!(vad.is_currently_speaking(),
-            "user was already speaking when hint was scheduled");
-        assert!(should_cancel_hint(&hint, Some(&vad)),
-            "should cancel when user was already speaking");
+        assert!(
+            vad.is_currently_speaking(),
+            "user was already speaking when hint was scheduled"
+        );
+        assert!(
+            should_cancel_hint(&hint, Some(&vad)),
+            "should cancel when user was already speaking"
+        );
     }
 
     #[test]
@@ -1125,8 +1206,10 @@ mod tests {
             scheduled_at: now,
         };
 
-        assert!(!should_cancel_hint(&hint, Some(&vad)),
-            "should not cancel when user stopped speaking before hint was scheduled");
+        assert!(
+            !should_cancel_hint(&hint, Some(&vad)),
+            "should not cancel when user stopped speaking before hint was scheduled"
+        );
     }
 
     // ── Integration: shadow hints + mic VAD ──
@@ -1141,7 +1224,14 @@ mod tests {
         let scheduler = HintScheduler::new();
         let session_id = "sess-shadow-vad";
 
-        schedule_shadow_hint(&scheduler, session_id, "What is Rust?", QuestionType::Technical, &db, &model);
+        schedule_shadow_hint(
+            &scheduler,
+            session_id,
+            "What is Rust?",
+            QuestionType::Technical,
+            &db,
+            &model,
+        );
 
         // Simulate user speaking (mic VAD) during the 2.5s delay
         let mut vad = crate::audio::mic_vad::MicVadState::new();
@@ -1154,7 +1244,11 @@ mod tests {
         let future = Instant::now() + std::time::Duration::from_secs(5);
         let expired = scheduler.tick(future);
 
-        assert_eq!(expired.len(), 1, "tick should still return the hint (VAD isn't in tick)");
+        assert_eq!(
+            expired.len(),
+            1,
+            "tick should still return the hint (VAD isn't in tick)"
+        );
         // Now simulate what emit_expired_hints does:
         let should_cancel = expired.iter().any(|h| should_cancel_hint(h, Some(&vad)));
         assert!(should_cancel, "VAD should cancel the expired hint");
@@ -1168,7 +1262,14 @@ mod tests {
         let scheduler = HintScheduler::new();
         let session_id = "sess-shadow-silent";
 
-        schedule_shadow_hint(&scheduler, session_id, "Tell me about a conflict", QuestionType::Star, &db, &model);
+        schedule_shadow_hint(
+            &scheduler,
+            session_id,
+            "Tell me about a conflict",
+            QuestionType::Star,
+            &db,
+            &model,
+        );
 
         // No mic VAD activity
         let vad = crate::audio::mic_vad::MicVadState::new();
@@ -1182,9 +1283,11 @@ mod tests {
 
         let hint = &expired[0];
         assert_eq!(hint.session_id, session_id);
-        assert!(hint.text.contains("STAR"),
+        assert!(
+            hint.text.contains("STAR"),
             "hint text should contain the generic Star hint, got: {}",
-            hint.text);
+            hint.text
+        );
     }
 
     /// Combined test: schedule two shadow hints, user starts speaking,
@@ -1197,8 +1300,22 @@ mod tests {
         let scheduler = HintScheduler::new();
 
         // Simulate two questions in sequence
-        schedule_shadow_hint(&scheduler, "sess-m", "first question", QuestionType::Technical, &db, &model);
-        schedule_shadow_hint(&scheduler, "sess-m", "second question", QuestionType::Star, &db, &model);
+        schedule_shadow_hint(
+            &scheduler,
+            "sess-m",
+            "first question",
+            QuestionType::Technical,
+            &db,
+            &model,
+        );
+        schedule_shadow_hint(
+            &scheduler,
+            "sess-m",
+            "second question",
+            QuestionType::Star,
+            &db,
+            &model,
+        );
 
         let mut vad = crate::audio::mic_vad::MicVadState::new();
         // User starts speaking after both questions
@@ -1212,7 +1329,10 @@ mod tests {
 
         // Both should be cancelled by VAD
         let any_survive = expired.iter().any(|h| !should_cancel_hint(h, Some(&vad)));
-        assert!(!any_survive, "all hints should be cancelled when user is speaking");
+        assert!(
+            !any_survive,
+            "all hints should be cancelled when user is speaking"
+        );
     }
 
     /// Combined test: specify that VAD cancellation does NOT interfere with
@@ -1225,7 +1345,14 @@ mod tests {
         let scheduler = HintScheduler::new();
         let session_id = "sess-vad-conflict";
 
-        schedule_shadow_hint(&scheduler, session_id, "question", QuestionType::Technical, &db, &model);
+        schedule_shadow_hint(
+            &scheduler,
+            session_id,
+            "question",
+            QuestionType::Technical,
+            &db,
+            &model,
+        );
 
         // Cancel at session level (same as pipeline thread end)
         scheduler.cancel_all(session_id);
@@ -1235,8 +1362,10 @@ mod tests {
         let future = Instant::now() + std::time::Duration::from_secs(5);
         let expired = scheduler.tick(future);
 
-        assert!(expired.is_empty(),
-            "CancelSession should remove hints regardless of VAD state");
+        assert!(
+            expired.is_empty(),
+            "CancelSession should remove hints regardless of VAD state"
+        );
     }
 
     /// Combined test: specify that VAD cancellation does NOT interfere with
@@ -1248,8 +1377,22 @@ mod tests {
         let db = test_db("multi_session");
         let scheduler = HintScheduler::new();
 
-        schedule_shadow_hint(&scheduler, "sess-a", "question a", QuestionType::Technical, &db, &model);
-        schedule_shadow_hint(&scheduler, "sess-b", "question b", QuestionType::Star, &db, &model);
+        schedule_shadow_hint(
+            &scheduler,
+            "sess-a",
+            "question a",
+            QuestionType::Technical,
+            &db,
+            &model,
+        );
+        schedule_shadow_hint(
+            &scheduler,
+            "sess-b",
+            "question b",
+            QuestionType::Star,
+            &db,
+            &model,
+        );
 
         // End session "sess-a"
         scheduler.cancel_all("sess-a");
@@ -1259,7 +1402,10 @@ mod tests {
 
         assert_eq!(expired.len(), 1, "only sess-b's hint should survive");
         assert_eq!(expired[0].session_id, "sess-b");
-        assert!(expired[0].text.contains("STAR"), "should be the Star generic hint for sess-b");
+        assert!(
+            expired[0].text.contains("STAR"),
+            "should be the Star generic hint for sess-b"
+        );
     }
 
     // ── PanicState tests ──
@@ -1267,7 +1413,10 @@ mod tests {
     #[test]
     fn panic_state_starts_inactive() {
         let state = PanicState::new();
-        assert!(!state.is_panicking(), "fresh PanicState should not be panicking");
+        assert!(
+            !state.is_panicking(),
+            "fresh PanicState should not be panicking"
+        );
     }
 
     #[test]
@@ -1277,7 +1426,10 @@ mod tests {
             let mut guard = state.0.lock().unwrap();
             *guard = Some(Instant::now() + Duration::from_secs(10));
         }
-        assert!(state.is_panicking(), "should be panicking while within the 10s window");
+        assert!(
+            state.is_panicking(),
+            "should be panicking while within the 10s window"
+        );
     }
 
     #[test]
@@ -1290,7 +1442,10 @@ mod tests {
         }
         // Sleep a tiny bit to ensure the instant is really in the past
         std::thread::sleep(Duration::from_millis(5));
-        assert!(!state.is_panicking(), "should not be panicking after expiry");
+        assert!(
+            !state.is_panicking(),
+            "should not be panicking after expiry"
+        );
     }
 
     #[test]
@@ -1329,7 +1484,10 @@ mod tests {
     fn scheduler_tick_empty_returns_empty() {
         let s = HintScheduler::new();
         let expired = s.tick(Instant::now());
-        assert!(expired.is_empty(), "tick on empty scheduler should return empty vec");
+        assert!(
+            expired.is_empty(),
+            "tick on empty scheduler should return empty vec"
+        );
     }
 
     #[test]
@@ -1338,7 +1496,10 @@ mod tests {
         // Should not panic or error
         s.cancel_all("non-existent-session");
         let expired = s.tick(Instant::now());
-        assert!(expired.is_empty(), "cancel on empty scheduler should leave it empty");
+        assert!(
+            expired.is_empty(),
+            "cancel on empty scheduler should leave it empty"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1424,7 +1585,10 @@ mod tests {
         // Tick will return empty (poisoned)
         std::thread::sleep(Duration::from_millis(20));
         let expired = s.tick(Instant::now());
-        assert!(expired.is_empty(), "hint scheduled on poisoned mutex should be lost");
+        assert!(
+            expired.is_empty(),
+            "hint scheduled on poisoned mutex should be lost"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1562,7 +1726,10 @@ mod tests {
         let future = Instant::now() + Duration::from_secs(5);
         let expired = scheduler.tick(future);
         assert_eq!(expired.len(), 1, "should have scheduled a hint");
-        assert!(expired[0].text.contains("stack"), "should fall back to generic Technical hint");
+        assert!(
+            expired[0].text.contains("stack"),
+            "should fall back to generic Technical hint"
+        );
     }
 
     // ── HintScheduler: hint metadata preserved through tick ──

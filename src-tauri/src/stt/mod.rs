@@ -51,7 +51,13 @@ pub(crate) fn persist_transcript_line(
     if let Err(e) = conn.execute(
         "INSERT INTO transcript_lines (session_id, speaker, text, started_at_ms, ended_at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![session_id, speaker.as_db_str(), text, started_at_ms, ended_at_ms],
+        rusqlite::params![
+            session_id,
+            speaker.as_db_str(),
+            text,
+            started_at_ms,
+            ended_at_ms
+        ],
     ) {
         log::error!("Failed to persist transcript line: {e}");
     }
@@ -150,7 +156,10 @@ impl STTConfig {
             if p.exists() {
                 return p;
             }
-            let p = home_path.join("moonshine-models").join("en").join("medium-streaming");
+            let p = home_path
+                .join("moonshine-models")
+                .join("en")
+                .join("medium-streaming");
             if p.exists() {
                 return p;
             }

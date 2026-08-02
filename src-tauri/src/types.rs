@@ -128,13 +128,19 @@ mod tests {
     #[test]
     fn speaker_deserialize_rejects_invalid() {
         let result: Result<Speaker, _> = serde_json::from_str(r#""invalid""#);
-        assert!(result.is_err(), "invalid speaker value should fail to deserialize");
+        assert!(
+            result.is_err(),
+            "invalid speaker value should fail to deserialize"
+        );
     }
 
     #[test]
     fn speaker_deserialize_rejects_uppercase() {
         let result: Result<Speaker, _> = serde_json::from_str(r#""User""#);
-        assert!(result.is_err(), "capitalized 'User' should fail (must be lowercase)");
+        assert!(
+            result.is_err(),
+            "capitalized 'User' should fail (must be lowercase)"
+        );
     }
 
     // ── Speaker Clone + Copy ──
