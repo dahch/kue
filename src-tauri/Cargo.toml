@@ -26,6 +26,7 @@ rusqlite = { version = "0.33", features = ["bundled"] }
 cpal = "0.15"
 hound = "3.5"
 rubato = "0.15"
+nnnoiseless = "0.5"
 
 [dependencies.screencapturekit]
 path = "vendor/screencapturekit-rs/screencapturekit"
