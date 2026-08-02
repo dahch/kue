@@ -12,7 +12,12 @@ pub struct SimpleVAD {
 }
 
 impl SimpleVAD {
-    pub fn new(threshold: f32, sample_rate: u32, min_speech_duration_ms: u64, silence_timeout_ms: u64) -> Self {
+    pub fn new(
+        threshold: f32,
+        sample_rate: u32,
+        min_speech_duration_ms: u64,
+        silence_timeout_ms: u64,
+    ) -> Self {
         Self {
             threshold,
             sample_rate,
@@ -25,7 +30,13 @@ impl SimpleVAD {
     }
 
     pub fn is_speech(&mut self, samples: &[i16]) -> bool {
-        let rms = rms(samples);
+        // Normalize RMS to the [-1, 1] float scale the threshold is tuned for.
+        // Samples are i16 (RMS can be ~30k for full-scale speech), so comparing
+        // the raw RMS against a float threshold (e.g. 0.015) would mark any
+        // ambient noise as speech and keep the VAD "speaking" forever — which
+        // delays transcription until the max-segment hard cap. Mic audio never
+        // has true silence, so this matters there; loopback audio drops to zero.
+        let rms = rms(samples) / i16::MAX as f32;
         let above = rms > self.threshold;
 
         if above {
@@ -126,7 +137,10 @@ mod tests {
         let mut vad = SimpleVAD::new(0.02, 16000, 200, 600);
         // First chunk: 100ms — not enough to trigger `in_speech`
         let chunk = make_chunk(5000, 1600);
-        assert!(!vad.is_speech(&chunk), "100ms should be below min_speech_duration of 200ms");
+        assert!(
+            !vad.is_speech(&chunk),
+            "100ms should be below min_speech_duration of 200ms"
+        );
         // Second chunk: another 100ms = 200ms total → should trigger
         let chunk2 = make_chunk(5000, 1600);
         assert!(vad.is_speech(&chunk2), "200ms total should trigger speech");
@@ -230,7 +244,10 @@ mod tests {
         // Since in_speech was never true, speech_samples was NOT reset.
         // 1 more chunk (100ms) + existing 300ms = 400ms → triggers speech
         let chunk = make_chunk(5000, 1600);
-        assert!(vad.is_speech(&chunk), "accumulated 300ms + 100ms = 400ms should trigger");
+        assert!(
+            vad.is_speech(&chunk),
+            "accumulated 300ms + 100ms = 400ms should trigger"
+        );
     }
 
     #[test]
@@ -248,7 +265,10 @@ mod tests {
             assert!(!vad.is_speech(&chunk), "re-accumulating 100ms < 200ms");
         }
         let chunk = make_chunk(5000, 1600); // another 100ms = 200ms
-        assert!(vad.is_speech(&chunk), "200ms after reset should trigger speech");
+        assert!(
+            vad.is_speech(&chunk),
+            "200ms after reset should trigger speech"
+        );
     }
 
     #[test]
@@ -278,14 +298,14 @@ mod tests {
 
     #[test]
     fn vad_high_threshold_requires_strong_signal() {
-        let mut vad = SimpleVAD::new(10000.0, 16000, 200, 600);
-        // RMS of samples [100; 3200] = 100.0, which is < 10000
+        let mut vad = SimpleVAD::new(0.5, 16000, 200, 600);
+        // RMS is normalized to [-1, 1]; 100 i16 → 100/32767 ≈ 0.003 < 0.5
         let chunk = make_chunk(100, 3200);
-        assert!(!vad.is_speech(&chunk), "100 RMS < 10000 threshold");
+        assert!(!vad.is_speech(&chunk), "0.003 RMS < 0.5 threshold");
 
-        // RMS of samples [20000; 3200] = 20000, which is > 10000
+        // 20000 i16 → 20000/32767 ≈ 0.610 > 0.5
         let chunk2 = make_chunk(20000, 3200);
-        assert!(vad.is_speech(&chunk2), "20000 RMS > 10000 threshold");
+        assert!(vad.is_speech(&chunk2), "0.610 RMS > 0.5 threshold");
     }
 
     #[test]
@@ -297,7 +317,10 @@ mod tests {
 
         // Reset
         vad.reset();
-        assert!(!vad.is_speech(&make_chunk(0, 160)), "should be silent after reset");
+        assert!(
+            !vad.is_speech(&make_chunk(0, 160)),
+            "should be silent after reset"
+        );
 
         // Must re-accumulate from zero
         let chunk = make_chunk(5000, 1600); // 100ms
@@ -316,7 +339,10 @@ mod tests {
         // Silence at exactly boundary: 600ms = 9600 samples @ 16kHz
         // At exactly 9600 samples, silence_run >= silence_samples should trigger
         let silence = make_chunk(0, 9600);
-        assert!(!vad.is_speech(&silence), "should exit speech after 600ms silence");
+        assert!(
+            !vad.is_speech(&silence),
+            "should exit speech after 600ms silence"
+        );
 
         // Continue silence should stay silent
         let more_silence = make_chunk(0, 1600);
