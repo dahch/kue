@@ -1,5 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,10 @@ struct InterviewStatusEvent {
 
 #[derive(Debug, Clone)]
 pub enum InterviewCommand {
-    Start { session_id: String, plan: InterviewPlan },
+    Start {
+        session_id: String,
+        plan: InterviewPlan,
+    },
     NextQuestion,
     Stop,
 }
@@ -48,7 +52,9 @@ pub struct InterviewRunnerHandle {
 
 impl InterviewRunnerHandle {
     pub fn send(&self, cmd: InterviewCommand) -> Result<(), String> {
-        self.tx.send(cmd).map_err(|_| "Interview runner disconnected".to_string())
+        self.tx
+            .send(cmd)
+            .map_err(|_| "Interview runner disconnected".to_string())
     }
 }
 
@@ -107,8 +113,14 @@ impl InterviewRunner {
 // ---------------------------------------------------------------------------
 
 enum Phase {
-    /// Speaking: TTS is running in a background thread.
-    Speaking { tts_handle: Option<JoinHandle<()>> },
+    /// Speaking: TTS is running in a background thread. The `cancel_flag` is
+    /// shared with the TTS thread; setting it makes `speak_cancellable` kill
+    /// the `say` subprocess, so orphaned TTS does not continue after the
+    /// interview ends.
+    Speaking {
+        tts_handle: Option<JoinHandle<()>>,
+        cancel_flag: Arc<AtomicBool>,
+    },
     /// Listening: waiting for the user's answer budget to expire.
     Listening { started_at: Instant },
 }
@@ -126,7 +138,10 @@ impl RunningInterview {
             session_id,
             plan,
             question_index: 0,
-            phase: Phase::Speaking { tts_handle: None },
+            phase: Phase::Speaking {
+                tts_handle: None,
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+            },
         }
     }
 
@@ -136,6 +151,14 @@ impl RunningInterview {
 
     fn is_done(&self) -> bool {
         self.question_index >= self.plan.questions.len()
+    }
+
+    /// Signals any active TTS thread to kill its `say` subprocess. The TTS
+    /// thread observes the flag within ~50ms and returns.
+    fn cancel_tts(&mut self) {
+        if let Phase::Speaking { cancel_flag, .. } = &self.phase {
+            cancel_flag.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -154,8 +177,8 @@ fn run_interview_loop(
             // -- Command received ------------------------------------------------
             Ok(InterviewCommand::Start { session_id, plan }) => {
                 // Clean up previous state if any
-                if let Some(prev) = state.take() {
-                    finish_interview(&app_handle, &db, &prev.session_id, "restarted");
+                if let Some(mut prev) = state.take() {
+                    finish_interview(&app_handle, &db, &mut prev, "restarted");
                 }
 
                 let mut running = RunningInterview::new(session_id, plan);
@@ -167,22 +190,22 @@ fn run_interview_loop(
                 if let Some(ref mut running) = state {
                     advance_question(&app_handle, running);
                     if running.is_done() {
-                        finish_interview(&app_handle, &db, &running.session_id, "completed");
+                        finish_interview(&app_handle, &db, running, "completed");
                         state = None;
                     }
                 }
             }
 
             Ok(InterviewCommand::Stop) => {
-                if let Some(running) = state.take() {
-                    finish_interview(&app_handle, &db, &running.session_id, "stopped");
+                if let Some(mut running) = state.take() {
+                    finish_interview(&app_handle, &db, &mut running, "stopped");
                 }
                 break;
             }
 
             Err(RecvTimeoutError::Disconnected) => {
-                if let Some(running) = state.take() {
-                    finish_interview(&app_handle, &db, &running.session_id, "disconnected");
+                if let Some(mut running) = state.take() {
+                    finish_interview(&app_handle, &db, &mut running, "disconnected");
                 }
                 break;
             }
@@ -190,9 +213,9 @@ fn run_interview_loop(
             // -- Timeout (no command) — tick the state machine -------------------
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(ref mut running) = state {
-                    tick(&app_handle, &db, running);
+                    tick(&app_handle, running);
                     if running.is_done() {
-                        finish_interview(&app_handle, &db, &running.session_id, "completed");
+                        finish_interview(&app_handle, &db, running, "completed");
                         state = None;
                     }
                 }
@@ -209,58 +232,111 @@ fn run_interview_loop(
 
 /// Starts the TTS for the current question and transitions to Speaking.
 fn start_current_question(app_handle: &tauri::AppHandle, running: &mut RunningInterview) {
-    let Some(q) = running.current_question() else {
+    // Extract values before mutable operations so we don't hold an immutable
+    // borrow across the cancel_tts call.
+    let q_index = running.question_index;
+    let q_total = running.plan.questions.len();
+    let q_text = running
+        .current_question()
+        .map(|q| q.text.clone())
+        .unwrap_or_default();
+
+    // Kill any TTS still running from a previous question.
+    running.cancel_tts();
+
+    // Defensive: if a plan entry has empty text, emit the question and go
+    // straight to Listening so the state machine doesn't stall on it.
+    if q_text.trim().is_empty() {
+        let _ = app_handle.emit(
+            "interview-question",
+            InterviewQuestionEvent {
+                question_index: q_index,
+                total_questions: q_total,
+                text: q_text,
+            },
+        );
+        let _ = app_handle.emit(
+            "interview-status",
+            InterviewStatusEvent {
+                status: "listening".to_string(),
+            },
+        );
+        running.phase = Phase::Listening {
+            started_at: Instant::now(),
+        };
         return;
-    };
+    }
 
-    let _ = app_handle.emit("interview-question", InterviewQuestionEvent {
-        question_index: running.question_index,
-        total_questions: running.plan.questions.len(),
-        text: q.text.clone(),
-    });
+    let _ = app_handle.emit(
+        "interview-question",
+        InterviewQuestionEvent {
+            question_index: q_index,
+            total_questions: q_total,
+            text: q_text.clone(),
+        },
+    );
 
-    let _ = app_handle.emit("interview-status", InterviewStatusEvent {
-        status: "speaking".to_string(),
-    });
+    let _ = app_handle.emit(
+        "interview-status",
+        InterviewStatusEvent {
+            status: "speaking".to_string(),
+        },
+    );
 
-    let text = q.text.clone();
     let ah = app_handle.clone();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let cancel_flag_clone = Arc::clone(&cancel_flag);
+
     let tts_handle = thread::spawn(move || {
-        if let Err(e) = tts::speak(&text) {
-            log::warn!("TTS speak failed: {e}");
+        // Only emit "listening" when TTS completed naturally. If it was
+        // cancelled (Stop/Next), emitting a stale "listening" would revert the
+        // UI from "finished" back to listening and resurrect the buttons.
+        let completed = tts::speak_cancellable(&q_text, Arc::clone(&cancel_flag_clone)).is_ok();
+        if completed && !cancel_flag_clone.load(Ordering::Relaxed) {
+            let _ = ah.emit(
+                "interview-status",
+                InterviewStatusEvent {
+                    status: "listening".to_string(),
+                },
+            );
+        } else {
+            log::debug!("TTS cancelled; not emitting listening status");
         }
-        let _ = ah.emit("interview-status", InterviewStatusEvent {
-            status: "listening".to_string(),
-        });
     });
 
-    running.phase = Phase::Speaking { tts_handle: Some(tts_handle) };
+    running.phase = Phase::Speaking {
+        tts_handle: Some(tts_handle),
+        cancel_flag,
+    };
 }
 
 /// Called on each tick (~300ms). Checks whether TTS has finished (→Listening)
 /// and whether the listening budget has elapsed (→advance).
-fn tick(app_handle: &tauri::AppHandle, db: &Database, running: &mut RunningInterview) {
+fn tick(app_handle: &tauri::AppHandle, running: &mut RunningInterview) {
     match &running.phase {
-        Phase::Speaking { tts_handle } => {
+        Phase::Speaking { tts_handle, .. } => {
             if tts_handle.as_ref().map_or(true, |h| h.is_finished()) {
-                // TTS finished — transition to listening.
-                running.phase = Phase::Listening { started_at: Instant::now() };
+                running.phase = Phase::Listening {
+                    started_at: Instant::now(),
+                };
             }
         }
         Phase::Listening { started_at } => {
-            let budget = running.current_question().map(|q| q.budget_seconds.max(10)).unwrap_or(10);
+            let budget = running
+                .current_question()
+                .map(|q| q.budget_seconds.max(10))
+                .unwrap_or(10);
             if started_at.elapsed().as_secs() >= budget as u64 {
                 advance_question(app_handle, running);
-                if running.is_done() {
-                    finish_interview(app_handle, db, &running.session_id, "completed");
-                }
             }
         }
     }
 }
 
-/// Moves to the next question and starts its TTS.
+/// Moves to the next question, cancelling any active TTS first, then starts
+/// the next question's TTS.
 fn advance_question(app_handle: &tauri::AppHandle, running: &mut RunningInterview) {
+    running.cancel_tts();
     running.question_index += 1;
     if !running.is_done() {
         start_current_question(app_handle, running);
@@ -270,32 +346,45 @@ fn advance_question(app_handle: &tauri::AppHandle, running: &mut RunningIntervie
 fn finish_interview(
     app_handle: &tauri::AppHandle,
     db: &Database,
-    session_id: &str,
+    running: &mut RunningInterview,
     reason: &str,
 ) {
-    let _ = app_handle.emit("interview-status", InterviewStatusEvent {
-        status: "finished".to_string(),
-    });
-    let _ = app_handle.emit("interview-finished", serde_json::json!({
-        "session_id": session_id,
-        "reason": reason,
-    }));
+    // Kill any running TTS subprocess immediately.
+    running.cancel_tts();
+
+    let _ = app_handle.emit(
+        "interview-status",
+        InterviewStatusEvent {
+            status: "finished".to_string(),
+        },
+    );
+    let _ = app_handle.emit(
+        "interview-finished",
+        serde_json::json!({
+            "session_id": &running.session_id,
+            "reason": reason,
+        }),
+    );
 
     if let Ok(conn) = db.conn.lock() {
         let _ = conn.execute(
             "UPDATE sessions SET current_question_index = -1 WHERE id = ?1",
-            rusqlite::params![session_id],
+            rusqlite::params![running.session_id],
         );
     }
 
-    log::info!("Interview finished for session {} (reason: {})", session_id, reason);
+    log::info!(
+        "Interview finished for session {} (reason: {})",
+        running.session_id,
+        reason
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn start_ai_interview(
     session_id: String,
     _job_description: String,
@@ -321,20 +410,28 @@ pub fn start_ai_interview(
         .map_err(|e| e.to_string())?;
     }
 
-    let mut runner = interview_runner.lock().map_err(|e| e.to_string())?;
+    // Take the old runner's thread handle out of the state so the new runner
+    // replaces it atomically, then stop+join the old runner off the UI thread.
+    // Joining on the async runtime guarantees the old runner has fully stopped
+    // (and won't emit stray interview-* events) before the new one starts.
+    let old_handle = {
+        let mut runner = interview_runner.lock().map_err(|e| e.to_string())?;
+        let old_handle = runner.handle.take();
+        let old_tx = runner.cmd_tx.clone();
+        if let Some(old_handle) = old_handle {
+            let _ = old_tx.send(InterviewCommand::Stop);
+            Some(old_handle)
+        } else {
+            None
+        }
+    };
 
-    // Grab the old thread handle and sender before replacing the runner.
-    let old_handle = runner.handle.take();
-    let old_tx = runner.cmd_tx.clone();
-    drop(runner);
-
-    // Stop the old runner outside the lock
     if let Some(old_handle) = old_handle {
-        let _ = old_tx.send(InterviewCommand::Stop);
+        // Runs on Tauri's blocking thread pool (command(async)), NOT the UI
+        // thread and NOT the async runtime.
         let _ = old_handle.join();
     }
 
-    // Re-lock and install the new runner
     let mut runner = interview_runner.lock().map_err(|e| e.to_string())?;
     let new_runner = InterviewRunner::new(app_handle.clone(), Database::clone(db.inner()));
     *runner = new_runner;
