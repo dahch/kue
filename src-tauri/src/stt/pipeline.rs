@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use tauri::Emitter;
 
-use super::{create_engine, persist_transcript_line, SimpleVAD, STTConfig, STTEngine};
+use super::{create_engine, persist_transcript_line, STTConfig, STTEngine, SimpleVAD};
 use crate::classifier::{classify, QuestionType};
 use crate::orchestrator::{HintCommand, HintJob, HintJobSender};
 use crate::types::{Speaker, TranscriptLine};
@@ -17,6 +17,13 @@ pub struct STTPipeline {
     app_handle: Option<tauri::AppHandle>,
     mode: String,
     hint_job_tx: Option<HintJobSender>,
+    /// Which speaker the pipeline transcribes. Loopback audio is the
+    /// interviewer; mic audio is the user.
+    speaker: Speaker,
+    /// When true, the pipeline classifies transcribed text as questions and
+    /// emits `question-detected` events / schedules hints. Only the loopback
+    /// (interviewer) pipeline does this — the mic (user) pipeline just records.
+    is_question_source: bool,
 }
 
 impl STTPipeline {
@@ -30,6 +37,8 @@ impl STTPipeline {
             app_handle: None,
             mode: String::new(),
             hint_job_tx: None,
+            speaker: Speaker::Interviewer,
+            is_question_source: true,
         }
     }
 
@@ -48,8 +57,18 @@ impl STTPipeline {
         self
     }
 
+    /// Sets which speaker this pipeline attributes its transcriptions to.
+    /// Also disables question classification/hints for non-interviewer
+    /// (mic) pipelines.
+    pub fn with_speaker(mut self, speaker: Speaker) -> Self {
+        self.is_question_source = matches!(speaker, Speaker::Interviewer);
+        self.speaker = speaker;
+        self
+    }
+
     pub fn load_model(&mut self) -> Result<(), String> {
-        self.engine.load(&self.config.model_path, &self.config.language)
+        self.engine
+            .load(&self.config.model_path, &self.config.language)
     }
 
     pub fn start_session(&mut self, session_id: &str) {
@@ -85,11 +104,12 @@ impl STTPipeline {
         let mut segment_start_ms: u64 = 0;
         let mut in_segment = false;
         let session_start = Instant::now();
+        let thread_name = format!("kue-stt-{}", self.speaker.as_db_str());
 
         thread::Builder::new()
-            .name("kue-stt-pipeline".into())
+            .name(thread_name)
             .spawn(move || {
-                log::info!("STT pipeline thread started");
+                log::info!("STT pipeline thread started (speaker: {})", self.speaker);
 
                 loop {
                     let samples = {
@@ -199,15 +219,18 @@ impl STTPipeline {
 
             if !self.session_id.is_empty() {
                 persist_transcript_line(
-                    db, &self.session_id, &transcribed, &Speaker::Interviewer, *segment_start_ms, ended_at_ms,
+                    db,
+                    &self.session_id,
+                    &transcribed,
+                    &self.speaker,
+                    *segment_start_ms,
+                    ended_at_ms,
                 );
             }
 
             if let Some(ref handle) = self.app_handle {
-                let qtype = classify(&transcribed);
-
                 let line = TranscriptLine {
-                    speaker: Speaker::Interviewer,
+                    speaker: self.speaker,
                     text: transcribed.clone(),
                     started_at_ms: *segment_start_ms,
                     ended_at_ms,
@@ -216,22 +239,29 @@ impl STTPipeline {
                     log::warn!("Failed to emit new-transcript event: {e}");
                 }
 
-                if qtype != QuestionType::None {
-                    if let Err(e) = handle.emit("question-detected", serde_json::json!({
-                        "text": &transcribed,
-                        "type": qtype.as_str(),
-                        "session_id": self.session_id,
-                    })) {
-                        log::warn!("Failed to emit question-detected event: {e}");
-                    }
+                if self.is_question_source {
+                    let qtype = classify(&transcribed);
 
-                    if let Some(ref tx) = self.hint_job_tx {
-                        let _ = tx.send(HintCommand::Process(HintJob {
-                            session_id: self.session_id.clone(),
-                            text: transcribed.clone(),
-                            qtype,
-                            mode: self.mode.clone(),
-                        }));
+                    if qtype != QuestionType::None {
+                        if let Err(e) = handle.emit(
+                            "question-detected",
+                            serde_json::json!({
+                                "text": &transcribed,
+                                "type": qtype.as_str(),
+                                "session_id": self.session_id,
+                            }),
+                        ) {
+                            log::warn!("Failed to emit question-detected event: {e}");
+                        }
+
+                        if let Some(ref tx) = self.hint_job_tx {
+                            let _ = tx.send(HintCommand::Process(HintJob {
+                                session_id: self.session_id.clone(),
+                                text: transcribed.clone(),
+                                qtype,
+                                mode: self.mode.clone(),
+                            }));
+                        }
                     }
                 }
             }
@@ -268,15 +298,18 @@ impl STTPipeline {
 
             if !self.session_id.is_empty() {
                 persist_transcript_line(
-                    db, &self.session_id, &transcribed, &Speaker::Interviewer, *segment_start_ms, ended_at_ms,
+                    db,
+                    &self.session_id,
+                    &transcribed,
+                    &self.speaker,
+                    *segment_start_ms,
+                    ended_at_ms,
                 );
             }
 
             if let Some(ref handle) = self.app_handle {
-                let qtype = classify(&transcribed);
-
                 let line = TranscriptLine {
-                    speaker: Speaker::Interviewer,
+                    speaker: self.speaker,
                     text: transcribed.clone(),
                     started_at_ms: *segment_start_ms,
                     ended_at_ms,
@@ -285,22 +318,29 @@ impl STTPipeline {
                     log::warn!("Failed to emit new-transcript event: {e}");
                 }
 
-                if qtype != QuestionType::None {
-                    if let Err(e) = handle.emit("question-detected", serde_json::json!({
-                        "text": &transcribed,
-                        "type": qtype.as_str(),
-                        "session_id": self.session_id,
-                    })) {
-                        log::warn!("Failed to emit question-detected event: {e}");
-                    }
+                if self.is_question_source {
+                    let qtype = classify(&transcribed);
 
-                    if let Some(ref tx) = self.hint_job_tx {
-                        let _ = tx.send(HintCommand::Process(HintJob {
-                            session_id: self.session_id.clone(),
-                            text: transcribed.clone(),
-                            qtype,
-                            mode: self.mode.clone(),
-                        }));
+                    if qtype != QuestionType::None {
+                        if let Err(e) = handle.emit(
+                            "question-detected",
+                            serde_json::json!({
+                                "text": &transcribed,
+                                "type": qtype.as_str(),
+                                "session_id": self.session_id,
+                            }),
+                        ) {
+                            log::warn!("Failed to emit question-detected event: {e}");
+                        }
+
+                        if let Some(ref tx) = self.hint_job_tx {
+                            let _ = tx.send(HintCommand::Process(HintJob {
+                                session_id: self.session_id.clone(),
+                                text: transcribed.clone(),
+                                qtype,
+                                mode: self.mode.clone(),
+                            }));
+                        }
                     }
                 }
             }
@@ -313,11 +353,10 @@ impl STTPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
     use crate::orchestrator::{HintCommand, HintJob};
     use rusqlite::Connection;
-
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
     // -----------------------------------------------------------------------
     // MockEngine — controllable STTEngine for pipeline tests
@@ -345,7 +384,8 @@ mod tests {
 
     impl STTEngine for MockEngine {
         fn load(&mut self, _model_path: &PathBuf, _language: &str) -> Result<(), String> {
-            self.load_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.load_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.load_result.clone()
         }
 
@@ -429,6 +469,8 @@ mod tests {
             app_handle: None,
             mode: String::new(),
             hint_job_tx: None,
+            speaker: Speaker::Interviewer,
+            is_question_source: true,
         }
     }
 
@@ -512,8 +554,11 @@ mod tests {
         let db = create_test_db("sess-1");
 
         pipeline.flush_segment(
-            &mut buffer, &mut segment_start_ms, &mut in_segment,
-            &start, &db,
+            &mut buffer,
+            &mut segment_start_ms,
+            &mut in_segment,
+            &start,
+            &db,
         );
 
         // Early return: no state change
@@ -537,8 +582,11 @@ mod tests {
         let db = create_test_db("sess-2");
 
         pipeline.flush_segment(
-            &mut buffer, &mut segment_start_ms, &mut in_segment,
-            &start, &db,
+            &mut buffer,
+            &mut segment_start_ms,
+            &mut in_segment,
+            &start,
+            &db,
         );
 
         assert!(buffer.is_empty());
@@ -560,8 +608,11 @@ mod tests {
         let db = create_test_db("sess-3");
 
         pipeline.flush_segment(
-            &mut buffer, &mut segment_start_ms, &mut in_segment,
-            &start, &db,
+            &mut buffer,
+            &mut segment_start_ms,
+            &mut in_segment,
+            &start,
+            &db,
         );
 
         assert!(buffer.is_empty());
@@ -570,7 +621,9 @@ mod tests {
         // Verify nothing was persisted
         let conn = db.conn.lock().unwrap();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM transcript_lines", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM transcript_lines", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0, "empty text should not be persisted");
     }
@@ -590,8 +643,11 @@ mod tests {
         let db = create_test_db("unused");
 
         pipeline.flush_segment(
-            &mut buffer, &mut segment_start_ms, &mut in_segment,
-            &start, &db,
+            &mut buffer,
+            &mut segment_start_ms,
+            &mut in_segment,
+            &start,
+            &db,
         );
 
         assert!(buffer.is_empty());
@@ -600,7 +656,9 @@ mod tests {
         // Nothing persisted because session_id was empty
         let conn = db.conn.lock().unwrap();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM transcript_lines", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM transcript_lines", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -621,8 +679,11 @@ mod tests {
         let db = create_test_db("session-flush-1");
 
         pipeline.flush_segment(
-            &mut buffer, &mut segment_start_ms, &mut in_segment,
-            &start, &db,
+            &mut buffer,
+            &mut segment_start_ms,
+            &mut in_segment,
+            &start,
+            &db,
         );
 
         // Verify buffer cleared and segment reset
@@ -660,7 +721,14 @@ mod tests {
     fn persist_transcript_line_inserts_row() {
         let db = create_test_db("session-persist-1");
 
-        super::persist_transcript_line(&db, "session-persist-1", "hello", &Speaker::Interviewer, 100, 200);
+        super::persist_transcript_line(
+            &db,
+            "session-persist-1",
+            "hello",
+            &Speaker::Interviewer,
+            100,
+            200,
+        );
 
         let conn = db.conn.lock().unwrap();
         let (text, speaker, started, ended): (String, String, u64, u64) = conn
@@ -685,13 +753,20 @@ mod tests {
         // This should fail silently (the FK violation is caught by the
         // eprintln! guard — no panic, no crash)
         super::persist_transcript_line(
-            &db, "non-existent-session", "orphan text", &Speaker::Interviewer, 0, 100,
+            &db,
+            "non-existent-session",
+            "orphan text",
+            &Speaker::Interviewer,
+            0,
+            100,
         );
 
         // Nothing should have been inserted
         let conn = db.conn.lock().unwrap();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM transcript_lines", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM transcript_lines", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -712,7 +787,8 @@ mod tests {
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
              );
              INSERT INTO sessions (id) VALUES ('s-poisoned');",
-        ).unwrap();
+        )
+        .unwrap();
 
         let mtx = std::sync::Arc::new(std::sync::Mutex::new(conn));
         // Poison the mutex by panicking in another thread
@@ -724,14 +800,20 @@ mod tests {
         let _ = handle.join();
 
         let db = crate::db::Database {
-            conn: std::sync::Arc::try_unwrap(mtx).unwrap_or_else(|_| {
-                panic!("Arc should have one reference after join")
-            }),
+            conn: std::sync::Arc::try_unwrap(mtx)
+                .unwrap_or_else(|_| panic!("Arc should have one reference after join")),
             path: PathBuf::from(":memory:"),
         };
 
         // This should handle the poisoned mutex gracefully (eprintln + return)
-        super::persist_transcript_line(&db, "s-poisoned", "should not panic", &Speaker::Interviewer, 0, 100);
+        super::persist_transcript_line(
+            &db,
+            "s-poisoned",
+            "should not panic",
+            &Speaker::Interviewer,
+            0,
+            100,
+        );
         // The function should not panic — that's the main assertion.
         // Since the mutex is poisoned, no row was inserted.
     }
@@ -741,15 +823,20 @@ mod tests {
         let db = create_test_db("session-special");
         let special = "Hello, ¿cómo estás? 你好 👋 émoji & <stuff>";
 
-        super::persist_transcript_line(&db, "session-special", special, &Speaker::Interviewer, 0, 100);
+        super::persist_transcript_line(
+            &db,
+            "session-special",
+            special,
+            &Speaker::Interviewer,
+            0,
+            100,
+        );
 
         let conn = db.conn.lock().unwrap();
         let text: String = conn
-            .query_row(
-                "SELECT text FROM transcript_lines LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT text FROM transcript_lines LIMIT 1", [], |row| {
+                row.get(0)
+            })
             .unwrap();
 
         assert_eq!(text, special);
@@ -759,13 +846,36 @@ mod tests {
     fn persist_transcript_line_multiple_lines() {
         let db = create_test_db("session-multi");
 
-        super::persist_transcript_line(&db, "session-multi", "first", &Speaker::Interviewer, 0, 100);
-        super::persist_transcript_line(&db, "session-multi", "second", &Speaker::Interviewer, 150, 300);
-        super::persist_transcript_line(&db, "session-multi", "third", &Speaker::Interviewer, 350, 500);
+        super::persist_transcript_line(
+            &db,
+            "session-multi",
+            "first",
+            &Speaker::Interviewer,
+            0,
+            100,
+        );
+        super::persist_transcript_line(
+            &db,
+            "session-multi",
+            "second",
+            &Speaker::Interviewer,
+            150,
+            300,
+        );
+        super::persist_transcript_line(
+            &db,
+            "session-multi",
+            "third",
+            &Speaker::Interviewer,
+            350,
+            500,
+        );
 
         let conn = db.conn.lock().unwrap();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM transcript_lines", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM transcript_lines", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 3);
 
@@ -815,19 +925,16 @@ mod tests {
         let start = session_start();
         let db = create_test_db("sess-chan");
 
-        pipeline.flush_segment(
-            &mut buffer,
-            &mut seg_start,
-            &mut in_seg,
-            &start,
-            &db,
-        );
+        pipeline.flush_segment(&mut buffer, &mut seg_start, &mut in_seg, &start, &db);
 
         // Verify no send occurred (app_handle is None, so the hint_job_tx
         // branch is never reached — this is the expected behaviour in a
         // test environment)
         let received = rx.try_recv();
-        assert!(received.is_err(), "channel should be empty when app_handle is None");
+        assert!(
+            received.is_err(),
+            "channel should be empty when app_handle is None"
+        );
     }
 
     #[test]

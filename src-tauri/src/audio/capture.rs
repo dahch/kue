@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{SampleFormat, WavSpec, WavWriter};
+use nnnoiseless::DenoiseState;
 use rubato::{FastFixedOut, PolynomialDegree, Resampler};
 use screencapturekit::cm_sample_buffer::CMSampleBuffer;
 use screencapturekit::sc_content_filter::{self, SCContentFilter};
@@ -36,8 +37,9 @@ const LOOPBACK_CHANNEL_B_FILENAME: &str = "loopback_channel_B.wav";
 
 /// Gain applied to system-loopback (Channel B) samples. Interview audio is
 /// often much quieter than the microphone; this boost keeps it above the VAD
-/// threshold without clipping.
-const LOOPBACK_GAIN: f32 = 4.0;
+/// threshold without clipping. Kept modest so the amplified TTS does not
+/// distort and confuse the STT engine.
+const LOOPBACK_GAIN: f32 = 3.0;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -117,6 +119,12 @@ struct AudioCaptureInner {
     loopback_writer: Option<JoinHandle<()>>,
     mic_vad_handle: Option<JoinHandle<()>>,
     stt_thread: Option<JoinHandle<()>>,
+    /// STT pipeline thread for the microphone (Canal A, user speech).
+    mic_stt_thread: Option<JoinHandle<()>>,
+    /// Handle to the background teardown thread spawned by `stop_session`.
+    /// Joined in `start()` before creating new streams so the old session's
+    /// ScreenCaptureKit handles are fully released.
+    stop_bg_handle: Option<JoinHandle<()>>,
     mode: String,
     session_dir: Option<PathBuf>,
     session_id: Option<String>,
@@ -132,6 +140,8 @@ impl AudioCapture {
                 loopback_writer: None,
                 mic_vad_handle: None,
                 stt_thread: None,
+                mic_stt_thread: None,
+                stop_bg_handle: None,
                 mode: String::new(),
                 session_dir: None,
                 session_id: None,
@@ -172,10 +182,39 @@ impl AudioCapture {
         std::env::temp_dir().join(format!("kue-session-{ts}"))
     }
 
+    /// Schedules reaping of any pending teardown thread from a previous
+    /// session. Non-blocking: the previous `stop()` already dropped the streams
+    /// and released the inner lock before joining writers, so a new `start()`
+    /// can proceed immediately — we only need to make sure the old teardown
+    /// thread is joined/reaped so its handles don't leak. The join itself runs
+    /// on a detached watcher thread; serialization with `start()` is enforced
+    /// by the inner mutex.
+    pub fn schedule_teardown_reap(&self) {
+        let handle = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.stop_bg_handle.take()
+        };
+        if let Some(h) = handle {
+            log::info!("Reaping previous session teardown thread...");
+            // Detach the join: the teardown thread does its own cleanup and
+            // batch transcription; we must not block session start on it.
+            std::thread::spawn(move || {
+                let _ = h.join();
+            });
+        }
+    }
+
     pub fn start(
         &self,
         mode: &str,
-    ) -> Result<(AudioCaptureStatus, std::sync::mpsc::Receiver<Vec<i16>>), AudioError> {
+    ) -> Result<
+        (
+            AudioCaptureStatus,
+            std::sync::mpsc::Receiver<Vec<i16>>,
+            std::sync::mpsc::Receiver<Vec<i16>>,
+        ),
+        AudioError,
+    > {
         if !VALID_MODES.contains(&mode) {
             return Err(AudioError::InvalidMode(format!(
                 "Mode must be 'practice' or 'shadow', got '{mode}'"
@@ -197,7 +236,8 @@ impl AudioCapture {
         // -- Mic (Canal A) -------------------------------------------------
         let (mic_wav_tx, mic_wav_rx) = sync_channel::<Vec<i16>>(BUFFER_CAPACITY);
         let (mic_vad_tx, mic_vad_rx) = sync_channel::<Vec<i16>>(BUFFER_CAPACITY);
-        let mic = start_mic_capture_tee(mic_wav_tx, mic_vad_tx).map_err(|e| {
+        let (mic_stt_tx, mic_stt_rx) = sync_channel::<Vec<i16>>(BUFFER_CAPACITY);
+        let mic = start_mic_capture_tee(mic_wav_tx, mic_vad_tx, mic_stt_tx).map_err(|e| {
             let _ = fs::remove_dir_all(&session_dir);
             e
         })?;
@@ -233,35 +273,64 @@ impl AudioCapture {
                 session_id: None,
             },
             stt_rx,
+            mic_stt_rx,
         ))
     }
 
     pub fn stop(&self) -> AudioCaptureStatus {
-        let mut inner = self.inner.lock().unwrap();
-        inner.mic = None;
-        inner.loopback = None;
+        // Take the handles and clear the state under the lock, but do the
+        // (potentially blocking) joins OUTSIDE it. Holding the lock across a
+        // hang would block `start()` forever — the exact "can't start a new
+        // session after stopping" bug.
+        let (
+            mic_writer,
+            loopback_writer,
+            mic_vad_handle,
+            stt_thread,
+            mic_stt_thread,
+            session_id,
+            mode,
+        ) = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.mic = None; // drops the cpal stream → closes WAV/VAD/STT channels
+            inner.loopback = None; // drops SCStream → closes loopback channels
 
-        // Join writer threads so the WAV files are fully flushed.
-        inner.mic_writer.take().map(|h| h.join().ok());
-        inner.loopback_writer.take().map(|h| h.join().ok());
+            // Detach (don't join) the STT threads — they may be stuck in a
+            // long-running CLI transcription and joining them here would block
+            // the entire teardown, preventing batch transcription from ever
+            // being spawned. The STT threads exit on their own when their
+            // audio receivers disconnect.
+            let stt_thread = inner.stt_thread.take();
+            let mic_stt_thread = inner.mic_stt_thread.take();
+            inner.mode = String::new();
+            // session_dir stays for batch transcription to handle cleanup
+
+            (
+                inner.mic_writer.take(),
+                inner.loopback_writer.take(),
+                inner.mic_vad_handle.take(),
+                stt_thread,
+                mic_stt_thread,
+                inner.session_id.clone(),
+                std::mem::take(&mut inner.mode),
+            )
+        };
+
+        // Join writer threads so the WAV files are fully flushed. Runs outside
+        // the lock so a stuck join can't deadlock a subsequent start().
+        mic_writer.map(|h| h.join().ok());
+        loopback_writer.map(|h| h.join().ok());
 
         // Join VAD monitor thread
-        inner.mic_vad_handle.take().map(|h| h.join().ok());
+        mic_vad_handle.map(|h| h.join().ok());
 
-        // Detach (don't join) the STT thread — it may be stuck in a
-        // long-running CLI transcription and joining it here would block
-        // the entire teardown, preventing batch transcription from ever
-        // being spawned. The STT thread will exit on its own when the
-        // audio receiver disconnects.
-        drop(inner.stt_thread.take());
-
-        inner.mode = String::new();
-        // session_dir stays for batch transcription to handle cleanup
+        drop(stt_thread);
+        drop(mic_stt_thread);
 
         AudioCaptureStatus {
             mic_active: false,
             loopback_active: false,
-            session_id: inner.session_id.clone(),
+            session_id,
         }
     }
 
@@ -282,7 +351,6 @@ impl AudioCapture {
             }
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -294,8 +362,23 @@ impl AudioCapture {
 /// Values outside [-1.0, 1.0] are clamped to the valid i16 range.
 /// This is the standard conversion used across all capture paths.
 pub fn f32_to_i16(sample: f32) -> i16 {
-    (sample * i16::MAX as f32)
-        .clamp(i16::MIN as f32, i16::MAX as f32) as i16
+    (sample * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16
+}
+
+/// Amplify i16 samples by a linear gain, rounding and clamping to the i16
+/// range. A gain of ~1.0 returns the input unchanged. Used to lift quiet
+/// microphone/loopback audio up to a level the VAD and STT can reliably hear.
+pub fn boost_gain(samples: &[i16], gain: f32) -> Vec<i16> {
+    if (gain - 1.0_f32).abs() <= f32::EPSILON {
+        return samples.to_vec();
+    }
+    samples
+        .iter()
+        .map(|&s| {
+            let b = s as f32 * gain;
+            b.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +431,79 @@ fn spawn_wav_writer(
 // Mic capture (Canal A) – cpal, with tee for VAD
 // ---------------------------------------------------------------------------
 
+/// Real-time noise reduction for the microphone channel using RNNoise.
+///
+/// RNNoise is a 48 kHz algorithm: its frequency bands, pitch analysis and FFT
+/// sizes all assume 48 kHz mono. macOS default input devices are almost always
+/// 48 kHz, so we denoise the native mono stream here *before* `MicResampler`
+/// downsamples it to the 16 kHz the rest of the system expects. For devices
+/// running at other rates the reducer is a pass-through (RNNoise would need a
+/// 48 kHz round-trip resample, which isn't worth the extra latency/complexity
+/// in the real-time audio path).
+///
+/// Noise reduction is best-effort: if the model fails to initialize, the
+/// callback falls back to passing audio through untouched.
+struct MicNoiseReducer {
+    denoise: Option<Box<DenoiseState<'static>>>,
+    /// Internal buffer of 48 kHz mono f32 samples awaiting a full frame.
+    input_buffer: Vec<f32>,
+    /// True when this stream's native rate is 48 kHz (i.e. RNNoise is active).
+    active: bool,
+    /// RNNoise output has fade-in artifacts on the very first frame; we skip it.
+    first_frame: bool,
+}
+
+impl MicNoiseReducer {
+    fn new(input_rate: f64) -> Self {
+        // RNNoise operates at 48 kHz only. If the native rate differs, disable
+        // denoising rather than corrupting the signal with mismatched bands.
+        let active = (input_rate - 48_000.0).abs() < 1.0;
+        let denoise = if active {
+            DenoiseState::new().into()
+        } else {
+            None
+        };
+        Self {
+            denoise,
+            input_buffer: Vec::with_capacity(nnnoiseless::FRAME_SIZE),
+            active,
+            first_frame: true,
+        }
+    }
+
+    /// Processes a chunk of 48 kHz mono f32 samples (range [-1, 1]), returning
+    /// denoised samples. Output may be delayed by up to one RNNoise frame.
+    fn process(&mut self, mono: &[f32]) -> Vec<f32> {
+        if !self.active || self.denoise.is_none() {
+            return mono.to_vec();
+        }
+        let ds = self.denoise.as_mut().expect("denoise present when active");
+
+        self.input_buffer.extend_from_slice(mono);
+        let mut out: Vec<f32> = Vec::with_capacity(mono.len());
+
+        while self.input_buffer.len() >= nnnoiseless::FRAME_SIZE {
+            let mut input = [0.0f32; nnnoiseless::FRAME_SIZE];
+            input.copy_from_slice(&self.input_buffer[..nnnoiseless::FRAME_SIZE]);
+            self.input_buffer.drain(..nnnoiseless::FRAME_SIZE);
+
+            let mut output = [0.0f32; nnnoiseless::FRAME_SIZE];
+            ds.process_frame(&mut output, &input);
+
+            // Skip the first frame (fade-in artifacts).
+            if self.first_frame {
+                self.first_frame = false;
+                continue;
+            }
+            out.extend_from_slice(&output);
+        }
+        // Any trailing samples under one RNNoise frame (< 10 ms) are dropped
+        // when the stream ends; the loss is imperceptible and not worth the
+        // extra buffering in the real-time audio path.
+        out
+    }
+}
+
 /// Small stateful helper that converts microphone input to mono f32 and
 /// resamples it to `SAMPLE_RATE` (16 kHz) before it reaches the WAV writer,
 /// VAD and STT pipelines.
@@ -366,32 +522,29 @@ impl MicResampler {
         let ratio = SAMPLE_RATE as f64 / input_rate;
         // 1024 output frames @ 16 kHz ≈ 64 ms of audio. Large enough to be
         // efficient, small enough to keep latency low.
-        let resampler = FastFixedOut::new(
-            ratio,
-            2.0,
-            PolynomialDegree::Linear,
-            1024,
-            1,
-        )
-        .map_err(|e| AudioError::StreamError(format!("Failed to create mic resampler: {e}")))?;
+        let resampler = FastFixedOut::new(ratio, 2.0, PolynomialDegree::Linear, 1024, 1)
+            .map_err(|e| AudioError::StreamError(format!("Failed to create mic resampler: {e}")))?;
         Ok(Self {
             resampler,
             input_buffer: Vec::new(),
         })
     }
 
-    fn push(&mut self, mono_f32: &[f32], wav_tx: &SyncSender<Vec<i16>>, vad_tx: &SyncSender<Vec<i16>>) {
+    fn push(
+        &mut self,
+        mono_f32: &[f32],
+        wav_tx: &SyncSender<Vec<i16>>,
+        vad_tx: &SyncSender<Vec<i16>>,
+        stt_tx: &SyncSender<Vec<i16>>,
+    ) {
         self.input_buffer.extend_from_slice(mono_f32);
         while self.input_buffer.len() >= self.resampler.input_frames_next() {
             let needed = self.resampler.input_frames_next();
             let input = vec![self.input_buffer[..needed].to_vec()];
             match self.resampler.process(&input, None) {
                 Ok(output) => {
-                    let samples: Vec<i16> = output[0]
-                        .iter()
-                        .map(|&s| f32_to_i16(s))
-                        .collect();
-                    send_mic_samples(&samples, wav_tx, vad_tx);
+                    let samples: Vec<i16> = output[0].iter().map(|&s| f32_to_i16(s)).collect();
+                    send_mic_samples(&samples, wav_tx, vad_tx, stt_tx);
                 }
                 Err(e) => {
                     log::error!("Mic resampling error: {e}");
@@ -402,19 +555,33 @@ impl MicResampler {
     }
 }
 
-fn send_mic_samples(samples: &[i16], wav_tx: &SyncSender<Vec<i16>>, vad_tx: &SyncSender<Vec<i16>>) {
+fn send_mic_samples(
+    samples: &[i16],
+    wav_tx: &SyncSender<Vec<i16>>,
+    vad_tx: &SyncSender<Vec<i16>>,
+    stt_tx: &SyncSender<Vec<i16>>,
+) {
     let buf = samples.to_vec();
     if wav_tx.try_send(buf.clone()).is_err() {
         log::error!("Mic WAV writer channel full — dropping buffer");
     }
-    if vad_tx.try_send(buf).is_err() {
+    // Boost the mic samples for the VAD monitor and STT pipeline so quiet user
+    // speech is both detected for hint cancellation and transcribed in real
+    // time, mirroring LOOPBACK_GAIN on the loopback side. The WAV recording
+    // keeps the raw level for accurate retention.
+    let boosted = boost_gain(&buf, MIC_LIVE_GAIN);
+    if vad_tx.try_send(boosted.clone()).is_err() {
         log::error!("Mic VAD channel full — dropping buffer");
+    }
+    if stt_tx.try_send(boosted).is_err() {
+        log::error!("Mic STT channel full — dropping buffer");
     }
 }
 
 fn start_mic_capture_tee(
     wav_tx: SyncSender<Vec<i16>>,
     vad_tx: SyncSender<Vec<i16>>,
+    stt_tx: SyncSender<Vec<i16>>,
 ) -> Result<cpal::Stream, AudioError> {
     let host = cpal::default_host();
     let device = host.default_input_device().ok_or_else(|| {
@@ -431,8 +598,7 @@ fn start_mic_capture_tee(
     let stream_config: cpal::StreamConfig = config.into();
     let input_channels = stream_config.channels as usize;
     let input_rate = stream_config.sample_rate.0 as f64;
-    let needs_resampling =
-        (input_rate - SAMPLE_RATE as f64).abs() > 1.0 || input_channels != 1;
+    let needs_resampling = (input_rate - SAMPLE_RATE as f64).abs() > 1.0 || input_channels != 1;
 
     match sample_format {
         cpal::SampleFormat::I16 => {
@@ -441,14 +607,13 @@ fn start_mic_capture_tee(
             } else {
                 None
             };
+            let mut noise_reducer = MicNoiseReducer::new(input_rate);
             let stream = device
                 .build_input_stream::<i16, _, _>(
                     &stream_config,
                     move |data, _| {
                         let mono_f32: Vec<f32> = if input_channels == 1 {
-                            data.iter()
-                                .map(|&s| s as f32 / i16::MAX as f32)
-                                .collect()
+                            data.iter().map(|&s| s as f32 / i16::MAX as f32).collect()
                         } else {
                             data.chunks_exact(input_channels)
                                 .map(|chunk| {
@@ -457,14 +622,12 @@ fn start_mic_capture_tee(
                                 })
                                 .collect()
                         };
+                        let mono = noise_reducer.process(&mono_f32);
                         if let Some(r) = &mut resampler {
-                            r.push(&mono_f32, &wav_tx, &vad_tx);
+                            r.push(&mono, &wav_tx, &vad_tx, &stt_tx);
                         } else {
-                            let samples: Vec<i16> = mono_f32
-                                .iter()
-                                .map(|&s| f32_to_i16(s))
-                                .collect();
-                            send_mic_samples(&samples, &wav_tx, &vad_tx);
+                            let samples: Vec<i16> = mono.iter().map(|&s| f32_to_i16(s)).collect();
+                            send_mic_samples(&samples, &wav_tx, &vad_tx, &stt_tx);
                         }
                     },
                     move |err| log::error!("Mic capture error: {err}"),
@@ -486,6 +649,7 @@ fn start_mic_capture_tee(
             } else {
                 None
             };
+            let mut noise_reducer = MicNoiseReducer::new(input_rate);
             let stream = device
                 .build_input_stream::<f32, _, _>(
                     &stream_config,
@@ -497,14 +661,12 @@ fn start_mic_capture_tee(
                                 .map(|chunk| chunk.iter().sum::<f32>() / input_channels as f32)
                                 .collect()
                         };
+                        let mono = noise_reducer.process(&mono_f32);
                         if let Some(r) = &mut resampler {
-                            r.push(&mono_f32, &wav_tx, &vad_tx);
+                            r.push(&mono, &wav_tx, &vad_tx, &stt_tx);
                         } else {
-                            let samples: Vec<i16> = mono_f32
-                                .iter()
-                                .map(|&s| f32_to_i16(s))
-                                .collect();
-                            send_mic_samples(&samples, &wav_tx, &vad_tx);
+                            let samples: Vec<i16> = mono.iter().map(|&s| f32_to_i16(s)).collect();
+                            send_mic_samples(&samples, &wav_tx, &vad_tx, &stt_tx);
                         }
                     },
                     move |err| log::error!("Mic capture error: {err}"),
@@ -575,11 +737,7 @@ fn start_loopback_capture_tee(
     }
 
     impl StreamOutput for LoopbackOutputTee {
-        fn did_output_sample_buffer(
-            &self,
-            sample: CMSampleBuffer,
-            of_type: SCStreamOutputType,
-        ) {
+        fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutputType) {
             if !matches!(of_type, SCStreamOutputType::Audio) {
                 return;
             }
@@ -616,7 +774,9 @@ fn start_loopback_capture_tee(
         .start_capture()
         .map_err(|e| AudioError::StreamError(format!("Failed to start loopback capture: {e}")))?;
 
-    log::info!("Loopback capture (Canal B) with STT tee started — 16 kHz, mono via ScreenCaptureKit");
+    log::info!(
+        "Loopback capture (Canal B) with STT tee started — 16 kHz, mono via ScreenCaptureKit"
+    );
     Ok(stream)
 }
 
@@ -627,10 +787,7 @@ fn start_loopback_capture_tee(
 /// Spawns a background thread that reads i16 mic audio samples and feeds
 /// them into the shared `MicVadState`.  The thread exits when the channel
 /// is closed (mic capture stops).
-fn spawn_mic_vad_monitor(
-    rx: Receiver<Vec<i16>>,
-    state: Arc<Mutex<MicVadState>>,
-) -> JoinHandle<()> {
+fn spawn_mic_vad_monitor(rx: Receiver<Vec<i16>>, state: Arc<Mutex<MicVadState>>) -> JoinHandle<()> {
     thread::Builder::new()
         .name("kue-mic-vad".into())
         .spawn(move || {
@@ -649,7 +806,10 @@ fn spawn_mic_vad_monitor(
 fn apply_retention(session_dir: &std::path::Path, recordings_dir: &std::path::Path, retain: bool) {
     if retain {
         if let Err(e) = fs::create_dir_all(recordings_dir) {
-            log::error!("Failed to create recordings dir {dir:?}: {e}", dir = recordings_dir);
+            log::error!(
+                "Failed to create recordings dir {dir:?}: {e}",
+                dir = recordings_dir
+            );
         } else if let Some(name) = session_dir.file_name() {
             let target = recordings_dir.join(name);
             let _ = fs::create_dir_all(&target);
@@ -730,10 +890,43 @@ fn spawn_batch_transcription(
                         let mut total_lines = 0usize;
                         let mut errors: Vec<String> = Vec::new();
 
+                        // Live STT pipelines (loopback → interviewer, mic → user)
+                        // already persist transcript lines during the session.
+                        // Only run batch transcription for a channel as a safety
+                        // net when the live pipeline produced nothing, otherwise
+                        // every line would be persisted twice (and the analysis
+                        // would see doubled content).
+                        fn speaker_has_lines(
+                            db: &crate::db::Database,
+                            session_id: &str,
+                            speaker: crate::types::Speaker,
+                        ) -> bool {
+                            let Ok(conn) = db.conn.lock() else {
+                                return false; // can't check — treat as not covered
+                            };
+                            let count: i64 = conn
+                                .query_row(
+                                    "SELECT COUNT(*) FROM transcript_lines
+                                     WHERE session_id = ?1 AND speaker = ?2",
+                                    rusqlite::params![session_id, speaker.as_db_str()],
+                                    |row| row.get(0),
+                                )
+                                .unwrap_or(0);
+                            count > 0
+                        }
+
                         // Channel A — microphone (User speaker)
                         let mic_path = worker_session_dir.join(MIC_CHANNEL_A_FILENAME);
                         if mic_path.exists() {
-                            if !wav_has_samples(&mic_path) {
+                            if speaker_has_lines(
+                                &db,
+                                &worker_id,
+                                crate::types::Speaker::User,
+                            ) {
+                                log::info!(
+                                    "Batch transcription: mic channel already covered by live STT, skipping"
+                                );
+                            } else if !wav_has_samples(&mic_path) {
                                 errors.push(
                                     "Microphone channel (mic_channel_A.wav) has no audio samples. \
                                      Check that microphone permission is granted and the mic is not muted."
@@ -747,6 +940,7 @@ fn spawn_batch_transcription(
                                     &db,
                                     &*engine,
                                     &config,
+                                    MIC_BATCH_GAIN,
                                 ) {
                                     Ok(lines) => total_lines += lines.len(),
                                     Err(e) => {
@@ -760,7 +954,15 @@ fn spawn_batch_transcription(
                         // Channel B — system loopback (Interviewer speaker, includes TTS)
                         let loopback_path = worker_session_dir.join(LOOPBACK_CHANNEL_B_FILENAME);
                         if loopback_path.exists() {
-                            if !wav_has_samples(&loopback_path) {
+                            if speaker_has_lines(
+                                &db,
+                                &worker_id,
+                                crate::types::Speaker::Interviewer,
+                            ) {
+                                log::info!(
+                                    "Batch transcription: loopback channel already covered by live STT, skipping"
+                                );
+                            } else if !wav_has_samples(&loopback_path) {
                                 errors.push(
                                     "System audio channel (loopback_channel_B.wav) has no audio samples. \
                                      Check that Screen & System Audio Recording permission is granted."
@@ -774,6 +976,7 @@ fn spawn_batch_transcription(
                                     &db,
                                     &*engine,
                                     &config,
+                                    1.0, // Loopback already has LOOPBACK_GAIN applied during capture
                                 ) {
                                     Ok(lines) => total_lines += lines.len(),
                                     Err(e) => {
@@ -881,20 +1084,19 @@ fn spawn_batch_transcription(
             "Failed to spawn batch transcription thread for session {}: {e}",
             sid_fallback
         );
-        let _ = app_handle_fallback.emit("post-call-transcript-error", serde_json::json!({
-            "session_id": &sid_fallback,
-            "message": format!("Failed to spawn batch thread: {e}"),
-        }));
+        let _ = app_handle_fallback.emit(
+            "post-call-transcript-error",
+            serde_json::json!({
+                "session_id": &sid_fallback,
+                "message": format!("Failed to spawn batch thread: {e}"),
+            }),
+        );
         apply_retention(&session_dir_fallback, &recordings_dir_fallback, retain);
         mark_batch_ready(app_handle_fallback, batch_tracker_fallback, &sid_fallback);
     }
 }
 
-fn mark_batch_ready(
-    app_handle: tauri::AppHandle,
-    batch_tracker: BatchTracker,
-    session_id: &str,
-) {
+fn mark_batch_ready(app_handle: tauri::AppHandle, batch_tracker: BatchTracker, session_id: &str) {
     if let Ok(mut tracker) = batch_tracker.0.lock() {
         tracker.insert(session_id.to_string());
     }
@@ -916,7 +1118,24 @@ use tauri::Manager;
 
 const PANIC_DURATION_SECS: u64 = 10;
 
-#[tauri::command]
+/// Grace period after a session's `ended_at` before `is_transcript_ready`
+/// gives up waiting on the in-memory batch tracker. BATCH_TIMEOUT (60s in
+/// `spawn_batch_transcription`) plus margin: if the batch thread failed to
+/// finish and mark the session ready within this window, the UI proceeds so
+/// it isn't stuck "Processing..." forever.
+const BATCH_READY_FALLBACK_SECS: i64 = 90;
+
+/// Gain applied to the microphone channel (Canal A) during batch transcription
+/// so quiet user speech is detected by the VAD. The system loopback channel
+/// already has LOOPBACK_GAIN applied during capture, so it needs no extra boost.
+const MIC_BATCH_GAIN: f32 = 3.0;
+
+/// Gain applied to live microphone samples before they reach the STT pipeline
+/// (and its VAD). Mirrors LOOPBACK_GAIN so quiet user speech is detected in
+/// real time. The WAV recording and VAD monitor keep the raw level.
+const MIC_LIVE_GAIN: f32 = 3.0;
+
+#[tauri::command(async)]
 pub fn start_session(
     mode: String,
     company: Option<String>,
@@ -925,7 +1144,13 @@ pub fn start_session(
     db: tauri::State<'_, Database>,
     app_handle: tauri::AppHandle,
 ) -> Result<AudioCaptureStatus, String> {
-    let (status, stt_rx) = audio.start(&mode).map_err(|e| e.to_string())?;
+    // Join any pending teardown from a previous session before creating new
+    // SCK streams. Runs on Tauri's blocking thread pool (command(async)), NOT
+    // the UI thread and NOT the async runtime, so a slow teardown won't freeze
+    // the frontend or stall concurrent async commands.
+    audio.schedule_teardown_reap();
+
+    let (status, stt_rx, mic_stt_rx) = audio.start(&mode).map_err(|e| e.to_string())?;
 
     // Create a new session in the DB
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -933,13 +1158,16 @@ pub fn start_session(
         let conn = db.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO sessions (id, company, role, mode) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![session_id, company.as_deref().unwrap_or(""), role.as_deref().unwrap_or(""), mode],
+            rusqlite::params![
+                session_id,
+                company.as_deref().unwrap_or(""),
+                role.as_deref().unwrap_or(""),
+                mode
+            ],
         )
         .map_err(|e| format!("Failed to insert session: {e}"))?;
     }
 
-    // Start the STT pipeline
-    let rx = stt_rx;
     let config = STTConfig {
         model_path: STTConfig::default_model_path(),
         language: "en".to_string(),
@@ -947,26 +1175,46 @@ pub fn start_session(
     };
 
     let hint_job_tx = app_handle.state::<HintJobSender>().inner().clone();
+    let db_for_stt = Database::clone(db.inner());
 
-    let mut pipeline = STTPipeline::new(config)
+    // Loopback (Canal B) → interviewer. This pipeline classifies questions and
+    // schedules hints.
+    let mut interviewer_pipeline = STTPipeline::new(config.clone())
         .with_app_handle(app_handle.clone())
         .with_mode(&mode)
-        .with_hint_job_tx(hint_job_tx);
-    if let Err(e) = pipeline.load_model() {
+        .with_hint_job_tx(hint_job_tx.clone())
+        .with_speaker(crate::types::Speaker::Interviewer);
+    if let Err(e) = interviewer_pipeline.load_model() {
         log::error!("STT model load failed (best-effort): {e}");
     }
-    pipeline.start_session(&session_id);
+    interviewer_pipeline.start_session(&session_id);
+    let interviewer_rx = std::sync::Arc::new(std::sync::Mutex::new(stt_rx));
+    let stt_thread =
+        interviewer_pipeline.spawn_processing_thread(interviewer_rx, db_for_stt.clone());
 
-    let db_for_stt = Database::clone(db.inner());
-    let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-    let stt_thread = pipeline.spawn_processing_thread(rx, db_for_stt);
+    // Mic (Canal A) → user. This pipeline only records transcript lines; it
+    // does NOT classify questions or schedule hints.
+    let mut mic_pipeline = STTPipeline::new(config)
+        .with_app_handle(app_handle.clone())
+        .with_mode(&mode)
+        .with_speaker(crate::types::Speaker::User);
+    if let Err(e) = mic_pipeline.load_model() {
+        log::error!("Mic STT model load failed (best-effort): {e}");
+    }
+    mic_pipeline.start_session(&session_id);
+    let mic_rx = std::sync::Arc::new(std::sync::Mutex::new(mic_stt_rx));
+    let mic_stt_thread = mic_pipeline.spawn_processing_thread(mic_rx, db_for_stt);
 
     let mut inner = audio.inner.lock().map_err(|e| e.to_string())?;
     inner.stt_thread = Some(stt_thread);
+    inner.mic_stt_thread = Some(mic_stt_thread);
     inner.session_id = Some(session_id.clone());
 
     app_handle
-        .emit("session-started", serde_json::json!({"mode": mode, "session_id": &session_id}))
+        .emit(
+            "session-started",
+            serde_json::json!({"mode": mode, "session_id": &session_id}),
+        )
         .ok();
 
     Ok(AudioCaptureStatus {
@@ -976,8 +1224,8 @@ pub fn start_session(
     })
 }
 
-#[tauri::command]
-pub async fn stop_session(
+#[tauri::command(async)]
+pub fn stop_session(
     audio: tauri::State<'_, AudioCapture>,
     db: tauri::State<'_, Database>,
     app_handle: tauri::AppHandle,
@@ -1017,6 +1265,13 @@ pub async fn stop_session(
     // Tell the frontend immediately that the session is stopping.
     app_handle.emit("session-stopped", ()).ok();
 
+    // Capture the session directory NOW, before the teardown thread runs.
+    // If a new session starts while teardown is in flight, it overwrites
+    // inner.session_dir; taking it here prevents the teardown thread from
+    // grabbing the NEW session's directory (or locking inner and racing
+    // start()).
+    let session_dir = audio.take_session_dir();
+
     // The actual teardown (stream drops + WAV writer joins + batch STT) can
     // block for seconds on ScreenCaptureKit. Run it in a background thread so
     // the Tauri command returns instantly and the UI never freezes.
@@ -1026,9 +1281,8 @@ pub async fn stop_session(
     let batch_tracker_clone = BatchTracker::clone(batch_tracker.inner());
     let app_handle_clone = app_handle.clone();
 
-    std::thread::spawn(move || {
+    let teardown_handle = std::thread::spawn(move || {
         let _ = audio_clone.stop();
-        let session_dir = audio_clone.take_session_dir();
         if let (Some(dir), Some(sid)) = (session_dir, session_id) {
             spawn_batch_transcription(
                 dir,
@@ -1041,6 +1295,12 @@ pub async fn stop_session(
             );
         }
     });
+
+    // Save the join handle so start() can join it before creating new streams.
+    {
+        let mut inner = audio.inner.lock().map_err(|e| e.to_string())?;
+        inner.stop_bg_handle = Some(teardown_handle);
+    }
 
     Ok(AudioCaptureStatus {
         mic_active: false,
@@ -1064,32 +1324,65 @@ pub fn is_transcript_ready(
     batch_tracker: tauri::State<'_, BatchTracker>,
     db: tauri::State<'_, Database>,
 ) -> Result<bool, String> {
-    // Fast path: check in-memory tracker (set within the same process lifetime).
+    // Fast path: check in-memory tracker (set by mark_batch_ready after the
+    // batch transcription thread actually finishes).
     if let Ok(tracker) = batch_tracker.0.lock() {
         if tracker.contains(&session_id) {
             return Ok(true);
         }
     }
-    // Fall back to the database: a session whose `ended_at` is set was
-    // properly stopped, which means `spawn_batch_transcription` was triggered.
-    // Even if it produced 0 transcript lines (all-silence recording), the UI
-    // should not remain stuck "Processing..." forever — analysis will show a
-    // clear "No transcript lines" error instead.
+
+    // Second fast path: if the session has already ended and the live STT
+    // pipelines wrote transcript lines during the session, the transcript is
+    // available immediately — no need to wait for the background batch
+    // transcription. Gated on ended_at so a running session never reports
+    // ready prematurely.
+    {
+        let conn = db.conn.lock().map_err(|e| e.to_string())?;
+        let ready: bool = conn
+            .query_row(
+                "SELECT ended_at IS NOT NULL AND EXISTS(
+                     SELECT 1 FROM transcript_lines WHERE session_id = ?1
+                 ) FROM sessions WHERE id = ?1",
+                rusqlite::params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if ready {
+            if let Ok(mut tracker) = batch_tracker.0.lock() {
+                tracker.insert(session_id.clone());
+            }
+            return Ok(true);
+        }
+    }
+
+    // Fallback: if the session's `ended_at` was set more than
+    // BATCH_READY_FALLBACK_SECS ago and the tracker still doesn't have it,
+    // assume the batch thread failed to complete and let the UI proceed so
+    // it's not stuck forever. The analysis will show a clear error if no
+    // transcript lines exist.
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
-    let has_ended: bool = conn
+    let ended_s: Option<i64> = conn
         .query_row(
-            "SELECT ended_at IS NOT NULL FROM sessions WHERE id = ?1",
+            "SELECT CAST(strftime('%s', ended_at) AS INTEGER) FROM sessions WHERE id = ?1 AND ended_at IS NOT NULL",
             rusqlite::params![session_id],
             |row| row.get(0),
         )
-        .map_err(|e| e.to_string())?;
-    if has_ended {
-        // Re-insert into in-memory tracker so subsequent calls hit the fast path.
-        if let Ok(mut tracker) = batch_tracker.0.lock() {
-            tracker.insert(session_id.clone());
+        .ok();
+
+    if let Some(ended_ts) = ended_s {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if now.saturating_sub(ended_ts) > BATCH_READY_FALLBACK_SECS {
+            if let Ok(mut tracker) = batch_tracker.0.lock() {
+                tracker.insert(session_id.clone());
+            }
+            return Ok(true);
         }
-        return Ok(true);
     }
+
     Ok(false)
 }
 
@@ -1104,11 +1397,12 @@ pub fn panic_mode(
         *guard = Some(until);
     }
     app_handle
-        .emit("panic-mode", serde_json::json!({"until_secs": PANIC_DURATION_SECS}))
+        .emit(
+            "panic-mode",
+            serde_json::json!({"until_secs": PANIC_DURATION_SECS}),
+        )
         .map_err(|e| e.to_string())
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1232,14 +1526,23 @@ mod tests {
     #[test]
     fn audio_error_display_empty_message() {
         let cases: Vec<(AudioError, &str)> = vec![
-            (AudioError::PermissionDenied(String::new()), "PERMISSION_DENIED:"),
-            (AudioError::DeviceNotFound(String::new()), "DEVICE_NOT_FOUND:"),
+            (
+                AudioError::PermissionDenied(String::new()),
+                "PERMISSION_DENIED:",
+            ),
+            (
+                AudioError::DeviceNotFound(String::new()),
+                "DEVICE_NOT_FOUND:",
+            ),
             (AudioError::StreamError(String::new()), "STREAM_ERROR:"),
             (AudioError::InvalidMode(String::new()), "INVALID_MODE:"),
         ];
         for (err, prefix) in cases {
             let msg = err.to_string();
-            assert!(msg.starts_with(prefix), "Expected prefix {prefix} in '{msg}'");
+            assert!(
+                msg.starts_with(prefix),
+                "Expected prefix {prefix} in '{msg}'"
+            );
             // Should have colon but no extra content after it (just trailing whitespace is fine)
             assert!(!msg.is_empty());
         }
@@ -1264,7 +1567,10 @@ mod tests {
             session_id: None,
         };
         let json = serde_json::to_string(&status).unwrap();
-        assert_eq!(json, r#"{"mic_active":false,"loopback_active":false,"session_id":null}"#);
+        assert_eq!(
+            json,
+            r#"{"mic_active":false,"loopback_active":false,"session_id":null}"#
+        );
     }
 
     #[test]
@@ -1275,7 +1581,10 @@ mod tests {
             session_id: Some("abc".into()),
         };
         let json = serde_json::to_string(&status).unwrap();
-        assert_eq!(json, r#"{"mic_active":true,"loopback_active":true,"session_id":"abc"}"#);
+        assert_eq!(
+            json,
+            r#"{"mic_active":true,"loopback_active":true,"session_id":"abc"}"#
+        );
     }
 
     #[test]
@@ -1286,7 +1595,10 @@ mod tests {
             session_id: None,
         };
         let json = serde_json::to_string(&status).unwrap();
-        assert_eq!(json, r#"{"mic_active":true,"loopback_active":false,"session_id":null}"#);
+        assert_eq!(
+            json,
+            r#"{"mic_active":true,"loopback_active":false,"session_id":null}"#
+        );
     }
 
     #[test]
@@ -1297,7 +1609,10 @@ mod tests {
             session_id: None,
         };
         let json = serde_json::to_string(&status).unwrap();
-        assert_eq!(json, r#"{"mic_active":false,"loopback_active":true,"session_id":null}"#);
+        assert_eq!(
+            json,
+            r#"{"mic_active":false,"loopback_active":true,"session_id":null}"#
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1344,7 +1659,10 @@ mod tests {
     fn session_temp_dir_uses_kue_session_prefix() {
         let path = AudioCapture::session_temp_dir();
         let dirname = path.file_name().unwrap().to_str().unwrap().to_string();
-        assert!(dirname.starts_with("kue-session-"), "Expected 'kue-session-...', got {dirname}");
+        assert!(
+            dirname.starts_with("kue-session-"),
+            "Expected 'kue-session-...', got {dirname}"
+        );
         assert!(path.parent() == Some(std::env::temp_dir().as_path()));
     }
 
@@ -1493,8 +1811,11 @@ mod tests {
 
         // Verify sample data was written correctly
         let actual: Vec<i16> = reader.into_samples::<i16>().map(|s| s.unwrap()).collect();
-        assert_eq!(actual, vec![0, 100, -100, i16::MAX, i16::MIN, 42, -42],
-            "WAV file should contain the exact samples we sent");
+        assert_eq!(
+            actual,
+            vec![0, 100, -100, i16::MAX, i16::MIN, 42, -42],
+            "WAV file should contain the exact samples we sent"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1540,10 +1861,15 @@ mod tests {
         drop(tx);
 
         // Thread should not panic; it should print an error and return.
-        handle.join().expect("WAV writer thread should not panic on invalid path");
+        handle
+            .join()
+            .expect("WAV writer thread should not panic on invalid path");
 
         // File should NOT have been created
-        assert!(!path.exists(), "WAV file should NOT exist when parent dir is missing");
+        assert!(
+            !path.exists(),
+            "WAV file should NOT exist when parent dir is missing"
+        );
     }
 
     #[test]
@@ -1565,7 +1891,11 @@ mod tests {
 
         // Empty WAV files have the header (44 bytes) but no data
         let reader = hound::WavReader::open(&path).expect("should open WAV file");
-        assert_eq!(reader.duration(), 0, "empty buffer should produce 0 duration");
+        assert_eq!(
+            reader.duration(),
+            0,
+            "empty buffer should produce 0 duration"
+        );
         assert_eq!(reader.spec().channels, 1);
         assert_eq!(reader.spec().sample_rate, 16_000);
 
@@ -1596,8 +1926,8 @@ mod tests {
                 let msg = e.to_string();
                 assert!(
                     msg.starts_with("DEVICE_NOT_FOUND:")
-                    || msg.starts_with("STREAM_ERROR:")
-                    || msg.starts_with("PERMISSION_DENIED:"),
+                        || msg.starts_with("STREAM_ERROR:")
+                        || msg.starts_with("PERMISSION_DENIED:"),
                     "Expected hardware error, got: {msg}"
                 );
             }
@@ -1668,11 +1998,18 @@ mod tests {
         }
 
         let taken = cap.take_session_dir();
-        assert_eq!(taken, Some(expected), "should return the session_dir we set");
+        assert_eq!(
+            taken,
+            Some(expected),
+            "should return the session_dir we set"
+        );
 
         // Verify the inner field was cleared
         let inner = cap.inner.lock().unwrap();
-        assert!(inner.session_dir.is_none(), "take_session_dir should clear inner state");
+        assert!(
+            inner.session_dir.is_none(),
+            "take_session_dir should clear inner state"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1708,7 +2045,10 @@ mod tests {
         apply_retention(&session_dir, &recordings_dir, true);
 
         // Session dir should be removed
-        assert!(!session_dir.exists(), "session_dir should be removed after retention");
+        assert!(
+            !session_dir.exists(),
+            "session_dir should be removed after retention"
+        );
 
         // File should have been moved to recordings_dir/session-123/mic_channel_A.wav
         let dest_file = recordings_dir.join("session-123").join("mic_channel_A.wav");
@@ -1735,7 +2075,10 @@ mod tests {
         assert!(!session_dir.exists(), "session_dir should be removed");
 
         // Recordings dir should NOT have been created
-        assert!(!recordings_dir.exists(), "recordings dir should not exist when retain=false");
+        assert!(
+            !recordings_dir.exists(),
+            "recordings dir should not exist when retain=false"
+        );
     }
 
     #[test]
@@ -1820,7 +2163,11 @@ mod tests {
         assert!(recordings_dir.exists());
 
         // Also test with retain=false and a problematic session_dir path
-        apply_retention(Path::new("/nonexistent_weird_path_that_does_not_exist_xyz"), &recordings_dir, false);
+        apply_retention(
+            Path::new("/nonexistent_weird_path_that_does_not_exist_xyz"),
+            &recordings_dir,
+            false,
+        );
         // Should not panic
     }
 

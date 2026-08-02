@@ -1,9 +1,10 @@
 use std::path::Path;
 
+use crate::audio::capture::boost_gain;
 use crate::db::Database;
 use crate::types::{Speaker, TranscriptLine};
 
-use super::{persist_transcript_line, SimpleVAD, STTConfig, STTEngine};
+use super::{persist_transcript_line, STTConfig, STTEngine, SimpleVAD};
 
 fn chunk_size(sample_rate: u32) -> usize {
     (sample_rate as usize * 100) / 1000
@@ -20,19 +21,38 @@ pub fn transcribe_channel_batch(
     db: &Database,
     engine: &dyn STTEngine,
     config: &STTConfig,
+    gain: f32,
 ) -> Result<Vec<TranscriptLine>, String> {
-    let mut reader =
-        hound::WavReader::open(wav_path)
-            .map_err(|e| format!("Failed to open WAV at {:?}: {}", wav_path, e))?;
+    let mut reader = hound::WavReader::open(wav_path)
+        .map_err(|e| format!("Failed to open WAV at {:?}: {}", wav_path, e))?;
 
-    let samples: Vec<i16> = reader
-        .samples::<i16>()
-        .filter_map(|s| s.ok())
-        .collect();
+    log::info!(
+        "Batch transcription ({}): reading {:?} — {} samples, {} Hz, {} ch",
+        speaker.as_db_str(),
+        wav_path,
+        reader.len(),
+        reader.spec().sample_rate,
+        reader.spec().channels,
+    );
+
+    let samples: Vec<i16> = reader.samples::<i16>().filter_map(|s| s.ok()).collect();
 
     if samples.is_empty() {
+        log::info!(
+            "Batch transcription ({}): WAV is empty, returning 0 lines",
+            speaker.as_db_str()
+        );
         return Ok(Vec::new());
     }
+
+    let samples: Vec<i16> = boost_gain(&samples, gain);
+
+    log::info!(
+        "Batch transcription ({}): {} samples loaded, gain={:.1}x, detecting segments...",
+        speaker.as_db_str(),
+        samples.len(),
+        gain,
+    );
 
     let mut vad = SimpleVAD::new(
         config.vad_threshold,
@@ -51,6 +71,7 @@ pub fn transcribe_channel_batch(
 
     let step = chunk_size(config.sample_rate);
 
+    let mut segment_count = 0u32;
     let mut pos = 0usize;
     while pos < samples.len() {
         let end = std::cmp::min(pos + step, samples.len());
@@ -62,6 +83,7 @@ pub fn transcribe_channel_batch(
             if !in_segment {
                 in_segment = true;
                 segment_start_sample = pos;
+                segment_count += 1;
                 speech_buffer.clear();
             }
             speech_buffer.extend_from_slice(chunk);
@@ -135,7 +157,14 @@ pub fn transcribe_channel_batch(
         if let Some(text) = engine.transcribe_audio_chunk(&speech_buffer) {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                persist_transcript_line(db, session_id, trimmed, &speaker, started_at_ms, ended_at_ms);
+                persist_transcript_line(
+                    db,
+                    session_id,
+                    trimmed,
+                    &speaker,
+                    started_at_ms,
+                    ended_at_ms,
+                );
                 transcript_lines.push(TranscriptLine {
                     speaker,
                     text: trimmed.to_string(),
@@ -147,8 +176,9 @@ pub fn transcribe_channel_batch(
     }
 
     log::info!(
-        "Batch transcription ({}): {} lines",
+        "Batch transcription ({}): {} segments detected, {} transcript lines",
         speaker.as_db_str(),
+        segment_count,
         transcript_lines.len()
     );
     Ok(transcript_lines)
@@ -157,9 +187,9 @@ pub fn transcribe_channel_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use std::path::PathBuf;
     use std::sync::Mutex;
-    use rusqlite::Connection;
 
     struct MockEngine {
         result: Option<String>,
@@ -247,9 +277,16 @@ mod tests {
         };
         let config = STTConfig::default();
         let db = create_test_db("sess-empty");
-        let result =
-            transcribe_channel_batch(&wav_path, Speaker::User, "sess-empty", &db, &engine, &config)
-                .unwrap();
+        let result = transcribe_channel_batch(
+            &wav_path,
+            Speaker::User,
+            "sess-empty",
+            &db,
+            &engine,
+            &config,
+            1.0,
+        )
+        .unwrap();
 
         assert!(
             result.is_empty(),
@@ -272,6 +309,7 @@ mod tests {
             &db,
             &engine,
             &config,
+            1.0,
         );
         assert!(result.is_err());
     }
@@ -292,9 +330,16 @@ mod tests {
         };
         let config = STTConfig::default();
         let db = create_test_db("sess-user");
-        let result =
-            transcribe_channel_batch(&wav_path, Speaker::User, "sess-user", &db, &engine, &config)
-                .unwrap();
+        let result = transcribe_channel_batch(
+            &wav_path,
+            Speaker::User,
+            "sess-user",
+            &db,
+            &engine,
+            &config,
+            1.0,
+        )
+        .unwrap();
 
         assert_eq!(result.len(), 1, "should have one line");
         let line = &result[0];
@@ -338,6 +383,7 @@ mod tests {
             &db,
             &engine,
             &config,
+            1.0,
         )
         .unwrap();
 
@@ -377,11 +423,22 @@ mod tests {
         };
         let config = STTConfig::default();
         let db = create_test_db("sess-multi");
-        let result =
-            transcribe_channel_batch(&wav_path, Speaker::User, "sess-multi", &db, &engine, &config)
-                .unwrap();
+        let result = transcribe_channel_batch(
+            &wav_path,
+            Speaker::User,
+            "sess-multi",
+            &db,
+            &engine,
+            &config,
+            1.0,
+        )
+        .unwrap();
 
-        assert_eq!(result.len(), 2, "two speech segments should produce two lines");
+        assert_eq!(
+            result.len(),
+            2,
+            "two speech segments should produce two lines"
+        );
         assert_eq!(result[0].text, "response text");
         assert_eq!(result[1].text, "response text");
         // Second line should start after the first + silence gap
@@ -407,9 +464,16 @@ mod tests {
         let engine = SilentEngine;
         let config = STTConfig::default();
         let db = create_test_db("sess-silent");
-        let result =
-            transcribe_channel_batch(&wav_path, Speaker::User, "sess-silent", &db, &engine, &config)
-                .unwrap();
+        let result = transcribe_channel_batch(
+            &wav_path,
+            Speaker::User,
+            "sess-silent",
+            &db,
+            &engine,
+            &config,
+            1.0,
+        )
+        .unwrap();
 
         assert!(result.is_empty(), "silent engine should produce no lines");
 
@@ -432,9 +496,16 @@ mod tests {
         };
         let config = STTConfig::default();
         let db = create_test_db("sess-ws");
-        let result =
-            transcribe_channel_batch(&wav_path, Speaker::User, "sess-ws", &db, &engine, &config)
-                .unwrap();
+        let result = transcribe_channel_batch(
+            &wav_path,
+            Speaker::User,
+            "sess-ws",
+            &db,
+            &engine,
+            &config,
+            1.0,
+        )
+        .unwrap();
 
         assert!(
             result.is_empty(),
@@ -529,6 +600,7 @@ mod tests {
             &db,
             &engine,
             &config,
+            1.0,
         )
         .unwrap();
 
@@ -559,10 +631,14 @@ mod tests {
             &db,
             &engine,
             &config,
+            1.0,
         )
         .unwrap();
 
-        assert!(result.is_empty(), "empty-string transcription should be filtered");
+        assert!(
+            result.is_empty(),
+            "empty-string transcription should be filtered"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -605,8 +681,8 @@ mod tests {
 
         let engine = TwoResultEngine {
             results: vec![
-                Some("valid text".into()),             // first segment: valid
-                Some("   \n\t  ".into()),              // second segment: whitespace only
+                Some("valid text".into()), // first segment: valid
+                Some("   \n\t  ".into()),  // second segment: whitespace only
             ],
             call_count: Mutex::new(0),
         };
@@ -619,6 +695,7 @@ mod tests {
             &db,
             &engine,
             &config,
+            1.0,
         )
         .unwrap();
 
@@ -651,6 +728,7 @@ mod tests {
             &db,
             &engine,
             &config,
+            1.0,
         )
         .unwrap();
 
@@ -684,6 +762,7 @@ mod tests {
             &db,
             &engine,
             &config,
+            1.0,
         );
 
         assert!(result.is_err(), "corrupt WAV should produce an error");
@@ -714,6 +793,7 @@ mod tests {
             &db,
             &engine,
             &config,
+            1.0,
         )
         .unwrap();
 
@@ -749,10 +829,15 @@ mod tests {
             &db,
             &engine,
             &config,
+            1.0,
         )
         .unwrap();
 
-        assert_eq!(result.len(), 1, "should still transcribe with partial final chunk");
+        assert_eq!(
+            result.len(),
+            1,
+            "should still transcribe with partial final chunk"
+        );
         assert_eq!(result[0].text, "partial chunk text");
         // 250ms → start at 0, end near 250ms
         assert!(result[0].ended_at_ms >= 200 && result[0].ended_at_ms <= 300);
@@ -796,6 +881,7 @@ mod tests {
             &db,
             &engine,
             &config,
+            1.0,
         )
         .unwrap();
 
@@ -827,6 +913,7 @@ mod tests {
             &db,
             &engine,
             &config,
+            1.0,
         )
         .unwrap();
 
@@ -841,7 +928,10 @@ mod tests {
             .unwrap()
         };
 
-        assert_eq!(db_start, line.started_at_ms, "DB started_at_ms should match");
+        assert_eq!(
+            db_start, line.started_at_ms,
+            "DB started_at_ms should match"
+        );
         assert_eq!(db_end, line.ended_at_ms, "DB ended_at_ms should match");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -869,17 +959,16 @@ mod tests {
             &db,
             &engine,
             &config,
+            1.0,
         )
         .unwrap();
 
         assert!(!result.is_empty());
         let db_session_id: String = {
             let conn = db.conn.lock().unwrap();
-            conn.query_row(
-                "SELECT session_id FROM transcript_lines LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
+            conn.query_row("SELECT session_id FROM transcript_lines LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .unwrap()
         };
         assert_eq!(db_session_id, "sess-target-id");
@@ -911,6 +1000,7 @@ mod tests {
             &db,
             &engine,
             &config,
+            1.0,
         )
         .unwrap();
 
@@ -922,7 +1012,9 @@ mod tests {
         // Verify DB has the same count
         let conn = db.conn.lock().unwrap();
         let db_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM transcript_lines", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM transcript_lines", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(db_count as usize, result.len());
         let _ = std::fs::remove_dir_all(&dir);
@@ -950,6 +1042,7 @@ mod tests {
             &db,
             &engine,
             &config,
+            1.0,
         )
         .unwrap();
 
