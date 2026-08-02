@@ -40,7 +40,7 @@ graph TD
         D[db::register_vec_extension]
         E[setup handler<br/>DB + AudioCapture + Model + overlay +<br/>PanicState + BatchTracker + InterviewRunner]
         F[audio::capture<br/>AudioCapture]
-        EM[rag::embeddings<br/>EmbeddingModel (Mutex)]
+        EM["rag::embeddings<br/>EmbeddingModel (Mutex)"]
         CL[cleanup_orphaned_temp_dirs]
         PS[orchestrator::PanicState<br/>10s hint silence]
         BT[BatchTracker<br/>tracks completed batch<br/>transcriptions per session]
@@ -49,7 +49,7 @@ graph TD
 
     subgraph "Post-call + Interview Analysis"
         AN[analyze::analyze_session<br/>transcript + RAG → LLM]
-        KEYS[keys::save_key / has_key<br/>keyring (OS Keychain)]
+        KEYS["keys::save_key / has_key<br/>keyring (OS Keychain)"]
         PL[interview_plan::generate_interview_plan<br/>job description → question plan]
     end
 
@@ -89,7 +89,7 @@ graph TD
 
     subgraph "RAG Engine (implemented)"
         S[rag::embeddings<br/>snowflake-arctic-embed-s<br/>CPU+Accelerate]
-        T[rag::indexer<br/>ingest / search / chunk / folder<br/>PDF extraction (pdf-extract)]
+        T["rag::indexer<br/>ingest / search / chunk / folder<br/>PDF extraction (pdf-extract)"]
     end
 
     subgraph "STT Module (implemented, lifecycle-integrated)"
